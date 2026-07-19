@@ -956,9 +956,58 @@ class _GenerationLock:
     run_dir: Path
     device: int
     inode: int
+    runs_root_descriptor: int
+    runs_root: Path
+    runs_root_device: int
+    runs_root_inode: int
+
+
+def _open_trusted_directory(path: Path, label: str) -> tuple[int, os.stat_result]:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        named = path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or (metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            raise ValueError(
+                f"{label} must be an owned, non-writable-by-others stable directory"
+            )
+        return descriptor, metadata
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _assert_generation_runs_root_identity(owner: _GenerationLock) -> None:
+    metadata = os.fstat(owner.runs_root_descriptor)
+    try:
+        named = owner.runs_root.stat(follow_symlinks=False)
+    except (FileNotFoundError, OSError):
+        raise ValueError("generation runs root path was replaced") from None
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or (metadata.st_dev, metadata.st_ino)
+        != (owner.runs_root_device, owner.runs_root_inode)
+        or (named.st_dev, named.st_ino)
+        != (owner.runs_root_device, owner.runs_root_inode)
+    ):
+        raise ValueError("generation runs root path was replaced")
 
 
 def _assert_generation_run_identity(owner: _GenerationLock) -> None:
+    _assert_generation_runs_root_identity(owner)
     descriptor_stat = os.fstat(owner.descriptor)
     try:
         path_stat = owner.run_dir.stat(follow_symlinks=False)
@@ -974,44 +1023,65 @@ def _assert_generation_run_identity(owner: _GenerationLock) -> None:
 
 
 def _unlock_generation_lock(owner: _GenerationLock) -> None:
-    fcntl.flock(owner.descriptor, fcntl.LOCK_UN)
+    try:
+        fcntl.flock(owner.descriptor, fcntl.LOCK_UN)
+    finally:
+        fcntl.flock(owner.runs_root_descriptor, fcntl.LOCK_UN)
 
 
 def _generation_lock_is_held(run_dir: Path) -> bool:
     resolved = Path(run_dir).expanduser().resolve(strict=True)
-    descriptor = os.open(
-        resolved,
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
+    runs_root = resolved.parent.resolve(strict=True)
+    root_descriptor, _root_metadata = _open_trusted_directory(
+        runs_root, "generation runs root"
     )
     try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise ValueError("generation run path must be a directory")
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(root_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
             if error.errno in {errno.EACCES, errno.EAGAIN}:
                 return True
             raise
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        return False
+        descriptor, _metadata = _open_trusted_directory(
+            resolved, "generation run path"
+        )
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno in {errno.EACCES, errno.EAGAIN}:
+                    return True
+                raise
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(descriptor)
     finally:
-        os.close(descriptor)
+        try:
+            fcntl.flock(root_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(root_descriptor)
 
 
 def _acquire_generation_lock(run_dir: Path, timestamp: str) -> _GenerationLock:
     resolved = Path(run_dir).expanduser().resolve(strict=True)
-    descriptor = os.open(
-        resolved,
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
+    runs_root = resolved.parent.resolve(strict=True)
+    root_descriptor, root_stat = _open_trusted_directory(
+        runs_root, "generation runs root"
     )
+    descriptor = None
     try:
+        try:
+            fcntl.flock(root_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                raise ValueError(
+                    "generation authorization is already in progress"
+                ) from None
+            raise
+        descriptor, descriptor_stat = _open_trusted_directory(
+            resolved, "generation run path"
+        )
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
@@ -1020,9 +1090,6 @@ def _acquire_generation_lock(run_dir: Path, timestamp: str) -> _GenerationLock:
                     "generation authorization is already in progress"
                 ) from None
             raise
-        descriptor_stat = os.fstat(descriptor)
-        if not stat.S_ISDIR(descriptor_stat.st_mode):
-            raise ValueError("generation run path must be a directory")
         transaction_id = uuid.uuid4().hex
         owner = _GenerationLock(
             descriptor,
@@ -1030,6 +1097,10 @@ def _acquire_generation_lock(run_dir: Path, timestamp: str) -> _GenerationLock:
             resolved,
             descriptor_stat.st_dev,
             descriptor_stat.st_ino,
+            root_descriptor,
+            runs_root,
+            root_stat.st_dev,
+            root_stat.st_ino,
         )
         _assert_generation_run_identity(owner)
         removed_temp = False
@@ -1046,9 +1117,16 @@ def _acquire_generation_lock(run_dir: Path, timestamp: str) -> _GenerationLock:
         return owner
     except BaseException:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            if descriptor is not None:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
         finally:
-            os.close(descriptor)
+            try:
+                fcntl.flock(root_descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(root_descriptor)
         raise
 
 
@@ -1056,7 +1134,10 @@ def _release_generation_lock(owner: _GenerationLock) -> None:
     try:
         _unlock_generation_lock(owner)
     finally:
-        os.close(owner.descriptor)
+        try:
+            os.close(owner.descriptor)
+        finally:
+            os.close(owner.runs_root_descriptor)
 
 
 def authorize_generation(

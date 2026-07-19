@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -346,7 +347,9 @@ class PublicationGateTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 run_state.authorize_generation(self.run, "d-0")
         self.assertEqual((self.run / "run.json").read_bytes(), before_run)
-        self.assertEqual((self.run / "mockup-manifest.json").read_bytes(), before_ledger)
+        self.assertEqual(
+            (self.run / "mockup-manifest.json").read_bytes(), before_ledger
+        )
         self.assert_generation_lock_released()
         self.assertEqual(list(self.run.glob(".mockup-manifest.json.generation-*.tmp")), [])
 
@@ -608,6 +611,86 @@ time.sleep(60)
         ledger = json.loads((self.run / "mockup-manifest.json").read_text())
         self.assertEqual(ledger["generation_attempts_used"], 1)
         self.assertEqual(ledger["mockups"][0]["attempt_count"], 1)
+
+    def test_runs_root_mutex_blocks_real_process_run_directory_aba(self):
+        self.advance_to_approved()
+        self.write_pending_manifest()
+        before_run = (self.run / "run.json").read_bytes()
+        before_ledger = (self.run / "mockup-manifest.json").read_bytes()
+        owner = run_state._acquire_generation_lock(
+            self.run, "2026-07-20T00:00:00Z"
+        )
+        moved = self.root / "publication-run-original"
+        self.run.rename(moved)
+        shutil.copytree(moved, self.run)
+        try:
+            contender = subprocess.run(
+                [
+                    sys.executable,
+                    run_state.__file__,
+                    "authorize-generation",
+                    "--run",
+                    str(self.run),
+                    "--direction",
+                    "d-0",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(contender.returncode, 0, contender.stdout)
+            self.assertIn("already in progress", contender.stderr)
+        finally:
+            shutil.rmtree(self.run)
+            moved.rename(self.run)
+            run_state._release_generation_lock(owner)
+        self.assertEqual((self.run / "run.json").read_bytes(), before_run)
+        self.assertEqual(
+            (self.run / "mockup-manifest.json").read_bytes(), before_ledger
+        )
+        run_state.authorize_generation(self.run, "d-0")
+        ledger = json.loads((self.run / "mockup-manifest.json").read_text())
+        self.assertEqual(ledger["generation_attempts_used"], 1)
+        self.assertEqual(ledger["mockups"][0]["attempt_count"], 1)
+
+    def test_runs_root_mutex_rejects_symlink_and_unsafe_permissions(self):
+        alias = self.root.parent / f"{self.root.name}-alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        try:
+            with self.assertRaises(OSError):
+                run_state._open_trusted_directory(alias, "generation runs root")
+        finally:
+            alias.unlink()
+
+        self.advance_to_approved()
+        self.write_pending_manifest()
+        before_ledger = (self.run / "mockup-manifest.json").read_bytes()
+        original_mode = self.root.stat().st_mode & 0o777
+        self.root.chmod(0o777)
+        try:
+            with self.assertRaisesRegex(ValueError, "non-writable-by-others"):
+                run_state.authorize_generation(self.run, "d-0")
+            self.assertEqual(
+                (self.run / "mockup-manifest.json").read_bytes(), before_ledger
+            )
+        finally:
+            self.root.chmod(original_mode)
+
+    def test_post_return_same_uid_tampering_is_detected_on_next_validation(self):
+        self.advance_to_approved()
+        self.write_pending_manifest()
+        run_state.authorize_generation(self.run, "d-0")
+        published = (self.run / "mockup-manifest.json").read_bytes()
+        self.assertEqual(json.loads(published)["generation_attempts_used"], 1)
+
+        (self.run / "mockup-manifest.json").write_bytes(b"{external-tamper")
+        errors = validator.validate_mockup_manifest_for_generation(self.run)
+        self.assertTrue(
+            any("invalid mockup-manifest.json" in error for error in errors), errors
+        )
+        self.assertFalse(run_state.image_generation_allowed(self.run, "d-0"))
+        with self.assertRaisesRegex(ValueError, "generation manifest validation failed"):
+            run_state.authorize_generation(self.run, "d-0")
 
     def test_temp_swap_at_replace_boundary_rolls_back_old_valid_ledger(self):
         self.advance_to_approved()
