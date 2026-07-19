@@ -248,6 +248,27 @@ class SkillContractTests(unittest.TestCase):
         ):
             self.assertIn(phrase, combined)
 
+    def test_lexer_and_render_asset_closure_are_documented(self):
+        skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_DIR / "references/artifact-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        mockups = (SKILL_DIR / "references/mockups-implementation.md").read_text(
+            encoding="utf-8"
+        )
+        combined = "\n".join((skill, contracts, mockups))
+        for phrase in (
+            "deterministic JS/TS lexer",
+            "single/double-quoted literal token table",
+            "template literals",
+            "actual imported bindings",
+            "new URL(<literal>, import.meta.url)",
+            "JSX `src`, `href`, `poster`, and `srcSet`",
+            "HTML `img`, `source`, `video`, and `link`",
+            "runtime-computed and template-literal imports are out of scope",
+        ):
+            self.assertIn(phrase, combined)
+
 
 if __name__ == "__main__":
     unittest.main()

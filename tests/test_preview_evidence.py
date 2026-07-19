@@ -229,6 +229,26 @@ class PreviewEvidenceTests(unittest.TestCase):
             check["source_digest"] = digest
         self.assertEqual(self.validate(manifest, implementation), [])
 
+        (standalone / "hero.svg").write_text("<svg/>", encoding="utf-8")
+        (standalone / "index.html").write_text(
+            '<div id="root"></div><img src="./hero.svg">'
+            '<script type="module" src="/src/main.tsx"></script>',
+            encoding="utf-8",
+        )
+        implementation = copy.deepcopy(implementation)
+        digest = preview_digest(self.run, standalone_files)
+        for check in implementation["verification"]["viewport_checks"].values():
+            check["source_digest"] = digest
+        errors = self.validate(manifest, implementation)
+        self.assertTrue(any("unlisted local dependency" in error for error in errors), errors)
+
+        standalone_files.append("standalone/hero.svg")
+        implementation["preview_files"] = standalone_files
+        digest = preview_digest(self.run, standalone_files)
+        for check in implementation["verification"]["viewport_checks"].values():
+            check["source_digest"] = digest
+        self.assertEqual(self.validate(manifest, implementation), [])
+
     def test_standalone_rejects_incomplete_vite_react_topology(self):
         standalone = self.run / "standalone"
         (standalone / "src").mkdir(parents=True)
@@ -354,6 +374,158 @@ class PreviewEvidenceTests(unittest.TestCase):
         for expected in ("scripts", "index.html", "main.tsx", "App.tsx", "vite.config.ts", "tsconfig"):
             self.assertTrue(any(expected in error for error in errors), (expected, errors))
 
+    def test_project_route_imports_ignore_multiline_template_and_string_decoys(self):
+        consumer = self.project / "previews" / "App.tsx"
+        consumer.write_text(
+            "const quoted = \"import registry from './routes.json'\";\n"
+            "const templated = `first line\n"
+            "import registry from './routes.json'\n"
+            "import { Preview } from './Checkout'\n"
+            "createRoot(root).render(<Preview />)\n"
+            "`;",
+            encoding="utf-8",
+        )
+        implementation = copy.deepcopy(self.implementation)
+        digest = preview_digest(self.project, implementation["preview_files"])
+        for check in implementation["verification"]["viewport_checks"].values():
+            check["source_digest"] = digest
+        errors = self.validate(implementation=implementation)
+        self.assertTrue(any("static imports" in error for error in errors), errors)
+
+        consumer.write_text(
+            "import type registry from './routes.json';\n"
+            "import type { Preview } from './Checkout';",
+            encoding="utf-8",
+        )
+        implementation = copy.deepcopy(self.implementation)
+        digest = preview_digest(self.project, implementation["preview_files"])
+        for check in implementation["verification"]["viewport_checks"].values():
+            check["source_digest"] = digest
+        errors = self.validate(implementation=implementation)
+        self.assertTrue(any("static imports" in error for error in errors), errors)
+
+        consumer.write_text(
+            "import {\n"
+            "  Preview\n"
+            "} from './Checkout';\n"
+            "import registry\n"
+            "  from './routes.json';\n"
+            "export const resolve = (path: string) => registry[path] ? Preview : null;",
+            encoding="utf-8",
+        )
+        implementation = copy.deepcopy(self.implementation)
+        digest = preview_digest(self.project, implementation["preview_files"])
+        for check in implementation["verification"]["viewport_checks"].values():
+            check["source_digest"] = digest
+        self.assertEqual(self.validate(implementation=implementation), [])
+
+    def test_js_lexer_ignores_escaped_regex_and_computed_import_decoys(self):
+        source = r'''
+const quoted = "escaped \" import fake from './quoted'";
+const regex = /import\s+fake\s+from\s+["']\.\/regex["']\/\//;
+const templated = `import fake from './template'`;
+const lazy = import('./computed' + suffix);
+const required = require('./required' + suffix);
+/* import fake from './commented' */
+import {
+  real
+} from './real';
+'''
+        self.assertEqual(validator.js_dependencies(source), ["./real"])
+
+    def test_standalone_calls_must_be_bound_to_real_multiline_imports(self):
+        standalone = self.run / "standalone"
+        (standalone / "src").mkdir(parents=True)
+        (standalone / "package.json").write_text(
+            json.dumps(
+                {
+                    "scripts": {"dev": "vite", "build": "vite build"},
+                    "dependencies": {"react": "1", "react-dom": "1"},
+                    "devDependencies": {
+                        "vite": "1",
+                        "typescript": "1",
+                        "@vitejs/plugin-react": "1",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (standalone / "index.html").write_text(
+            '<div id="root"></div><script type="module" src="/src/main.tsx"></script>',
+            encoding="utf-8",
+        )
+        (standalone / "tsconfig.json").write_text(
+            '{"compilerOptions":{"jsx":"react-jsx","module":"ESNext"}}',
+            encoding="utf-8",
+        )
+        (standalone / "src" / "App.tsx").write_text(
+            "export default function App(){return <main>Preview</main>}",
+            encoding="utf-8",
+        )
+        (standalone / "src" / "main.tsx").write_text(
+            "import 'react';\n"
+            "import 'react-dom/client';\n"
+            "import './App';\n"
+            "const quoted = \"createRoot(root).render(<App />)\";\n"
+            "const templated = `line one\ncreateRoot(root).render(<App />)\n`;\n"
+            "createRoot(document.getElementById('root')!).render(<App />);",
+            encoding="utf-8",
+        )
+        (standalone / "vite.config.ts").write_text(
+            "import 'vite';\n"
+            "import '@vitejs/plugin-react';\n"
+            "const quoted = \"defineConfig({plugins:[react()]})\";\n"
+            "export default defineConfig({plugins:[react()]});",
+            encoding="utf-8",
+        )
+        files = [
+            "standalone/package.json",
+            "standalone/index.html",
+            "standalone/vite.config.ts",
+            "standalone/tsconfig.json",
+            "standalone/src/main.tsx",
+            "standalone/src/App.tsx",
+        ]
+        implementation = copy.deepcopy(self.implementation)
+        implementation.update(
+            mode="standalone",
+            preview_path="standalone/src/main.tsx",
+            preview_files=files,
+        )
+        digest = preview_digest(self.run, files)
+        for check in implementation["verification"]["viewport_checks"].values():
+            check["source_digest"] = digest
+        errors = self.validate(run_manifest(None), implementation)
+        self.assertTrue(any("main.tsx" in error for error in errors), errors)
+        self.assertTrue(any("vite.config.ts" in error for error in errors), errors)
+
+        (standalone / "src" / "main.tsx").write_text(
+            "import React, {\n"
+            "  StrictMode\n"
+            "} from 'react';\n"
+            "import {\n"
+            "  createRoot as mount\n"
+            "} from 'react-dom/client';\n"
+            "import PreviewApp\n"
+            "  from './App';\n"
+            "mount(document.getElementById('root')!).render(<PreviewApp />);",
+            encoding="utf-8",
+        )
+        (standalone / "vite.config.ts").write_text(
+            "import {\n"
+            "  defineConfig as config\n"
+            "} from 'vite';\n"
+            "import reactPlugin\n"
+            "  from '@vitejs/plugin-react';\n"
+            "export default config({plugins:[reactPlugin()]});",
+            encoding="utf-8",
+        )
+        implementation = copy.deepcopy(implementation)
+        digest = preview_digest(self.run, files)
+        for check in implementation["verification"]["viewport_checks"].values():
+            check["source_digest"] = digest
+        self.assertEqual(self.validate(run_manifest(None), implementation), [])
+
     def test_project_route_must_be_wired_and_source_digest_must_match(self):
         route_file = self.project / "previews" / "routes.json"
         route_file.write_text(
@@ -425,6 +597,57 @@ class PreviewEvidenceTests(unittest.TestCase):
             any("contained" in error or "existing file" in error for error in errors),
             errors,
         )
+
+    def test_project_render_assets_from_new_url_and_jsx_are_digest_bound(self):
+        actual = self.project / "previews" / "Actual.tsx"
+        (self.project / "previews" / "hero.svg").write_text(
+            "<svg id='hero'/>", encoding="utf-8"
+        )
+        (self.project / "previews" / "icon.svg").write_text(
+            "<svg id='icon'/>", encoding="utf-8"
+        )
+        actual.write_text(
+            "import './styles.css';\n"
+            "const hero = new URL('./hero.svg', import.meta.url);\n"
+            "export const Preview=()=> <main><img src='./icon.svg' /></main>;",
+            encoding="utf-8",
+        )
+        implementation = copy.deepcopy(self.implementation)
+        digest = preview_digest(self.project, implementation["preview_files"])
+        for check in implementation["verification"]["viewport_checks"].values():
+            check["source_digest"] = digest
+        errors = self.validate(implementation=implementation)
+        self.assertGreaterEqual(
+            sum("unlisted local dependency" in error for error in errors), 2, errors
+        )
+
+        implementation["preview_files"].extend(
+            ["previews/hero.svg", "previews/icon.svg"]
+        )
+        digest = preview_digest(self.project, implementation["preview_files"])
+        for check in implementation["verification"]["viewport_checks"].values():
+            check["source_digest"] = digest
+        self.assertEqual(self.validate(implementation=implementation), [])
+
+        (self.project / "previews" / "hero.svg").write_text(
+            "<svg id='mutated'/>", encoding="utf-8"
+        )
+        errors = self.validate(implementation=implementation)
+        self.assertTrue(any("source_digest" in error for error in errors), errors)
+
+    def test_jsx_render_asset_symlink_escape_is_rejected(self):
+        outside = self.root / "outside.svg"
+        outside.write_text("<svg/>", encoding="utf-8")
+        escape = self.project / "previews" / "escape.svg"
+        escape.symlink_to(outside)
+        (self.project / "previews" / "Actual.tsx").write_text(
+            "export const Preview=()=> <img src='./escape.svg' />;",
+            encoding="utf-8",
+        )
+        implementation = copy.deepcopy(self.implementation)
+        implementation["preview_files"].append("previews/escape.svg")
+        errors = self.validate(implementation=implementation)
+        self.assertTrue(any("contained" in error or "existing file" in error for error in errors), errors)
 
     def test_aggregate_checks_cannot_substitute_for_viewport_evidence(self):
         implementation = copy.deepcopy(self.implementation)

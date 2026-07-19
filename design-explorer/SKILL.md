@@ -18,7 +18,7 @@ Build evidence-backed directions, then implement selection in user's language, i
 7. Record approved IDs and transition to `directions_approved`.
 8. Read `references/mockups-implementation.md`; run `can-generate` immediately before each provider call and generate comparable full-screen UI mockups only when it returns true.
 9. Record outputs and validate coverage. Ask the user to select, or `revise` a bounded variation as a first-class direction ID and reapprove it.
-10. Implement a structured-registry project preview or standalone fallback. Validate recursive local dependency closure. Bind exact-size PNG evidence to current source bytes before integration.
+10. Implement a structured-registry project preview or standalone fallback. Validate lexer-proven code/render-asset closure. Bind exact-size PNG evidence to current source bytes before integration.
 
 ## Hard gates
 

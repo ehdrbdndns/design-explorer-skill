@@ -9,6 +9,7 @@ import struct
 import sys
 import unicodedata
 import zlib
+from dataclasses import dataclass
 from datetime import datetime
 from html.parser import HTMLParser
 from itertools import combinations
@@ -336,125 +337,414 @@ def preview_files_digest(root: Path, paths: list[str]) -> str | None:
 LOCAL_SCRIPT_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".css")
 
 
-def strip_js_comments(source: str) -> str:
-    result = []
+@dataclass(frozen=True)
+class JsStringLiteral:
+    start: int
+    end: int
+    value: str
+    quote: str
+
+
+@dataclass(frozen=True)
+class JsLexResult:
+    executable: str
+    literals: tuple[JsStringLiteral, ...]
+
+
+@dataclass(frozen=True)
+class JsModuleReference:
+    kind: str
+    specifier: str
+    clause: str = ""
+
+
+def _mask_span(output: list[str], start: int, end: int, keep_quotes: bool = False) -> None:
+    for index in range(start, end):
+        if output[index] not in "\r\n" and not (
+            keep_quotes and index in {start, end - 1}
+        ):
+            output[index] = " "
+
+
+def _decode_js_string(value: str) -> str | None:
+    decoded = []
     index = 0
-    quote = None
-    while index < len(source):
-        current = source[index]
-        following = source[index + 1] if index + 1 < len(source) else ""
-        if quote is not None:
-            result.append(current)
-            if current == "\\" and following:
-                result.append(following)
-                index += 2
-                continue
-            if current == quote:
-                quote = None
+    escapes = {
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "v": "\v",
+        "0": "\0",
+    }
+    while index < len(value):
+        current = value[index]
+        if current != "\\":
+            decoded.append(current)
             index += 1
             continue
-        if current in {"'", '"', "`"}:
-            quote = current
-            result.append(current)
-            index += 1
-            continue
-        if current == "/" and following == "/":
-            result.extend("  ")
-            index += 2
-            while index < len(source) and source[index] not in "\r\n":
-                result.append(" ")
-                index += 1
-            continue
-        if current == "/" and following == "*":
-            result.extend("  ")
-            index += 2
-            while index < len(source):
-                if index + 1 < len(source) and source[index : index + 2] == "*/":
-                    result.extend("  ")
-                    index += 2
-                    break
-                result.append("\n" if source[index] == "\n" else " ")
-                index += 1
-            continue
-        result.append(current)
         index += 1
-    return "".join(result)
-
-
-def mask_js_strings(source: str) -> str:
-    result = []
-    index = 0
-    quote = None
-    while index < len(source):
-        current = source[index]
-        following = source[index + 1] if index + 1 < len(source) else ""
-        if quote is None:
-            if current in {"'", '"', "`"}:
-                quote = current
-                result.append(" ")
+        if index >= len(value):
+            return None
+        escaped = value[index]
+        if escaped in "\r\n":
+            if escaped == "\r" and index + 1 < len(value) and value[index + 1] == "\n":
+                index += 1
+        elif escaped == "x":
+            digits = value[index + 1 : index + 3]
+            if len(digits) != 2 or not re.fullmatch(r"[0-9A-Fa-f]{2}", digits):
+                return None
+            decoded.append(chr(int(digits, 16)))
+            index += 2
+        elif escaped == "u":
+            if index + 1 < len(value) and value[index + 1] == "{":
+                close = value.find("}", index + 2)
+                digits = value[index + 2 : close] if close != -1 else ""
+                if not digits or not re.fullmatch(r"[0-9A-Fa-f]{1,6}", digits):
+                    return None
+                codepoint = int(digits, 16)
+                if codepoint > 0x10FFFF:
+                    return None
+                decoded.append(chr(codepoint))
+                index = close
             else:
-                result.append(current)
-            index += 1
-            continue
-        result.append("\n" if current == "\n" else " ")
-        if current == "\\" and following:
-            result.append("\n" if following == "\n" else " ")
-            index += 2
-            continue
-        if current == quote:
-            quote = None
+                digits = value[index + 1 : index + 5]
+                if len(digits) != 4 or not re.fullmatch(r"[0-9A-Fa-f]{4}", digits):
+                    return None
+                decoded.append(chr(int(digits, 16)))
+                index += 4
+        else:
+            decoded.append(escapes.get(escaped, escaped))
         index += 1
-    return "".join(result)
+    return "".join(decoded)
 
 
-STATIC_IMPORT_PATTERN = re.compile(
-    r"(?m)^\s*import\s+(?:[^\n;]*?\s+from\s+)?[\"']([^\"']+)[\"']"
+def _slash_starts_regex(output: list[str], index: int) -> bool:
+    previous = index - 1
+    while previous >= 0 and output[previous].isspace():
+        previous -= 1
+    if previous < 0:
+        return True
+    if output[previous] in "([{=,:;!?&|+*%^~<>-":
+        return True
+    end = previous + 1
+    while previous >= 0 and (output[previous].isalnum() or output[previous] in "_$"):
+        previous -= 1
+    word = "".join(output[previous + 1 : end])
+    return word in {
+        "case",
+        "delete",
+        "do",
+        "else",
+        "in",
+        "instanceof",
+        "new",
+        "return",
+        "throw",
+        "typeof",
+        "void",
+        "yield",
+        "await",
+    }
+
+
+def lex_js(source: str) -> JsLexResult:
+    output = list(source)
+    literals = []
+    index = 0
+    while index < len(source):
+        current = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        if current == "/" and following in {"/", "*"}:
+            end = index + 2
+            if following == "/":
+                while end < len(source) and source[end] not in "\r\n":
+                    end += 1
+            else:
+                close = source.find("*/", end)
+                end = len(source) if close == -1 else close + 2
+            _mask_span(output, index, end)
+            index = end
+            continue
+        if current in {"'", '"'}:
+            quote = current
+            end = index + 1
+            closed = False
+            while end < len(source):
+                if source[end] == "\\" and end + 1 < len(source):
+                    end += 2
+                    continue
+                if source[end] == quote:
+                    end += 1
+                    closed = True
+                    break
+                if source[end] in "\r\n":
+                    break
+                end += 1
+            if closed:
+                value = _decode_js_string(source[index + 1 : end - 1])
+                if value is not None:
+                    literals.append(JsStringLiteral(index, end, value, quote))
+                _mask_span(output, index, end, keep_quotes=True)
+            else:
+                _mask_span(output, index, end)
+            index = end
+            continue
+        if current == "`":
+            end = index + 1
+            while end < len(source):
+                if source[end] == "\\" and end + 1 < len(source):
+                    end += 2
+                    continue
+                if source[end] == "`":
+                    end += 1
+                    break
+                end += 1
+            _mask_span(output, index, end)
+            index = end
+            continue
+        if current == "/" and _slash_starts_regex(output, index):
+            end = index + 1
+            character_class = False
+            closed = False
+            while end < len(source) and source[end] not in "\r\n":
+                if source[end] == "\\" and end + 1 < len(source):
+                    end += 2
+                    continue
+                if source[end] == "[":
+                    character_class = True
+                elif source[end] == "]":
+                    character_class = False
+                elif source[end] == "/" and not character_class:
+                    end += 1
+                    while end < len(source) and source[end].isalpha():
+                        end += 1
+                    closed = True
+                    break
+                end += 1
+            if closed:
+                _mask_span(output, index, end)
+                index = end
+                continue
+        index += 1
+    return JsLexResult("".join(output), tuple(literals))
+
+
+STATIC_FROM_PATTERN = re.compile(
+    r"(?m)^[ \t]*import\b(?!\s*\()(?P<clause>[^;]*?)\bfrom\s*(?P<quote>[\"'])"
+)
+SIDE_EFFECT_IMPORT_PATTERN = re.compile(
+    r"(?m)^[ \t]*import\s*(?P<quote>[\"'])"
 )
 EXPORT_FROM_PATTERN = re.compile(
-    r"(?m)^\s*export\s+[^\n;]*?\s+from\s+[\"']([^\"']+)[\"']"
+    r"(?m)^[ \t]*export\b[^;]*?\bfrom\s*(?P<quote>[\"'])"
 )
-DYNAMIC_IMPORT_PATTERN = re.compile(r"\bimport\s*\(\s*[\"']([^\"']+)[\"']\s*\)")
-REQUIRE_PATTERN = re.compile(r"\brequire\s*\(\s*[\"']([^\"']+)[\"']\s*\)")
+DYNAMIC_IMPORT_PATTERN = re.compile(
+    r"\bimport\s*\(\s*(?P<quote>[\"'])\s*(?P=quote)\s*\)"
+)
+REQUIRE_PATTERN = re.compile(
+    r"\brequire\s*\(\s*(?P<quote>[\"'])\s*(?P=quote)\s*\)"
+)
+
+
+def js_module_references(source: str) -> tuple[JsLexResult, list[JsModuleReference]]:
+    lexed = lex_js(source)
+    literals = {literal.start: literal for literal in lexed.literals}
+    references = []
+    seen = set()
+    patterns = (
+        ("import", STATIC_FROM_PATTERN),
+        ("import", SIDE_EFFECT_IMPORT_PATTERN),
+        ("export", EXPORT_FROM_PATTERN),
+        ("dynamic", DYNAMIC_IMPORT_PATTERN),
+        ("require", REQUIRE_PATTERN),
+    )
+    for kind, pattern in patterns:
+        for match in pattern.finditer(lexed.executable):
+            literal = literals.get(match.start("quote"))
+            key = (kind, literal.start if literal else -1)
+            if literal is None or key in seen:
+                continue
+            seen.add(key)
+            clause = match.groupdict().get("clause") or ""
+            references.append(JsModuleReference(kind, literal.value, clause))
+    return lexed, references
+
+
+IDENTIFIER = r"[A-Za-z_$][A-Za-z0-9_$]*"
+
+
+def import_bindings(reference: JsModuleReference) -> dict[str, str]:
+    if reference.kind != "import" or not reference.clause.strip():
+        return {}
+    clause = reference.clause.strip()
+    if re.match(r"^type\b", clause):
+        return {}
+    bindings = {}
+    default = re.match(rf"^({IDENTIFIER})\b", clause)
+    if default:
+        bindings["default"] = default.group(1)
+    namespace = re.search(rf"\*\s+as\s+({IDENTIFIER})", clause)
+    if namespace:
+        bindings["*"] = namespace.group(1)
+    named = re.search(r"\{(.*?)\}", clause, re.S)
+    if named:
+        for item in named.group(1).split(","):
+            item = re.sub(r"^\s*type\s+", "", item).strip()
+            match = re.fullmatch(
+                rf"({IDENTIFIER})(?:\s+as\s+({IDENTIFIER}))?", item
+            )
+            if match:
+                bindings[match.group(1)] = match.group(2) or match.group(1)
+    return bindings
+
+
+def is_runtime_import(reference: JsModuleReference) -> bool:
+    return reference.kind == "import" and not re.match(
+        r"^\s*type\b", reference.clause
+    )
+
+
+def imported_locals(
+    references: list[JsModuleReference], specifier: str, exported: str | None = None
+) -> set[str]:
+    result = set()
+    for reference in references:
+        if reference.kind != "import" or reference.specifier != specifier:
+            continue
+        bindings = import_bindings(reference)
+        if exported is None:
+            result.update(bindings.values())
+        elif exported in bindings:
+            result.add(bindings[exported])
+    return result
 CSS_IMPORT_PATTERN = re.compile(
     r"@import\s+(?:url\(\s*)?[\"']?([^\"')\s;]+)", re.IGNORECASE
 )
 CSS_URL_PATTERN = re.compile(r"url\(\s*[\"']?([^\"')]+)", re.IGNORECASE)
+NEW_URL_PATTERN = re.compile(
+    r"\bnew\s+URL\s*\(\s*(?P<quote>[\"'])\s*(?P=quote)\s*,"
+    r"\s*import\s*\.\s*meta\s*\.\s*url\s*\)"
+)
+JSX_TAG_PATTERN = re.compile(
+    r"<[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)?\b(?P<attrs>[^<>]*?)>",
+    re.S,
+)
+JSX_ASSET_ATTRIBUTE_PATTERN = re.compile(
+    r"\b(?P<name>src|href|poster|srcSet)\s*=\s*(?P<quote>[\"'])",
+    re.IGNORECASE,
+)
+
+
+def normalize_local_asset_reference(value: str) -> str | None:
+    value = value.strip()
+    if not value or value.startswith(("#", "//")):
+        return None
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", value):
+        return None
+    value = value.split("#", 1)[0].split("?", 1)[0].strip()
+    if not value:
+        return None
+    if value.startswith(("./", "../", "/")):
+        return value
+    return f"./{value}"
+
+
+def srcset_references(value: str) -> list[str]:
+    if "data:" in value.casefold():
+        return []
+    references = []
+    for candidate in value.split(","):
+        parts = candidate.strip().split()
+        if parts:
+            normalized = normalize_local_asset_reference(parts[0])
+            if normalized is not None:
+                references.append(normalized)
+    return references
+
+
+def js_render_dependencies(lexed: JsLexResult) -> list[str]:
+    literals = {literal.start: literal for literal in lexed.literals}
+    references = []
+    for match in NEW_URL_PATTERN.finditer(lexed.executable):
+        literal = literals.get(match.start("quote"))
+        if literal is not None:
+            normalized = normalize_local_asset_reference(literal.value)
+            if normalized is not None:
+                references.append(normalized)
+    for tag in JSX_TAG_PATTERN.finditer(lexed.executable):
+        attrs_start = tag.start("attrs")
+        attrs = tag.group("attrs")
+        for match in JSX_ASSET_ATTRIBUTE_PATTERN.finditer(attrs):
+            literal = literals.get(attrs_start + match.start("quote"))
+            if literal is None:
+                continue
+            if match.group("name").casefold() == "srcset":
+                references.extend(srcset_references(literal.value))
+            else:
+                normalized = normalize_local_asset_reference(literal.value)
+                if normalized is not None:
+                    references.append(normalized)
+    return list(dict.fromkeys(references))
 
 
 def js_dependencies(source: str) -> list[str]:
-    clean = strip_js_comments(source)
-    values = []
-    for pattern in (
-        STATIC_IMPORT_PATTERN,
-        EXPORT_FROM_PATTERN,
-        DYNAMIC_IMPORT_PATTERN,
-        REQUIRE_PATTERN,
-    ):
-        values.extend(pattern.findall(clean))
+    lexed, references = js_module_references(source)
+    values = [reference.specifier for reference in references]
+    values.extend(js_render_dependencies(lexed))
     return list(dict.fromkeys(values))
 
 
-class _ModuleScriptParser(HTMLParser):
+class _HtmlDependencyParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.sources = []
+        self.references = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.casefold() != "script":
-            return
+        tag = tag.casefold()
         values = {name.casefold(): value for name, value in attrs}
-        if values.get("type", "").casefold() == "module" and values.get("src"):
-            self.sources.append(values["src"])
+        if tag == "script" and (values.get("type") or "").casefold() == "module":
+            source = values.get("src")
+            if source:
+                self.sources.append(source)
+                self.references.append(source)
+        attribute_names = {
+            "img": ("src", "srcset"),
+            "source": ("src", "srcset"),
+            "video": ("src", "poster"),
+            "link": ("href",),
+        }.get(tag, ())
+        for name in attribute_names:
+            value = values.get(name)
+            if not value:
+                continue
+            if name == "srcset":
+                self.references.extend(srcset_references(value))
+            else:
+                normalized = normalize_local_asset_reference(value)
+                if normalized is not None:
+                    self.references.append(normalized)
+
+    def handle_startendtag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        self.handle_starttag(tag, attrs)
 
 
-def html_module_sources(source: str) -> list[str]:
-    parser = _ModuleScriptParser()
+def parse_html_dependencies(source: str) -> _HtmlDependencyParser:
+    parser = _HtmlDependencyParser()
     try:
         parser.feed(source)
         parser.close()
     except Exception:
-        return []
-    return parser.sources
+        return _HtmlDependencyParser()
+    return parser
+
+
+def html_module_sources(source: str) -> list[str]:
+    return parse_html_dependencies(source).sources
 
 
 def local_dependencies(path: Path) -> list[str]:
@@ -466,10 +756,12 @@ def local_dependencies(path: Path) -> list[str]:
     if suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
         return js_dependencies(source)
     if suffix == ".css":
+        source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
         values = CSS_IMPORT_PATTERN.findall(source) + CSS_URL_PATTERN.findall(source)
-        return list(dict.fromkeys(values))
+        normalized = [normalize_local_asset_reference(value) for value in values]
+        return list(dict.fromkeys(value for value in normalized if value is not None))
     if suffix in {".html", ".htm"}:
-        return html_module_sources(source)
+        return list(dict.fromkeys(parse_html_dependencies(source).references))
     return []
 
 
@@ -616,33 +908,48 @@ def _standalone_topology_errors(
         return errors
     if "/src/main.tsx" not in html_module_sources(index):
         errors.append("standalone index.html must load /src/main.tsx as a module")
-    clean_main = strip_js_comments(main)
-    main_imports = set(STATIC_IMPORT_PATTERN.findall(clean_main))
-    executable_main = mask_js_strings(clean_main)
-    if (
-        "react" not in main_imports
-        or "react-dom/client" not in main_imports
-        or not any(value in main_imports for value in ("./App", "./App.tsx"))
-        or not re.search(
-            r"\bcreateRoot\s*\([^;{}]*\)\s*\.\s*render\s*\(", executable_main
+    main_lexed, main_references = js_module_references(main)
+    react_locals = imported_locals(main_references, "react")
+    root_locals = imported_locals(
+        main_references, "react-dom/client", "createRoot"
+    )
+    app_locals = set()
+    for app_specifier in ("./App", "./App.tsx"):
+        app_locals.update(imported_locals(main_references, app_specifier))
+    bound_mount = any(
+        re.search(
+            rf"\b{re.escape(root_local)}\s*\([^;{{}}]*\)\s*\.\s*render\s*"
+            rf"\(\s*<\s*{re.escape(app_local)}\b",
+            main_lexed.executable,
+            re.S,
         )
-    ):
+        for root_local in root_locals
+        for app_local in app_locals
+    )
+    if not react_locals or not root_locals or not app_locals or not bound_mount:
         errors.append("standalone src/main.tsx must mount the React App with createRoot")
-    executable_app = mask_js_strings(strip_js_comments(app))
+    executable_app = lex_js(app).executable
     if (
         not re.search(r"\bexport\s+(?:default\b|(?:const|function|class)\s+\w+)", executable_app)
-        or not re.search(r"<[A-Za-z][A-Za-z0-9]*(?:\s|/?>)", executable_app)
+        or not re.search(
+            r"(?:<>|<[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)?(?:\s|/?>))",
+            executable_app,
+        )
     ):
         errors.append("standalone src/App.tsx must export and render a JSX component")
-    clean_vite = strip_js_comments(vite)
-    vite_imports = set(STATIC_IMPORT_PATTERN.findall(clean_vite))
-    executable_vite = mask_js_strings(clean_vite)
-    if (
-        "vite" not in vite_imports
-        or "@vitejs/plugin-react" not in vite_imports
-        or not re.search(r"\bexport\s+default\s+defineConfig\s*\(", executable_vite)
-        or not re.search(r"\bplugins\s*:\s*\[[^\]]*\breact\s*\(", executable_vite, re.S)
-    ):
+    vite_lexed, vite_references = js_module_references(vite)
+    config_locals = imported_locals(vite_references, "vite", "defineConfig")
+    plugin_locals = imported_locals(vite_references, "@vitejs/plugin-react")
+    configured = any(
+        re.search(
+            rf"\bexport\s+default\s+{re.escape(config_local)}\s*\("
+            rf"(?=[\s\S]*?\bplugins\s*:\s*\[[^]]*\b{re.escape(plugin_local)}\s*\()",
+            vite_lexed.executable,
+        )
+        for config_local in config_locals
+        for plugin_local in plugin_locals
+    )
+    if not config_locals or not plugin_locals or not configured:
         errors.append(
             "standalone vite.config.ts must import defineConfig/react and export configured plugins"
         )
@@ -1260,14 +1567,15 @@ def validate_implementation(run_dir: Path) -> list[str]:
                 )
             except (OSError, UnicodeError):
                 consumer_source = ""
+            _, consumer_references = js_module_references(consumer_source)
             imported = set()
-            for specifier in STATIC_IMPORT_PATTERN.findall(
-                strip_js_comments(consumer_source)
-            ):
+            for reference in consumer_references:
+                if not is_runtime_import(reference):
+                    continue
                 resolved, error = resolve_local_dependency(
                     project_root,
                     resolved_preview_map[consumer_path],
-                    specifier,
+                    reference.specifier,
                     project_root,
                 )
                 if error:
