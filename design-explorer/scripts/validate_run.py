@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import ipaddress
 import json
 import re
 import struct
 import sys
 import unicodedata
+import zlib
 from datetime import datetime
 from itertools import combinations
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 
 AXES = ("layout", "typography", "palette", "density", "imagery", "interaction")
@@ -45,6 +47,8 @@ RFC3339_PATTERN = re.compile(
 )
 VIEWPORT_PATTERN = re.compile(r"[1-9]\d*x[1-9]\d*")
 MAX_VIEWPORT_DIMENSION = 10_000
+MAX_PNG_CHUNK_BYTES = 32 * 1024 * 1024
+MAX_PNG_FILE_BYTES = 64 * 1024 * 1024
 PROMPT_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 BLOCKED_HOST_SUFFIXES = (
     "localhost",
@@ -221,17 +225,187 @@ def resolved_scoped_path(base: Path, relative: str) -> Path | None:
 
 def png_dimensions(path: Path) -> tuple[int, int] | None:
     try:
-        header = path.read_bytes()[:24]
+        if path.stat().st_size > MAX_PNG_FILE_BYTES:
+            return None
+        stream = path.open("rb")
     except OSError:
         return None
-    if (
-        len(header) != 24
-        or header[:8] != b"\x89PNG\r\n\x1a\n"
-        or header[8:12] != b"\x00\x00\x00\r"
-        or header[12:16] != b"IHDR"
-    ):
-        return None
-    return struct.unpack(">II", header[16:24])
+    with stream:
+        if stream.read(8) != b"\x89PNG\r\n\x1a\n":
+            return None
+        dimensions = None
+        saw_idat = False
+        chunk_index = 0
+        while True:
+            header = stream.read(8)
+            if len(header) != 8:
+                return None
+            length, chunk_type = struct.unpack(">I4s", header)
+            if length > MAX_PNG_CHUNK_BYTES:
+                return None
+            if chunk_index == 0 and (chunk_type != b"IHDR" or length != 13):
+                return None
+            if chunk_index > 0 and chunk_type == b"IHDR":
+                return None
+            if chunk_type == b"IEND" and length != 0:
+                return None
+
+            remaining = length
+            crc = zlib.crc32(chunk_type)
+            ihdr = bytearray()
+            while remaining:
+                block = stream.read(min(remaining, 64 * 1024))
+                if not block:
+                    return None
+                if chunk_type == b"IHDR":
+                    ihdr.extend(block)
+                crc = zlib.crc32(block, crc)
+                remaining -= len(block)
+            stored_crc = stream.read(4)
+            if len(stored_crc) != 4 or struct.unpack(">I", stored_crc)[0] != (
+                crc & 0xFFFFFFFF
+            ):
+                return None
+
+            if chunk_type == b"IHDR":
+                width, height = struct.unpack(">II", ihdr[:8])
+                if width <= 0 or height <= 0:
+                    return None
+                dimensions = (width, height)
+            elif chunk_type == b"IDAT":
+                saw_idat = True
+            elif chunk_type == b"IEND":
+                if dimensions is None or not saw_idat or stream.read(1) != b"":
+                    return None
+                return dimensions
+            chunk_index += 1
+
+
+def valid_preview_route(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    current = value
+    for _ in range(6):
+        if (
+            not current.startswith("/")
+            or current.startswith("//")
+            or "//" in current
+            or "?" in current
+            or "#" in current
+            or "\\" in current
+            or any(part in {".", ".."} for part in current.split("/"))
+            or any(
+                character.isspace() or unicodedata.category(character) == "Cc"
+                for character in current
+            )
+            or re.search(r"%(?![0-9A-Fa-f]{2})", current)
+        ):
+            return False
+        decoded = unquote(current)
+        if decoded == current:
+            return "%" not in current
+        current = decoded
+    return False
+
+
+def preview_files_digest(root: Path, paths: list[str]) -> str | None:
+    digest = hashlib.sha256()
+    for relative in sorted(paths):
+        resolved = resolved_scoped_path(root, relative)
+        if resolved is None or not resolved.is_file():
+            return None
+        name = relative.encode("utf-8")
+        try:
+            size = resolved.stat().st_size
+            digest.update(struct.pack(">Q", len(name)))
+            digest.update(name)
+            digest.update(struct.pack(">Q", size))
+            with resolved.open("rb") as stream:
+                while block := stream.read(64 * 1024):
+                    digest.update(block)
+        except OSError:
+            return None
+    return "sha256:" + digest.hexdigest()
+
+
+def _standalone_topology_errors(
+    root: Path, preview_files: list[str], resolved_files: dict[str, Path]
+) -> list[str]:
+    errors = []
+    packages = [path for path in preview_files if PurePosixPath(path).name == "package.json"]
+    if len(packages) != 1:
+        return ["standalone preview_files must include exactly one package.json"]
+    package_path = PurePosixPath(packages[0])
+    prefix = "" if str(package_path.parent) == "." else f"{package_path.parent}/"
+    required = {
+        "index": f"{prefix}index.html",
+        "vite": f"{prefix}vite.config.ts",
+        "tsconfig": f"{prefix}tsconfig.json",
+        "main": f"{prefix}src/main.tsx",
+        "app": f"{prefix}src/App.tsx",
+    }
+    missing = [path for path in required.values() if path not in preview_files]
+    if missing:
+        errors.append(
+            "standalone preview_files missing complete Vite React TS files: "
+            + ", ".join(missing)
+        )
+        return errors
+    try:
+        package = json.loads(resolved_files[packages[0]].read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeError):
+        package = None
+    if not isinstance(package, dict):
+        errors.append("standalone package.json must be valid JSON object")
+    else:
+        scripts = package.get("scripts")
+        if not isinstance(scripts, dict) or any(
+            not isinstance(scripts.get(name), str) or not scripts[name].strip()
+            for name in ("dev", "build")
+        ):
+            errors.append("standalone package.json requires dev and build scripts")
+        dependencies = package.get("dependencies")
+        if not isinstance(dependencies, dict) or any(
+            not isinstance(dependencies.get(name), str)
+            or not dependencies[name].strip()
+            for name in ("react", "react-dom")
+        ):
+            errors.append("standalone package.json requires react and react-dom dependencies")
+        dev_dependencies = package.get("devDependencies")
+        if not isinstance(dev_dependencies, dict) or any(
+            not isinstance(dev_dependencies.get(name), str)
+            or not dev_dependencies[name].strip()
+            for name in ("vite", "typescript", "@vitejs/plugin-react")
+        ):
+            errors.append(
+                "standalone package.json requires vite, typescript, and @vitejs/plugin-react devDependencies"
+            )
+    try:
+        index = resolved_files[required["index"]].read_text(encoding="utf-8")
+        main = resolved_files[required["main"]].read_text(encoding="utf-8")
+        app = resolved_files[required["app"]].read_text(encoding="utf-8")
+        vite = resolved_files[required["vite"]].read_text(encoding="utf-8")
+        tsconfig = json.loads(
+            resolved_files[required["tsconfig"]].read_text(encoding="utf-8")
+        )
+    except (json.JSONDecodeError, OSError, UnicodeError):
+        errors.append("standalone Vite React TS files must be readable and tsconfig.json valid")
+        return errors
+    script_pattern = re.compile(
+        r"<script\b(?=[^>]*\btype=[\"']module[\"'])(?=[^>]*\bsrc=[\"']/src/main\.tsx[\"'])[^>]*>",
+        re.IGNORECASE,
+    )
+    if not script_pattern.search(index):
+        errors.append("standalone index.html must load /src/main.tsx as a module")
+    if "react-dom/client" not in main or "createRoot" not in main or "./App" not in main:
+        errors.append("standalone src/main.tsx must mount the React App with createRoot")
+    if not app.strip():
+        errors.append("standalone src/App.tsx must be nonblank")
+    if "@vitejs/plugin-react" not in vite or "react(" not in vite:
+        errors.append("standalone vite.config.ts must configure @vitejs/plugin-react")
+    if not isinstance(tsconfig, dict):
+        errors.append("standalone tsconfig.json must be a JSON object")
+    return errors
 
 
 def find_secret_errors(value, label: str) -> list[str]:
@@ -730,18 +904,7 @@ def validate_implementation(run_dir: Path) -> list[str]:
         errors.append("implementation preview_path must be included in preview_files")
 
     preview_route = implementation.get("preview_route")
-    if (
-        not isinstance(preview_route, str)
-        or not preview_route.startswith("/")
-        or preview_route.startswith("//")
-        or "//" in preview_route
-        or "?" in preview_route
-        or "#" in preview_route
-        or "\\" in preview_route
-        or re.search(r"%(?:2e|2f|5c)", preview_route, re.IGNORECASE)
-        or any(part in {".", ".."} for part in preview_route.split("/"))
-        or any(character.isspace() or unicodedata.category(character) == "Cc" for character in preview_route)
-    ):
+    if not valid_preview_route(preview_route):
         errors.append("implementation preview_route must be a normalized absolute URL path")
 
     project_root = None
@@ -771,6 +934,12 @@ def validate_implementation(run_dir: Path) -> list[str]:
                 errors.append(f"implementation preview file must be an existing file: {path}")
             else:
                 resolved_previews.append((path, resolved))
+    resolved_preview_map = dict(resolved_previews)
+    expected_source_digest = None
+    if project_root is not None and preview_files is not None and len(
+        resolved_previews
+    ) == len(preview_files):
+        expected_source_digest = preview_files_digest(project_root, preview_files)
 
     resolved_production = []
     if mode == "project" and project_root is not None and production_paths is not None:
@@ -790,12 +959,58 @@ def validate_implementation(run_dir: Path) -> list[str]:
                     f"preview file {preview_name} overlaps production_path {production_name}"
                 )
 
-    if mode == "standalone" and preview_files is not None:
-        if not any(PurePosixPath(path).name == "package.json" for path in preview_files):
-            errors.append("standalone preview_files must include package.json")
-        entry_pattern = re.compile(r"(?:^|/)src/(?:main|index)\.(?:js|jsx|ts|tsx)$")
-        if not any(entry_pattern.search(path) for path in preview_files):
-            errors.append("standalone preview_files must include an entry source file")
+    if mode == "project" and isinstance(preview_route, str) and resolved_previews:
+        route_bytes = preview_route.encode("utf-8")
+        try:
+            route_sources = [
+                (name, path)
+                for name, path in resolved_previews
+                if route_bytes in path.read_bytes()
+            ]
+        except OSError:
+            route_sources = []
+        wiring_tokens = {route_bytes}
+        for name, _ in route_sources:
+            pure = PurePosixPath(name)
+            wiring_tokens.update(
+                {
+                    name.encode("utf-8"),
+                    pure.name.encode("utf-8"),
+                    pure.stem.encode("utf-8"),
+                }
+            )
+        route_is_wired = False
+        scanned = 0
+        for _, production in resolved_production:
+            candidates = [production] if production.is_file() else production.rglob("*")
+            for candidate in candidates:
+                if scanned >= 256:
+                    break
+                try:
+                    if not candidate.is_file() or candidate.stat().st_size > 2 * 1024 * 1024:
+                        continue
+                    scanned += 1
+                    value = candidate.read_bytes()
+                except OSError:
+                    continue
+                if route_sources and any(token in value for token in wiring_tokens):
+                    route_is_wired = True
+                    break
+            if route_is_wired or scanned >= 256:
+                break
+        if not route_sources or not route_is_wired:
+            errors.append(
+                "project preview_route must be recorded in preview files and wired from production source"
+            )
+
+    if mode == "standalone" and preview_files is not None and len(
+        resolved_previews
+    ) == len(preview_files):
+        errors.extend(
+            _standalone_topology_errors(
+                Path(run_dir), preview_files, resolved_preview_map
+            )
+        )
 
     verification = implementation.get("verification", {})
     if not isinstance(verification, dict):
@@ -849,6 +1064,14 @@ def validate_implementation(run_dir: Path) -> list[str]:
                     if item_checks.get(item) != "pass":
                         errors.append(f"{label} {field} must pass: {item}")
         screenshot_ref = check.get("screenshot_ref")
+        source_digest = check.get("source_digest")
+        if (
+            not isinstance(source_digest, str)
+            or not PROMPT_DIGEST_PATTERN.fullmatch(source_digest)
+            or expected_source_digest is None
+            or source_digest != expected_source_digest
+        ):
+            errors.append(f"{label} source_digest must match current preview_files")
         if not valid_artifact_ref(screenshot_ref):
             errors.append(f"{label} screenshot_ref must be a safe run-relative path")
             continue

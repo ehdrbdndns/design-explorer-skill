@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from design_explorer_import import load_script_module
-from test_preview_evidence import write_png
+from test_preview_evidence import preview_digest, write_png
 from test_run_state import DIGEST, direction, evidence, reference
 
 
@@ -70,7 +70,10 @@ class WorkflowIntegrationTests(unittest.TestCase):
             },
         )
 
-    def implementation(self, preview_path: str, preview_files: list[str]):
+    def implementation(
+        self, source_root: Path, preview_path: str, preview_files: list[str]
+    ):
+        source_digest = preview_digest(source_root, preview_files)
         return {
             "selected_direction_id": "d-0",
             "mode": "project" if preview_path.startswith("previews/") else "standalone",
@@ -87,6 +90,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 "viewport_checks": {
                     viewport: {
                         "screenshot_ref": f"evidence/{viewport}.png",
+                        "source_digest": source_digest,
                         "content": "pass",
                         "overflow": "pass",
                         "accessibility": "pass",
@@ -102,13 +106,29 @@ class WorkflowIntegrationTests(unittest.TestCase):
             },
         }
 
+    def offline_http_get(self, project: Path, route: str) -> tuple[int, str]:
+        app_source = (project / "src" / "App.tsx").read_text(encoding="utf-8")
+        routes = json.loads((project / "previews" / "routes.json").read_text())
+        wiring = "../previews/routes.json" in app_source and "../previews/Checkout" in app_source
+        if wiring and route in routes:
+            return 200, (project / "previews" / "Checkout.tsx").read_text(encoding="utf-8")
+        return 404, "not found"
+
     def test_project_lifecycle_gates_provider_and_preserves_production(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             project = root / "project"
             (project / "src").mkdir(parents=True)
+            (project / "package.json").write_text(
+                '{"dependencies":{"react":"1","react-dom":"1"}}', encoding="utf-8"
+            )
             production = project / "src" / "App.tsx"
-            production.write_text("export const production = true;", encoding="utf-8")
+            production.write_text(
+                "import { Preview } from '../previews/Checkout';\n"
+                "import routes from '../previews/routes.json';\n"
+                "export const resolve = (path: string) => routes[path] ? Preview : null;",
+                encoding="utf-8",
+            )
             production_hash = hashlib.sha256(production.read_bytes()).hexdigest()
             run_dir = run_state.init_run(
                 root / "runs",
@@ -142,16 +162,25 @@ class WorkflowIntegrationTests(unittest.TestCase):
 
             (project / "previews").mkdir()
             (project / "previews" / "Checkout.tsx").write_text(
-                "export const Preview = true;", encoding="utf-8"
+                "export const Preview = () => <main>Expected preview shell</main>;",
+                encoding="utf-8",
             )
+            (project / "previews" / "routes.json").write_text(
+                '{"/design-explorer/checkout":"Checkout"}', encoding="utf-8"
+            )
+            project_files = ["previews/Checkout.tsx", "previews/routes.json"]
             for viewport in ("390x844", "1280x800"):
                 width, height = (int(part) for part in viewport.split("x"))
                 write_png(run_dir / "evidence" / f"{viewport}.png", width, height)
             self.write_json(
                 run_dir,
                 "implementation.json",
-                self.implementation("previews/Checkout.tsx", ["previews/Checkout.tsx"]),
+                self.implementation(project, "previews/Checkout.tsx", project_files),
             )
+            status, body = self.offline_http_get(project, "/design-explorer/checkout")
+            self.assertEqual(status, 200)
+            self.assertIn("Expected preview shell", body)
+            self.assertEqual(self.offline_http_get(project, "/missing")[0], 404)
             self.assertEqual(hashlib.sha256(production.read_bytes()).hexdigest(), production_hash)
             run_state.transition_run(run_dir, "prototype_ready")
             self.reload_at(run_dir, "prototype_ready")
@@ -188,11 +217,45 @@ class WorkflowIntegrationTests(unittest.TestCase):
 
             (run_dir / "standalone" / "src").mkdir(parents=True)
             (run_dir / "standalone" / "package.json").write_text(
-                '{"scripts":{"dev":"vite"}}', encoding="utf-8"
+                json.dumps(
+                    {
+                        "scripts": {"dev": "vite", "build": "vite build"},
+                        "dependencies": {"react": "1", "react-dom": "1"},
+                        "devDependencies": {
+                            "vite": "1",
+                            "typescript": "1",
+                            "@vitejs/plugin-react": "1",
+                        },
+                    }
+                ),
+                encoding="utf-8",
             )
+            (run_dir / "standalone" / "index.html").write_text(
+                '<div id="root"></div><script type="module" src="/src/main.tsx"></script>',
+                encoding="utf-8",
+            )
+            (run_dir / "standalone" / "vite.config.ts").write_text(
+                "import react from '@vitejs/plugin-react'; export default {plugins:[react()]}",
+                encoding="utf-8",
+            )
+            (run_dir / "standalone" / "tsconfig.json").write_text("{}", encoding="utf-8")
             (run_dir / "standalone" / "src" / "main.tsx").write_text(
-                "const app = true;", encoding="utf-8"
+                "import {createRoot} from 'react-dom/client'; import App from './App'; "
+                "createRoot(document.getElementById('root')!).render(<App/>);",
+                encoding="utf-8",
             )
+            (run_dir / "standalone" / "src" / "App.tsx").write_text(
+                "export default function App(){return <main>Expected preview shell</main>}",
+                encoding="utf-8",
+            )
+            standalone_files = [
+                "standalone/package.json",
+                "standalone/index.html",
+                "standalone/vite.config.ts",
+                "standalone/tsconfig.json",
+                "standalone/src/main.tsx",
+                "standalone/src/App.tsx",
+            ]
             for viewport in ("390x844", "1280x800"):
                 width, height = (int(part) for part in viewport.split("x"))
                 write_png(run_dir / "evidence" / f"{viewport}.png", width, height)
@@ -200,8 +263,9 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 run_dir,
                 "implementation.json",
                 self.implementation(
+                    run_dir,
                     "standalone/src/main.tsx",
-                    ["standalone/package.json", "standalone/src/main.tsx"],
+                    standalone_files,
                 ),
             )
             run_state.transition_run(run_dir, "prototype_ready")

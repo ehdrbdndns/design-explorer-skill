@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import struct
 import tempfile
@@ -33,6 +34,18 @@ def write_png(path: Path, width: int, height: int) -> None:
     path.write_bytes(png)
 
 
+def preview_digest(root: Path, files: list[str]) -> str:
+    digest = hashlib.sha256()
+    for relative in sorted(files):
+        name = relative.encode("utf-8")
+        data = (root / relative).read_bytes()
+        digest.update(struct.pack(">Q", len(name)))
+        digest.update(name)
+        digest.update(struct.pack(">Q", len(data)))
+        digest.update(data)
+    return "sha256:" + digest.hexdigest()
+
+
 def run_manifest(project_path: str | None, production_paths=None):
     return {
         "schema_version": 2,
@@ -54,9 +67,10 @@ def run_manifest(project_path: str | None, production_paths=None):
     }
 
 
-def viewport_check(viewport: str):
+def viewport_check(viewport: str, source_digest: str):
     return {
         "screenshot_ref": f"evidence/{viewport}.png",
+        "source_digest": source_digest,
         "content": "pass",
         "overflow": "pass",
         "accessibility": "pass",
@@ -74,18 +88,31 @@ class PreviewEvidenceTests(unittest.TestCase):
         self.run.mkdir()
         self.project = self.root / "project"
         (self.project / "src").mkdir(parents=True)
-        (self.project / "src" / "App.tsx").write_text("production", encoding="utf-8")
+        (self.project / "package.json").write_text(
+            '{"dependencies":{"react":"1","react-dom":"1"}}', encoding="utf-8"
+        )
+        (self.project / "src" / "App.tsx").write_text(
+            "import { Preview } from '../previews/Checkout';\n"
+            "import routes from '../previews/routes.json';\n"
+            "export const resolve = (path: string) => routes[path] ? Preview : null;",
+            encoding="utf-8",
+        )
         (self.project / "previews").mkdir()
         (self.project / "previews" / "Checkout.tsx").write_text("preview", encoding="utf-8")
+        (self.project / "previews" / "routes.json").write_text(
+            '{"/design-explorer/checkout":"Checkout"}', encoding="utf-8"
+        )
         for viewport in ("390x844", "1440x900"):
             width, height = (int(part) for part in viewport.split("x"))
             write_png(self.run / f"evidence/{viewport}.png", width, height)
         self.manifest = run_manifest(str(self.project), ["src/App.tsx"])
+        project_preview_files = ["previews/Checkout.tsx", "previews/routes.json"]
+        source_digest = preview_digest(self.project, project_preview_files)
         self.implementation = {
             "selected_direction_id": "a",
             "mode": "project",
             "preview_path": "previews/Checkout.tsx",
-            "preview_files": ["previews/Checkout.tsx"],
+            "preview_files": project_preview_files,
             "preview_route": "/design-explorer/checkout",
             "verification": {
                 "rendered_viewports": ["390x844", "1440x900"],
@@ -95,7 +122,7 @@ class PreviewEvidenceTests(unittest.TestCase):
                     "accessibility": "pass",
                 },
                 "viewport_checks": {
-                    viewport: viewport_check(viewport)
+                    viewport: viewport_check(viewport, source_digest)
                     for viewport in ("390x844", "1440x900")
                 },
             },
@@ -119,16 +146,150 @@ class PreviewEvidenceTests(unittest.TestCase):
     def test_standalone_preview_is_scoped_to_run_and_requires_vite_entry(self):
         standalone = self.run / "standalone"
         (standalone / "src").mkdir(parents=True)
+        (standalone / "package.json").write_text(
+            json.dumps(
+                {
+                    "scripts": {"dev": "vite", "build": "vite build"},
+                    "dependencies": {"react": "1", "react-dom": "1"},
+                    "devDependencies": {
+                        "vite": "1",
+                        "typescript": "1",
+                        "@vitejs/plugin-react": "1",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (standalone / "index.html").write_text(
+            '<div id="root"></div><script type="module" src="/src/main.tsx"></script>',
+            encoding="utf-8",
+        )
+        (standalone / "vite.config.ts").write_text(
+            "import react from '@vitejs/plugin-react';\nexport default {plugins:[react()]}",
+            encoding="utf-8",
+        )
+        (standalone / "tsconfig.json").write_text("{}", encoding="utf-8")
+        (standalone / "src" / "main.tsx").write_text(
+            "import { createRoot } from 'react-dom/client';\n"
+            "import App from './App';\ncreateRoot(document.getElementById('root')!).render(<App />);",
+            encoding="utf-8",
+        )
+        (standalone / "src" / "App.tsx").write_text(
+            "export default function App(){return <main>Preview</main>}", encoding="utf-8"
+        )
+        manifest = run_manifest(None)
+        implementation = copy.deepcopy(self.implementation)
+        standalone_files = [
+            "standalone/package.json",
+            "standalone/index.html",
+            "standalone/vite.config.ts",
+            "standalone/tsconfig.json",
+            "standalone/src/main.tsx",
+            "standalone/src/App.tsx",
+        ]
+        implementation.update(
+            mode="standalone",
+            preview_path="standalone/src/main.tsx",
+            preview_files=standalone_files,
+        )
+        digest = preview_digest(self.run, standalone_files)
+        for check in implementation["verification"]["viewport_checks"].values():
+            check["source_digest"] = digest
+        self.assertEqual(self.validate(manifest, implementation), [])
+
+    def test_standalone_rejects_incomplete_vite_react_topology(self):
+        standalone = self.run / "standalone"
+        (standalone / "src").mkdir(parents=True)
         (standalone / "package.json").write_text('{"scripts":{"dev":"vite"}}', encoding="utf-8")
         (standalone / "src" / "main.tsx").write_text("entry", encoding="utf-8")
         manifest = run_manifest(None)
         implementation = copy.deepcopy(self.implementation)
+        files = ["standalone/package.json", "standalone/src/main.tsx"]
         implementation.update(
             mode="standalone",
             preview_path="standalone/src/main.tsx",
-            preview_files=["standalone/package.json", "standalone/src/main.tsx"],
+            preview_files=files,
         )
-        self.assertEqual(self.validate(manifest, implementation), [])
+        digest = preview_digest(self.run, files)
+        for check in implementation["verification"]["viewport_checks"].values():
+            check["source_digest"] = digest
+        errors = self.validate(manifest, implementation)
+        self.assertTrue(any("standalone" in error for error in errors), errors)
+
+    def test_standalone_dependency_versions_must_be_nonblank_strings(self):
+        standalone = self.run / "standalone"
+        (standalone / "src").mkdir(parents=True)
+        package = {
+            "scripts": {"dev": "vite", "build": "vite build"},
+            "dependencies": {"react": "", "react-dom": "1"},
+            "devDependencies": {
+                "vite": "1",
+                "typescript": "1",
+                "@vitejs/plugin-react": "1",
+            },
+        }
+        (standalone / "package.json").write_text(json.dumps(package), encoding="utf-8")
+        (standalone / "index.html").write_text(
+            '<script type="module" src="/src/main.tsx"></script>', encoding="utf-8"
+        )
+        (standalone / "vite.config.ts").write_text(
+            "import react from '@vitejs/plugin-react'; export default {plugins:[react()]}",
+            encoding="utf-8",
+        )
+        (standalone / "tsconfig.json").write_text("{}", encoding="utf-8")
+        (standalone / "src" / "main.tsx").write_text(
+            "import {createRoot} from 'react-dom/client'; import App from './App'; "
+            "createRoot(document.body).render(<App/>);",
+            encoding="utf-8",
+        )
+        (standalone / "src" / "App.tsx").write_text("export default ()=> <main/>", encoding="utf-8")
+        files = [
+            "standalone/package.json",
+            "standalone/index.html",
+            "standalone/vite.config.ts",
+            "standalone/tsconfig.json",
+            "standalone/src/main.tsx",
+            "standalone/src/App.tsx",
+        ]
+        implementation = copy.deepcopy(self.implementation)
+        implementation.update(
+            mode="standalone",
+            preview_path="standalone/src/main.tsx",
+            preview_files=files,
+        )
+        digest = preview_digest(self.run, files)
+        for check in implementation["verification"]["viewport_checks"].values():
+            check["source_digest"] = digest
+        errors = self.validate(run_manifest(None), implementation)
+        self.assertTrue(any("dependencies" in error for error in errors), errors)
+
+    def test_project_route_must_be_wired_and_source_digest_must_match(self):
+        route_file = self.project / "previews" / "routes.json"
+        route_file.write_text('{"/different":"Checkout"}', encoding="utf-8")
+        implementation = copy.deepcopy(self.implementation)
+        digest = preview_digest(self.project, implementation["preview_files"])
+        for check in implementation["verification"]["viewport_checks"].values():
+            check["source_digest"] = digest
+        errors = self.validate(implementation=implementation)
+        self.assertTrue(any("preview_route" in error for error in errors), errors)
+
+        route_file.write_text('{"/design-explorer/checkout":"Checkout"}', encoding="utf-8")
+        self.assertEqual(self.validate(), [])
+
+        production = self.project / "src" / "App.tsx"
+        production.write_text("export const unrelated = true;", encoding="utf-8")
+        errors = self.validate()
+        self.assertTrue(any("preview_route" in error for error in errors), errors)
+
+        production.write_text(
+            "import { Preview } from '../previews/Checkout';\n"
+            "import routes from '../previews/routes.json';\n"
+            "export const resolve = (path: string) => routes[path] ? Preview : null;",
+            encoding="utf-8",
+        )
+        (self.project / "previews" / "Checkout.tsx").write_text("changed", encoding="utf-8")
+        errors = self.validate()
+        self.assertTrue(any("source_digest" in error for error in errors), errors)
 
     def test_aggregate_checks_cannot_substitute_for_viewport_evidence(self):
         implementation = copy.deepcopy(self.implementation)
@@ -219,6 +380,14 @@ class PreviewEvidenceTests(unittest.TestCase):
             "/a//b",
             "/a/../b",
             "/a/%2e%2e/b",
+            "/a/%252e%252e/b",
+            "/a/%25252e%25252e/b",
+            "/a/%252f/b",
+            "/a/%255c/b",
+            "/a/%ZZ/b",
+            "/a/%25/b",
+            "/preview%253fq=1",
+            "/preview%2523fragment",
             "/preview?q=1",
             "/preview#x",
         ):

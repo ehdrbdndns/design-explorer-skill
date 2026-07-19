@@ -182,6 +182,47 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("Interactive requirements: none", research)
         self.assertIn("can-generate", skill)
 
+    def test_review_hardening_contracts_are_documented(self):
+        skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_DIR / "references/artifact-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        mockups = (SKILL_DIR / "references/mockups-implementation.md").read_text(
+            encoding="utf-8"
+        )
+        research = (SKILL_DIR / "references/research-evidence.md").read_text(
+            encoding="utf-8"
+        )
+        for phrase in (
+            "brief_constraints",
+            "brief_constraints_digest",
+            "brief_locked_at",
+            "accidental single-field mutation",
+            "does not protect against an attacker",
+            "source_digest",
+            "canonical sorted preview file paths and bytes",
+            "complete PNG chunk structure",
+            "CRC",
+            "IDAT",
+            "IEND",
+            "offline route resolution",
+            "not browser pixel rendering",
+        ):
+            self.assertTrue(
+                any(phrase in text for text in (contracts, mockups, research, skill)),
+                phrase,
+            )
+        for phrase in (
+            "react-dom",
+            "@vitejs/plugin-react",
+            "index.html",
+            "vite.config.ts",
+            "tsconfig.json",
+            "src/main.tsx",
+            "src/App.tsx",
+        ):
+            self.assertIn(phrase, contracts)
+
 
 if __name__ == "__main__":
     unittest.main()

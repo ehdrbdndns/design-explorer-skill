@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from design_explorer_import import load_script_module
+from test_preview_evidence import preview_digest, write_png
 
 
 validator = load_script_module("validate_run", "design-explorer/scripts/validate_run.py")
@@ -996,7 +997,11 @@ class ValidateRunTests(unittest.TestCase):
                 "preview_path": "standalone/src/main.tsx",
                 "preview_files": [
                     "standalone/package.json",
+                    "standalone/index.html",
+                    "standalone/vite.config.ts",
+                    "standalone/tsconfig.json",
                     "standalone/src/main.tsx",
+                    "standalone/src/App.tsx",
                 ],
                 "preview_route": "/preview",
                 "verification": {
@@ -1009,6 +1014,7 @@ class ValidateRunTests(unittest.TestCase):
                     "viewport_checks": {
                         "390x844": {
                             "screenshot_ref": "evidence/390x844.png",
+                            "source_digest": "replace-after-files",
                             "content": "pass",
                             "overflow": "pass",
                             "accessibility": "pass",
@@ -1022,14 +1028,45 @@ class ValidateRunTests(unittest.TestCase):
         )
         standalone = self.run / "standalone" / "src"
         standalone.mkdir(parents=True)
-        (self.run / "standalone" / "package.json").write_text("{}", encoding="utf-8")
-        (standalone / "main.tsx").write_text("entry", encoding="utf-8")
+        (self.run / "standalone" / "package.json").write_text(
+            json.dumps(
+                {
+                    "scripts": {"dev": "vite", "build": "vite build"},
+                    "dependencies": {"react": "1", "react-dom": "1"},
+                    "devDependencies": {
+                        "vite": "1",
+                        "typescript": "1",
+                        "@vitejs/plugin-react": "1",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.run / "standalone" / "index.html").write_text(
+            '<div id="root"></div><script type="module" src="/src/main.tsx"></script>',
+            encoding="utf-8",
+        )
+        (self.run / "standalone" / "vite.config.ts").write_text(
+            "import react from '@vitejs/plugin-react'; export default {plugins:[react()]}",
+            encoding="utf-8",
+        )
+        (self.run / "standalone" / "tsconfig.json").write_text("{}", encoding="utf-8")
+        (standalone / "main.tsx").write_text(
+            "import {createRoot} from 'react-dom/client'; import App from './App'; "
+            "createRoot(document.getElementById('root')!).render(<App/>);",
+            encoding="utf-8",
+        )
+        (standalone / "App.tsx").write_text(
+            "export default function App(){return <main>Preview</main>}", encoding="utf-8"
+        )
         evidence_dir = self.run / "evidence"
         evidence_dir.mkdir()
-        (evidence_dir / "390x844.png").write_bytes(
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
-            b"\x00\x00\x01\x86\x00\x00\x03\x4c"
-        )
+        write_png(evidence_dir / "390x844.png", 390, 844)
+        implementation_value = json.loads((self.run / "implementation.json").read_text())
+        implementation_value["verification"]["viewport_checks"]["390x844"][
+            "source_digest"
+        ] = preview_digest(self.run, implementation_value["preview_files"])
+        self.write("implementation.json", implementation_value)
         self.assertEqual(validator.validate_phase(self.run, "implementation"), [])
 
     def test_implementation_selection_must_be_non_empty_and_approved(self):

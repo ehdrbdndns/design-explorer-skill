@@ -18,11 +18,12 @@ Build evidence-backed directions, then implement only the user's selection. Use 
 7. Record approved IDs and transition to `directions_approved`.
 8. Read `references/mockups-implementation.md`; run `can-generate` immediately before each provider call and generate comparable full-screen UI mockups only when it returns true.
 9. Record outputs and validate coverage. Ask the user to select, or `revise` a bounded variation as a first-class direction ID and reapprove it.
-10. Implement an isolated preview using the active project's stack, or the standalone React fallback. Record exact-size per-viewport screenshots and item-level passing evidence before offering production integration.
+10. Implement a wired project preview or complete standalone fallback. Bind exact-size PNG evidence to current source bytes before offering integration.
 
 ## Hard gates
 
 - Do not call image generation unless `scripts/run_state.py can-generate --run <run-dir>` exits 0 immediately before the call.
+- Treat locked brief constraints, approved IDs, preview wiring, and `source_digest` as machine gates; never repair them by hand.
 - Do not present color-only variations as distinct directions; the validator enforces three axes.
 - Do not fabricate citations or hide conflicting evidence. Separate sources from inference.
 - Do not silently violate an official accessibility/platform baseline; disclose justified exceptions for explicit approval.
@@ -44,7 +45,6 @@ Run `scripts/validate_run.py` before consuming transitions; `scripts/run_state.p
 
 ## Common mistakes
 
-- Generating images from an enthusiastic reply without recording approved IDs.
 - Treating five palettes on one layout as five directions.
 - Reusing a primary ID for a combined direction instead of revising and reapproving it.
 - Citing a search-result thumbnail instead of the direct source.

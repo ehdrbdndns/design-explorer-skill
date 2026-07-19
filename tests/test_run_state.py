@@ -1,7 +1,6 @@
 import inspect
 import json
 import subprocess
-import struct
 import sys
 import tempfile
 import unittest
@@ -9,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from design_explorer_import import load_script_module
+from test_preview_evidence import preview_digest, write_png
 
 
 run_state = load_script_module("run_state", "design-explorer/scripts/run_state.py")
@@ -68,12 +68,16 @@ def direction(identifier, index):
     }
 
 
-def implementation(identifier="d-0"):
+def implementation(identifier="d-0", source_digest=None):
+    source_digest = source_digest or preview_digest(
+        Path(__file__).parent,
+        [],
+    )
     return {
         "selected_direction_id": identifier,
         "mode": "project",
         "preview_path": "previews/Checkout.tsx",
-        "preview_files": ["previews/Checkout.tsx"],
+        "preview_files": ["previews/Checkout.tsx", "previews/routes.json"],
         "preview_route": "/design-explorer/checkout",
         "verification": {
             "rendered_viewports": ["390x844"],
@@ -85,6 +89,7 @@ def implementation(identifier="d-0"):
             "viewport_checks": {
                 "390x844": {
                     "screenshot_ref": "evidence/390x844.png",
+                    "source_digest": source_digest,
                     "content": "pass",
                     "overflow": "pass",
                     "accessibility": "pass",
@@ -103,10 +108,17 @@ class RunStateTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.project_dir = self.root / "project"
         (self.project_dir / "src").mkdir(parents=True)
-        (self.project_dir / "src" / "App.tsx").write_text("production", encoding="utf-8")
+        (self.project_dir / "src" / "App.tsx").write_text(
+            "import { Preview } from '../previews/Checkout';\n"
+            "import routes from '../previews/routes.json';",
+            encoding="utf-8",
+        )
         (self.project_dir / "previews").mkdir()
         (self.project_dir / "previews" / "Checkout.tsx").write_text(
             "preview", encoding="utf-8"
+        )
+        (self.project_dir / "previews" / "routes.json").write_text(
+            '{"/design-explorer/checkout":"Checkout"}', encoding="utf-8"
         )
         self.run_dir = run_state.init_run(
             self.root,
@@ -121,10 +133,7 @@ class RunStateTests(unittest.TestCase):
         )
         screenshot = self.run_dir / "evidence" / "390x844.png"
         screenshot.parent.mkdir()
-        screenshot.write_bytes(
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
-            + struct.pack(">II", 390, 844)
-        )
+        write_png(screenshot, 390, 844)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -137,9 +146,28 @@ class RunStateTests(unittest.TestCase):
             path.write_text(value, encoding="utf-8")
 
     def set_state(self, state):
-        manifest = run_state.load_run(self.run_dir)
+        manifest = json.loads((self.run_dir / "run.json").read_text())
+        if state != "initialized" and "brief_constraints" not in manifest:
+            constraints = run_state._brief_constraints(manifest)
+            manifest["brief_constraints"] = constraints
+            manifest["brief_constraints_digest"] = run_state._constraints_digest(
+                constraints
+            )
+            manifest["brief_locked_at"] = "2026-07-19T12:00:00Z"
+        if run_state.STATES.index(state) >= run_state.STATES.index(
+            "directions_approved"
+        ):
+            self.write_research()
+            self.write_directions()
+            manifest["approved_direction_ids"] = manifest["approved_direction_ids"] or [
+                "d-0"
+            ]
         manifest["state"] = state
         self.write("run.json", manifest)
+
+    def implementation(self, identifier="d-0"):
+        files = ["previews/Checkout.tsx", "previews/routes.json"]
+        return implementation(identifier, preview_digest(self.project_dir, files))
 
     def write_brief(self):
         self.write("brief.md", "# Design Brief\n\nCheckout screen")
@@ -485,7 +513,7 @@ class RunStateTests(unittest.TestCase):
         manifest["approved_direction_ids"] = ["d-0"]
         manifest["selected_direction_id"] = "d-0"
         self.write("run.json", manifest)
-        self.write("implementation.json", implementation())
+        self.write("implementation.json", self.implementation())
         with self.assertRaisesRegex(ValueError, "explicit integration approval"):
             run_state.transition_run(self.run_dir, "integrated")
 
@@ -500,10 +528,10 @@ class RunStateTests(unittest.TestCase):
 
     def test_revision_archives_mockups_and_returns_to_pending_approval(self):
         self.set_state("mockups_generated")
-        self.write_mockups(["a"])
+        self.write_mockups(["d-0"])
         manifest = run_state.load_run(self.run_dir)
-        manifest["approved_direction_ids"] = ["a"]
-        manifest["selected_direction_id"] = "a"
+        manifest["approved_direction_ids"] = ["d-0"]
+        manifest["selected_direction_id"] = "d-0"
         manifest["generation_budget"] = 8
         manifest["max_attempts_per_direction"] = 3
         manifest["budget_expansion_approved_at"] = "2026-07-19T12:02:00Z"
@@ -538,11 +566,11 @@ class RunStateTests(unittest.TestCase):
             {
                 "mockups": [
                     {
-                        "direction_id": "a",
+                        "direction_id": "d-0",
                         "status": "success",
                         "viewport": "390x844",
                         "prompt_digest": DIGEST,
-                        "output_ref": "mockups/a.png",
+                        "output_ref": "mockups/d-0.png",
                         "attempt_count": 1,
                     }
                 ]
@@ -561,12 +589,12 @@ class RunStateTests(unittest.TestCase):
 
     def test_revision_preserves_current_manifest_on_archive_collision(self):
         self.set_state("mockups_generated")
-        current = {"mockups": [self._mockup("current")]}
+        current = {"mockups": [self._mockup("d-0")]}
         archived = {"mockups": [{"direction_id": "archived"}]}
         self.write("mockup-manifest.json", current)
         self.write("mockup-manifest.revision-1.json", archived)
         manifest = run_state.load_run(self.run_dir)
-        manifest["approved_direction_ids"] = ["current"]
+        manifest["approved_direction_ids"] = ["d-0"]
         self.write("run.json", manifest)
 
         with self.assertRaisesRegex(ValueError, "archive already exists"):
@@ -586,10 +614,10 @@ class RunStateTests(unittest.TestCase):
 
     def test_revision_rolls_back_archive_when_run_write_fails(self):
         self.set_state("mockups_generated")
-        current = {"mockups": [self._mockup("current")]}
+        current = {"mockups": [self._mockup("d-0")]}
         self.write("mockup-manifest.json", current)
         manifest = run_state.load_run(self.run_dir)
-        manifest["approved_direction_ids"] = ["current"]
+        manifest["approved_direction_ids"] = ["d-0"]
         self.write("run.json", manifest)
 
         with mock.patch.object(
@@ -661,10 +689,10 @@ class RunStateTests(unittest.TestCase):
 
     def test_revision_validates_mockups_before_archiving_or_mutating(self):
         cases = (
-            {**self._mockup("b")},
-            {**self._mockup("a"), "attempt_count": 999},
-            {**self._mockup("a"), "output_ref": "../private.png"},
-            {**self._mockup("a"), "status": "complete"},
+            {**self._mockup("d-1")},
+            {**self._mockup("d-0"), "attempt_count": 999},
+            {**self._mockup("d-0"), "output_ref": "../private.png"},
+            {**self._mockup("d-0"), "status": "complete"},
         )
         for index, invalid in enumerate(cases):
             with self.subTest(index=index), tempfile.TemporaryDirectory() as temp:
@@ -678,8 +706,24 @@ class RunStateTests(unittest.TestCase):
                     required_interactions=["Edit order"],
                 )
                 manifest = run_state.load_run(run_dir)
+                constraints = run_state._brief_constraints(manifest)
+                manifest["brief_constraints"] = constraints
+                manifest["brief_constraints_digest"] = run_state._constraints_digest(
+                    constraints
+                )
+                manifest["brief_locked_at"] = "2026-07-19T12:00:00Z"
                 manifest["state"] = "mockups_generated"
-                manifest["approved_direction_ids"] = ["a"]
+                manifest["approved_direction_ids"] = ["d-0"]
+                (run_dir / "evidence.json").write_text(
+                    json.dumps([evidence()]), encoding="utf-8"
+                )
+                (run_dir / "directions.json").write_text(
+                    json.dumps([direction(f"d-{item}", item) for item in range(5)]),
+                    encoding="utf-8",
+                )
+                (run_dir / "mood-directions.md").write_text(
+                    "# Directions", encoding="utf-8"
+                )
                 (run_dir / "run.json").write_text(json.dumps(manifest), encoding="utf-8")
                 (run_dir / "mockup-manifest.json").write_text(
                     json.dumps({"mockups": [invalid]}), encoding="utf-8"
@@ -762,7 +806,7 @@ class RunStateTests(unittest.TestCase):
             run_state.transition_run(self.run_dir, "prototype_ready")
         self.assertEqual(run_state.load_run(self.run_dir)["state"], "implementation_selected")
 
-        self.write("implementation.json", implementation())
+        self.write("implementation.json", self.implementation())
         run_state.transition_run(self.run_dir, "prototype_ready")
         self.write("implementation.json", {})
         with self.assertRaisesRegex(ValueError, "implementation validation failed"):
@@ -847,7 +891,7 @@ class RunStateTests(unittest.TestCase):
             )["selected_direction_id"],
             "d-0",
         )
-        self.write("implementation.json", implementation())
+        self.write("implementation.json", self.implementation())
         self.assertEqual(run_state.transition_run(self.run_dir, "prototype_ready")["state"], "prototype_ready")
         integrated = run_state.transition_run(
             self.run_dir,
@@ -886,9 +930,9 @@ class RunStateTests(unittest.TestCase):
 
     def test_cli_revises_mockups_with_an_audit_reason(self):
         self.set_state("mockups_generated")
-        self.write_mockups(["current"])
+        self.write_mockups(["d-0"])
         manifest = run_state.load_run(self.run_dir)
-        manifest["approved_direction_ids"] = ["current"]
+        manifest["approved_direction_ids"] = ["d-0"]
         self.write("run.json", manifest)
 
         result = subprocess.run(
@@ -920,7 +964,7 @@ class RunStateTests(unittest.TestCase):
         manifest["approved_direction_ids"] = ["d-0"]
         manifest["selected_direction_id"] = "d-0"
         self.write("run.json", manifest)
-        self.write("implementation.json", implementation())
+        self.write("implementation.json", self.implementation())
 
         result = subprocess.run(
             [

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import importlib.util
 import json
 import re
@@ -80,6 +81,31 @@ def write_json_atomic(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
+def _normalize_project_path(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("project_path must be a nonblank string or null")
+    return str(Path(value).expanduser().resolve(strict=False))
+
+
+def _brief_constraints(manifest: dict) -> dict:
+    return {
+        "project_path": manifest["project_path"],
+        "target_viewports": manifest["target_viewports"],
+        "required_content": manifest["required_content"],
+        "required_interactions": manifest["required_interactions"],
+        "production_paths": manifest["production_paths"],
+    }
+
+
+def _constraints_digest(constraints: dict) -> str:
+    canonical = json.dumps(
+        constraints, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
 def _normalize_strings(values: list[str] | None, label: str) -> list[str]:
     if values is not None and not isinstance(values, list):
         raise ValueError(f"{label} must be a list")
@@ -150,6 +176,7 @@ def init_run(
         required_interactions, "required_interactions"
     )
     normalized_production_paths = _normalize_production_paths(production_paths)
+    normalized_project_path = _normalize_project_path(project_path)
     run_dir = Path(root).expanduser() / identifier
     run_dir.mkdir(parents=True, exist_ok=False)
     manifest = {
@@ -159,7 +186,7 @@ def init_run(
         "state": "initialized",
         "created_at": timestamp,
         "updated_at": timestamp,
-        "project_path": project_path,
+        "project_path": normalized_project_path,
         "approved_direction_ids": [],
         "selected_direction_id": None,
         "revision_count": 0,
@@ -182,6 +209,7 @@ def load_run(run_dir: Path) -> dict:
     except (json.JSONDecodeError, OSError) as error:
         raise ValueError(f"invalid run.json: {error}") from None
     validate_run_manifest(manifest)
+    validate_state_artifacts(Path(run_dir), manifest)
     return manifest
 
 
@@ -226,6 +254,10 @@ def validate_run_manifest(manifest: object) -> None:
         manifest["project_path"], str
     ):
         raise ValueError("invalid run.json: project_path must be a string or null")
+    if manifest["project_path"] is not None and _normalize_project_path(
+        manifest["project_path"]
+    ) != manifest["project_path"]:
+        raise ValueError("invalid run.json: project_path must be normalized and absolute")
     approved = manifest["approved_direction_ids"]
     if (
         not isinstance(approved, list)
@@ -267,6 +299,24 @@ def validate_run_manifest(manifest: object) -> None:
             raise ValueError("invalid run.json: target_viewports must not be empty after initialization")
         if not manifest["required_content"]:
             raise ValueError("invalid run.json: required_content must not be empty after initialization")
+        for key in (
+            "brief_constraints",
+            "brief_constraints_digest",
+            "brief_locked_at",
+        ):
+            if key not in manifest:
+                raise ValueError(f"invalid run.json: missing required key: {key}")
+        constraints = manifest["brief_constraints"]
+        if not isinstance(constraints, dict) or set(constraints) != set(
+            _brief_constraints(manifest)
+        ):
+            raise ValueError("invalid run.json: brief constraints snapshot is malformed")
+        if constraints != _brief_constraints(manifest):
+            raise ValueError("invalid run.json: current fields differ from brief constraints")
+        if manifest["brief_constraints_digest"] != _constraints_digest(constraints):
+            raise ValueError("invalid run.json: brief_constraints_digest does not match snapshot")
+        if not valid_rfc3339(manifest["brief_locked_at"]):
+            raise ValueError("invalid run.json: brief_locked_at must be RFC3339")
     expanded = (
         manifest["generation_budget"] > DEFAULT_GENERATION_BUDGET
         or manifest["max_attempts_per_direction"]
@@ -287,6 +337,32 @@ def validate_run_manifest(manifest: object) -> None:
     ):
         raise ValueError(
             "invalid run.json: integration_approved_at must be a non-empty string"
+        )
+
+
+def validate_state_artifacts(run_dir: Path, manifest: dict) -> None:
+    if STATES.index(manifest["state"]) < STATES.index("directions_approved"):
+        return
+    approved = manifest["approved_direction_ids"]
+    if not approved:
+        raise ValueError(
+            "invalid run.json: approved_direction_ids must be non-empty after approval"
+        )
+    if len(approved) > manifest["generation_budget"]:
+        raise ValueError("invalid run.json: approved_direction_ids exceed generation_budget")
+    errors = _validator_module().validate_phase(run_dir, "directions")
+    if errors:
+        raise ValueError(f"invalid current directions artifact: {'; '.join(errors[:5])}")
+    try:
+        directions = json.loads((run_dir / "directions.json").read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise ValueError(f"invalid current directions artifact: {error}") from None
+    known = {item["id"] for item in directions}
+    unknown = set(approved) - known
+    if unknown:
+        raise ValueError(
+            "invalid run.json: approved IDs are not in current directions: "
+            + ", ".join(sorted(unknown))
         )
 
 
@@ -372,6 +448,12 @@ def transition_run(
         if not integration_approved:
             raise ValueError("integrated requires explicit integration approval")
         manifest["integration_approved_at"] = timestamp
+
+    if target == "brief_ready":
+        constraints = _brief_constraints(manifest)
+        manifest["brief_constraints"] = constraints
+        manifest["brief_constraints_digest"] = _constraints_digest(constraints)
+        manifest["brief_locked_at"] = timestamp
 
     if target == "directions_approved":
         if not approved_direction_ids:

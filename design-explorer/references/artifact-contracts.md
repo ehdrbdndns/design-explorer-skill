@@ -4,7 +4,7 @@ Use this contract when creating, resuming, validating, or transitioning a design
 
 ## Run directory and states
 
-The default run directory is `~/.codex/design-explorer/runs/<run-id>/`. Keep each exploration isolated in one run directory. New manifests use schema version 2. `run.json` records identity/state fields plus normalized, unique `target_viewports`, `required_content`, `required_interactions`, and safe project-relative `production_paths`. It also records approved/selected direction IDs, `revision_count`, `generation_budget` (default 5), `max_attempts_per_direction` (default 2), approval timestamps, and revision audit fields. Unsupported schemas must be migrated or reinitialized; do not edit a version number to simulate migration.
+The default run directory is `~/.codex/design-explorer/runs/<run-id>/`. Keep each exploration isolated in one run directory. New manifests use schema version 2. `run.json` records identity/state fields plus normalized, unique `target_viewports`, `required_content`, `required_interactions`, and safe project-relative `production_paths`. `project_path` is expanded and normalized to an absolute path at initialization. It also records approved/selected direction IDs, `revision_count`, generation limits, approval timestamps, and revision audit fields. Unsupported schemas must be migrated or reinitialized; do not edit a version number to simulate migration.
 
 Follow this primary state sequence without skipping steps:
 
@@ -24,6 +24,8 @@ python3 scripts/run_state.py status --run <run-dir>
 
 Repeat each flag as needed. Viewports use positive `WIDTHxHEIGHT` dimensions no greater than 10000. `brief_ready` requires at least one viewport and content item. UI runs should record every required interaction; a truly static brief may leave the list empty only when `brief.md` contains the exact line `Interactive requirements: none`.
 
+The `brief_ready` transition atomically writes `brief_constraints`, `brief_constraints_digest` (SHA-256 of canonical sorted-key JSON), and RFC3339 `brief_locked_at`. Every later load and transition requires the current project path and four requirement lists to equal that snapshot and verifies its digest. This detects accidental single-field mutation inside the writable trust root; it does not protect against an attacker rewriting both the snapshot and digest.
+
 After writing `brief.md`, transition to `brief_ready`:
 
 ```bash
@@ -41,7 +43,7 @@ python3 scripts/run_state.py transition --run <run-dir> --to directions_approved
 python3 scripts/run_state.py can-generate --run <run-dir>
 ```
 
-Repeat `--approved-direction <id>` for every explicitly approved direction. Run `can-generate --run <run-dir>` immediately before every provider call; exit 0/`true` is authorization, while any invalid, tampered, or wrong-state run fails closed with exit 1/`false`. After image output is recorded, execute the remaining steps in this order:
+Repeat `--approved-direction <id>` for every explicitly approved direction. At and after `directions_approved`, every load checks that approved IDs are non-empty, unique, present in the currently valid directions artifact, and within `generation_budget`. Run `can-generate --run <run-dir>` immediately before every provider call; invalid, tampered, or wrong-state runs fail closed with exit 1/`false`. After image output is recorded, execute the remaining steps in this order:
 
 The approval count cannot exceed `generation_budget`. A user-approved expansion is explicit and auditable. Whenever either limit exceeds its default, `budget_expansion_approved_at` is required and must be a valid RFC3339 timestamp; the field is forbidden when neither limit is expanded:
 
@@ -170,9 +172,11 @@ The list cannot exceed `generation_budget`. It contains exactly one current entr
 - aggregate `verification.checks` whose `content`, `overflow`, and `accessibility` values are all `pass`
 - `verification.viewport_checks`, keyed exactly by every target viewport
 
-Each viewport record has `content`, `overflow`, `accessibility`, and `interaction` set to `pass`; exact-key `required_content` and `required_interactions` maps with every value `pass`; and a safe run-relative `screenshot_ref`. The screenshot is stored inside the run directory and must be a PNG whose IHDR dimensions exactly match its viewport.
+Each viewport record has `content`, `overflow`, `accessibility`, and `interaction` set to `pass`; exact-key `required_content` and `required_interactions` maps with every value `pass`; a safe run-relative `screenshot_ref`; and `source_digest`. The digest is SHA-256 over canonical sorted preview file paths and bytes, with length framing, and must match current files. The screenshot is stored inside the run directory. Validation checks complete PNG chunk structure: signature, first 13-byte IHDR and its dimensions, bounded chunks/file, CRC for every chunk, at least one IDAT, exactly one terminal zero-length IEND, and no truncation or trailing bytes. It does not decode pixels.
 
-In project mode, `project_path` is an existing absolute directory. Preview files exist beneath it, while every `production_paths` entry exists and cannot contain or equal a preview file. In standalone mode, production paths are empty; preview files live beneath the run directory and include `package.json` plus `src/main.*` or `src/index.*` entry source. Aggregate checks never substitute for per-viewport evidence.
+In project mode, `project_path` is an existing absolute directory. Preview files exist beneath it, every `production_paths` entry exists and cannot contain or equal a preview file, the exact `preview_route` appears in a recorded preview route/source file, and recorded production source consumes that wiring. A detached TSX file does not pass.
+
+In standalone mode, production paths are empty and all files live beneath the run directory. `preview_files` includes valid `package.json` with `dev`/`build` scripts, `react`/`react-dom`, and `vite`/`typescript`/`@vitejs/plugin-react`; `index.html` loading `/src/main.tsx`; `vite.config.ts`; valid `tsconfig.json`; a React `createRoot` `src/main.tsx`; and nonblank `src/App.tsx`. Aggregate checks never substitute for per-viewport evidence. Tests exercise deterministic topology and offline route resolution, not browser pixel rendering; screenshot evidence remains a separate renderer responsibility.
 
 Validate this file before `prototype_ready`. The isolated preview remains separate from production until the user explicitly approves integration.
 
