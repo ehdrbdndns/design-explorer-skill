@@ -135,6 +135,22 @@ class SkillContractTests(unittest.TestCase):
         ):
             self.assertIn(phrase.lower(), research.lower())
 
+    def test_preview_verification_requires_visible_content_and_operable_controls(self):
+        mockups = (SKILL_DIR / "references/mockups-implementation.md").read_text(
+            encoding="utf-8"
+        )
+
+        for phrase in (
+            "At every target viewport",
+            "each required brief content item",
+            "operable, tested disclosure path",
+            "`Edit`, `Change`, or `Apply`",
+            "function or must not be presented as a control",
+            "rendered and interactive state, not DOM presence",
+            "Do not record `content: pass` while required content is inaccessible",
+        ):
+            self.assertIn(phrase, mockups)
+
 
 if __name__ == "__main__":
     unittest.main()
