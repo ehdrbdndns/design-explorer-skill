@@ -687,8 +687,19 @@ def image_generation_allowed(run_dir: Path, direction_id: str) -> bool:
         return False
 
 
-def _replace_path(source: Path, destination: Path) -> None:
-    os.replace(source, destination)
+def _replace_path(
+    source: str | Path,
+    destination: str | Path,
+    *,
+    src_dir_fd: int | None = None,
+    dst_dir_fd: int | None = None,
+) -> None:
+    os.replace(
+        source,
+        destination,
+        src_dir_fd=src_dir_fd,
+        dst_dir_fd=dst_dir_fd,
+    )
 
 
 def _fsync_generation_file(descriptor: int) -> None:
@@ -709,99 +720,276 @@ def _write_all(descriptor: int, data: bytes) -> None:
         remaining = remaining[written:]
 
 
-def _write_generation_temp(path: Path, data: bytes) -> None:
-    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+def _read_all(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks = []
+    while True:
+        chunk = os.read(descriptor, 64 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+@dataclass(frozen=True)
+class _StagedGenerationManifest:
+    descriptor: int
+    name: str
+    data: bytes
+    value: dict
+    device: int
+    inode: int
+
+
+def _validate_generation_bytes(data: bytes, expected_value: dict, label: str) -> None:
     try:
+        parsed = json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError(f"{label} is invalid JSON: {error}") from None
+    if parsed != expected_value:
+        raise ValueError(f"{label} does not match reservation")
+
+
+def _fsync_directory_descriptor(descriptor: int) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        if error.errno not in {errno.EINVAL, errno.ENOTSUP, errno.EBADF}:
+            raise
+
+
+def _named_inode_matches(directory_fd: int, name: str, device: int, inode: int) -> bool:
+    try:
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return (named.st_dev, named.st_ino) == (device, inode)
+
+
+def _stage_generation_manifest(
+    owner,
+    value: dict,
+    transaction_id: str,
+    exact_data: bytes | None = None,
+) -> _StagedGenerationManifest:
+    name = f".mockup-manifest.json.generation-{transaction_id}.tmp"
+    data = (
+        (json.dumps(value, indent=2) + "\n").encode("utf-8")
+        if exact_data is None
+        else exact_data
+    )
+    descriptor = os.open(
+        name,
+        os.O_CREAT
+        | os.O_EXCL
+        | os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=owner.descriptor,
+    )
+    initial = os.fstat(descriptor)
+    try:
+        if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1:
+            raise ValueError("staged generation manifest must be a private regular file")
         _write_all(descriptor, data)
         _fsync_generation_file(descriptor)
+        staged_data = _read_all(descriptor)
+        if staged_data != data:
+            raise ValueError("staged generation manifest bytes do not match reservation")
+        _validate_generation_bytes(staged_data, value, "staged generation manifest")
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or (current.st_dev, current.st_ino) != (initial.st_dev, initial.st_ino)
+            or not _named_inode_matches(
+                owner.descriptor, name, current.st_dev, current.st_ino
+            )
+        ):
+            raise ValueError("staged generation manifest inode changed")
+        return _StagedGenerationManifest(
+            descriptor,
+            name,
+            data,
+            value,
+            current.st_dev,
+            current.st_ino,
+        )
+    except BaseException:
+        if _named_inode_matches(
+            owner.descriptor, name, initial.st_dev, initial.st_ino
+        ):
+            try:
+                os.unlink(name, dir_fd=owner.descriptor)
+            except FileNotFoundError:
+                pass
+        os.close(descriptor)
+        raise
+
+
+def _close_staged_generation_manifest(owner, stage: _StagedGenerationManifest) -> None:
+    try:
+        if _named_inode_matches(
+            owner.descriptor, stage.name, stage.device, stage.inode
+        ):
+            try:
+                os.unlink(stage.name, dir_fd=owner.descriptor)
+            except FileNotFoundError:
+                pass
+    finally:
+        os.close(stage.descriptor)
+
+
+def _read_run_file(owner, name: str) -> tuple[bytes, os.stat_result]:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=owner.descriptor,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{name} must be a regular file")
+        return _read_all(descriptor), metadata
     finally:
         os.close(descriptor)
 
 
-def _validate_staged_generation_manifest(
-    path: Path, expected_data: bytes, expected_value: dict
-) -> None:
+def _published_stage_matches(owner, stage: _StagedGenerationManifest) -> bool:
     try:
-        staged_data = path.read_bytes()
-        staged_value = json.loads(staged_data)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
-        raise ValueError(f"staged generation manifest is invalid: {error}") from None
-    if staged_data != expected_data or staged_value != expected_value:
-        raise ValueError("staged generation manifest does not match reservation")
+        data, metadata = _read_run_file(owner, "mockup-manifest.json")
+    except (OSError, ValueError):
+        return False
+    if (
+        (metadata.st_dev, metadata.st_ino) != (stage.device, stage.inode)
+        or metadata.st_nlink != 1
+        or data != stage.data
+    ):
+        return False
+    try:
+        _validate_generation_bytes(
+            data, stage.value, "published generation manifest"
+        )
+    except ValueError:
+        return False
+    return True
 
 
-def _fsync_run_directory(run_dir: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(run_dir, flags)
+def _target_bytes_match(owner, expected: bytes) -> bool:
     try:
-        try:
-            os.fsync(descriptor)
-        except OSError as error:
-            if error.errno not in {errno.EINVAL, errno.ENOTSUP, errno.EBADF}:
-                raise
+        data, _metadata = _read_run_file(owner, "mockup-manifest.json")
+    except (OSError, ValueError):
+        return False
+    return data == expected
+
+
+def _restore_generation_manifest(owner, prior_data: bytes) -> None:
+    try:
+        prior_value = json.loads(prior_data)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError(f"prior generation manifest is invalid: {error}") from None
+    rollback = _stage_generation_manifest(
+        owner, prior_value, uuid.uuid4().hex, exact_data=prior_data
+    )
+    try:
+        if not _named_inode_matches(
+            owner.descriptor, rollback.name, rollback.device, rollback.inode
+        ):
+            raise ValueError("rollback generation manifest inode changed")
+        _replace_path(
+            rollback.name,
+            "mockup-manifest.json",
+            src_dir_fd=owner.descriptor,
+            dst_dir_fd=owner.descriptor,
+        )
+        _fsync_directory_descriptor(owner.descriptor)
+        if not _published_stage_matches(owner, rollback):
+            raise ValueError("failed to restore prior generation manifest")
     finally:
-        os.close(descriptor)
+        _close_staged_generation_manifest(owner, rollback)
 
 
 def _write_mockup_manifest_atomic(
-    run_dir: Path, value: dict, transaction_id: str
+    owner, value: dict, prior_data: bytes
 ) -> None:
-    destination = run_dir / "mockup-manifest.json"
-    temporary = run_dir / (
-        f".mockup-manifest.json.generation-{transaction_id}.tmp"
-    )
-    data = (json.dumps(value, indent=2) + "\n").encode("utf-8")
+    stage = _stage_generation_manifest(owner, value, owner.transaction_id)
     try:
-        _write_generation_temp(temporary, data)
-        _validate_staged_generation_manifest(temporary, data, value)
-        _replace_path(temporary, destination)
-        _fsync_run_directory(run_dir)
-    finally:
+        if not _named_inode_matches(
+            owner.descriptor, stage.name, stage.device, stage.inode
+        ):
+            raise ValueError("staged generation manifest inode changed before publish")
         try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-
-
-def _generation_temp_paths(run_dir: Path, transaction_id: str | None) -> list[Path]:
-    paths = []
-    for path in run_dir.glob(".mockup-manifest.json.generation-*.tmp"):
-        match = GENERATION_TEMP_PATTERN.fullmatch(path.name)
-        if match and (transaction_id is None or match.group(1) == transaction_id):
-            paths.append(path)
-    return paths
+            _replace_path(
+                stage.name,
+                "mockup-manifest.json",
+                src_dir_fd=owner.descriptor,
+                dst_dir_fd=owner.descriptor,
+            )
+            _fsync_directory_descriptor(owner.descriptor)
+        except BaseException:
+            if _published_stage_matches(owner, stage):
+                raise
+            if not _target_bytes_match(owner, prior_data):
+                _restore_generation_manifest(owner, prior_data)
+            raise
+        if not _published_stage_matches(owner, stage):
+            if not _target_bytes_match(owner, prior_data):
+                _restore_generation_manifest(owner, prior_data)
+            raise ValueError(
+                "published generation manifest does not match staged reservation"
+            )
+        try:
+            _assert_generation_run_identity(owner)
+        except BaseException:
+            _restore_generation_manifest(owner, prior_data)
+            raise
+    finally:
+        _close_staged_generation_manifest(owner, stage)
 
 
 @dataclass(frozen=True)
 class _GenerationLock:
     descriptor: int
     transaction_id: str
-    path: Path
+    run_dir: Path
+    device: int
+    inode: int
+
+
+def _assert_generation_run_identity(owner: _GenerationLock) -> None:
+    descriptor_stat = os.fstat(owner.descriptor)
+    try:
+        path_stat = owner.run_dir.stat(follow_symlinks=False)
+    except (FileNotFoundError, OSError):
+        raise ValueError("generation run directory path was replaced") from None
+    if (
+        not stat.S_ISDIR(descriptor_stat.st_mode)
+        or (descriptor_stat.st_dev, descriptor_stat.st_ino)
+        != (owner.device, owner.inode)
+        or (path_stat.st_dev, path_stat.st_ino) != (owner.device, owner.inode)
+    ):
+        raise ValueError("generation run directory path was replaced")
 
 
 def _unlock_generation_lock(owner: _GenerationLock) -> None:
     fcntl.flock(owner.descriptor, fcntl.LOCK_UN)
 
 
-def _write_generation_lock_payload(descriptor: int, payload: bytes) -> None:
-    os.ftruncate(descriptor, 0)
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    _write_all(descriptor, payload)
-    os.fsync(descriptor)
-
-
 def _generation_lock_is_held(run_dir: Path) -> bool:
-    lock_path = run_dir / ".generation.lock"
+    resolved = Path(run_dir).expanduser().resolve(strict=True)
+    descriptor = os.open(
+        resolved,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
     try:
-        descriptor = os.open(
-            lock_path,
-            os.O_RDWR
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-    except FileNotFoundError:
-        return False
-    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("generation run path must be a directory")
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
@@ -815,14 +1003,13 @@ def _generation_lock_is_held(run_dir: Path) -> bool:
 
 
 def _acquire_generation_lock(run_dir: Path, timestamp: str) -> _GenerationLock:
-    lock_path = run_dir / ".generation.lock"
+    resolved = Path(run_dir).expanduser().resolve(strict=True)
     descriptor = os.open(
-        lock_path,
-        os.O_CREAT
-        | os.O_RDWR
+        resolved,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
     )
     try:
         try:
@@ -834,33 +1021,28 @@ def _acquire_generation_lock(run_dir: Path, timestamp: str) -> _GenerationLock:
                 ) from None
             raise
         descriptor_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(descriptor_stat.st_mode):
-            raise ValueError("generation authorization lock must be a regular file")
-        path_stat = lock_path.stat()
-        if (descriptor_stat.st_dev, descriptor_stat.st_ino) != (
-            path_stat.st_dev,
-            path_stat.st_ino,
-        ):
-            raise ValueError("generation authorization lock path was replaced")
+        if not stat.S_ISDIR(descriptor_stat.st_mode):
+            raise ValueError("generation run path must be a directory")
         transaction_id = uuid.uuid4().hex
-        owner = _GenerationLock(descriptor, transaction_id, lock_path)
-        for temporary in _generation_temp_paths(run_dir, None):
+        owner = _GenerationLock(
+            descriptor,
+            transaction_id,
+            resolved,
+            descriptor_stat.st_dev,
+            descriptor_stat.st_ino,
+        )
+        _assert_generation_run_identity(owner)
+        removed_temp = False
+        for name in os.listdir(descriptor):
+            if GENERATION_TEMP_PATTERN.fullmatch(name) is None:
+                continue
             try:
-                temporary.unlink()
+                os.unlink(name, dir_fd=descriptor)
+                removed_temp = True
             except FileNotFoundError:
                 pass
-        payload = (
-            json.dumps(
-                {
-                    "pid": os.getpid(),
-                    "created_at": timestamp,
-                    "transaction_id": transaction_id,
-                }
-            )
-            + "\n"
-        ).encode("utf-8")
-        _write_generation_lock_payload(descriptor, payload)
-        _fsync_run_directory(run_dir)
+        if removed_temp:
+            _fsync_directory_descriptor(descriptor)
         return owner
     except BaseException:
         try:
@@ -887,8 +1069,18 @@ def authorize_generation(
     owner = _acquire_generation_lock(run_dir, timestamp)
     try:
         _manifest, mockup_manifest, entry = _generation_preflight(
-            run_dir, direction_id
+            owner.run_dir, direction_id
         )
+        _assert_generation_run_identity(owner)
+        prior_data, _prior_metadata = _read_run_file(
+            owner, "mockup-manifest.json"
+        )
+        try:
+            prior_value = json.loads(prior_data)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ValueError(f"invalid prior generation manifest: {error}") from None
+        if prior_value != mockup_manifest:
+            raise ValueError("generation manifest changed during authorization")
         entry["attempt_count"] += 1
         entry["status"] = "pending"
         for key in ("failure", "output_kind", "output_ref"):
@@ -896,9 +1088,8 @@ def authorize_generation(
         mockup_manifest["generation_attempts_used"] += 1
         mockup_manifest["last_generation_authorized_at"] = timestamp
         mockup_manifest["last_generation_direction_id"] = direction_id
-        _write_mockup_manifest_atomic(
-            run_dir, mockup_manifest, owner.transaction_id
-        )
+        _assert_generation_run_identity(owner)
+        _write_mockup_manifest_atomic(owner, mockup_manifest, prior_data)
         return {
             "direction_id": direction_id,
             "attempt_count": entry["attempt_count"],
