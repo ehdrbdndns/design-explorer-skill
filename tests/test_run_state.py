@@ -584,6 +584,28 @@ class RunStateTests(unittest.TestCase):
             manifest["budget_expansion_approved_at"], "2026-07-19T12:04:00Z"
         )
 
+    def test_direction_approval_returning_to_defaults_clears_stale_expansion(self):
+        self.advance_to_pending()
+        manifest = run_state.load_run(self.run_dir)
+        manifest["generation_budget"] = 6
+        manifest["max_attempts_per_direction"] = 3
+        manifest["budget_expansion_approved_at"] = "2026-07-19T12:03:00Z"
+        self.write("run.json", manifest)
+
+        approved = run_state.transition_run(
+            self.run_dir,
+            "directions_approved",
+            approved_direction_ids=["d-0"],
+            generation_budget=5,
+            max_attempts_per_direction=2,
+        )
+
+        self.assertEqual(approved["generation_budget"], 5)
+        self.assertEqual(approved["max_attempts_per_direction"], 2)
+        self.assertNotIn("budget_expansion_approved_at", approved)
+        reloaded = run_state.load_run(self.run_dir)
+        self.assertEqual(reloaded, approved)
+
     def test_complete_valid_lifecycle_reaches_integrated_deterministically(self):
         self.write_brief()
         self.assertEqual(run_state.transition_run(self.run_dir, "brief_ready")["state"], "brief_ready")

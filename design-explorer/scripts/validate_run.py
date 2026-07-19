@@ -4,6 +4,7 @@ import ipaddress
 import json
 import re
 import sys
+import unicodedata
 from datetime import datetime
 from itertools import combinations
 from pathlib import Path, PurePosixPath
@@ -25,7 +26,6 @@ SECRET_KEY_PATTERN = re.compile(
     r"(?:api|access|refresh|auth|bearer|pairing)?token|api(?:key|secret)|clientsecret"
 )
 SECRET_VALUE_PATTERNS = (
-    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{24,}={0,2}\b", re.IGNORECASE),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
@@ -35,6 +35,9 @@ SECRET_VALUE_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+)
+BEARER_CANDIDATE_PATTERN = re.compile(
+    r"\bBearer\s+([A-Za-z0-9._~+/-]{24,}={0,2})", re.IGNORECASE
 )
 RFC3339_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
@@ -47,6 +50,9 @@ BLOCKED_HOST_SUFFIXES = (
     "test",
     "invalid",
     "example",
+    "onion",
+    "internal",
+    "alt",
     "home.arpa",
     "nip.io",
     "sslip.io",
@@ -61,6 +67,22 @@ def valid_rfc3339(value) -> bool:
     except ValueError:
         return False
     return True
+
+
+def has_bearer_secret(value: str) -> bool:
+    for match in BEARER_CANDIDATE_PATTERN.finditer(value):
+        candidate = match.group(1)
+        jwt_segments = candidate.split(".")
+        is_jwt = (
+            len(jwt_segments) == 3
+            and all(len(segment) >= 4 for segment in jwt_segments)
+        )
+        has_opaque_signal = any(
+            character.isdigit() or character in "_+/=" for character in candidate
+        )
+        if is_jwt or has_opaque_signal:
+            return True
+    return False
 
 
 def read_json(run_dir: Path, name: str, errors: list[str]):
@@ -97,7 +119,7 @@ def valid_hostname(value: str) -> bool:
 
 def valid_url(value) -> bool:
     if not isinstance(value, str) or not value or any(
-        character.isspace() or ord(character) < 32 or ord(character) == 127
+        character.isspace() or unicodedata.category(character) == "Cc"
         for character in value
     ):
         return False
@@ -175,10 +197,11 @@ def find_secret_errors(value, label: str) -> list[str]:
         elif isinstance(current, list):
             for index, nested in enumerate(current):
                 walk(nested, f"{path}[{index}]")
-        elif isinstance(current, str) and any(
-            pattern.search(current) for pattern in SECRET_VALUE_PATTERNS
-        ):
-            errors.append(f"{path} has secret-like value")
+        elif isinstance(current, str):
+            if has_bearer_secret(current) or any(
+                pattern.search(current) for pattern in SECRET_VALUE_PATTERNS
+            ):
+                errors.append(f"{path} has secret-like value")
 
     walk(value, label)
     return errors

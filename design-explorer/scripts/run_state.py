@@ -330,6 +330,8 @@ def transition_run(
         manifest["max_attempts_per_direction"] = effective_attempts
         if expanded:
             manifest["budget_expansion_approved_at"] = timestamp
+        else:
+            manifest.pop("budget_expansion_approved_at", None)
 
     if target == "implementation_selected":
         if selected_direction_id not in manifest["approved_direction_ids"]:

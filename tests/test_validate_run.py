@@ -194,6 +194,9 @@ class ValidateRunTests(unittest.TestCase):
             "https://service.test/path",
             "https://service.invalid/path",
             "https://service.example/path",
+            "https://service.onion/path",
+            "https://service.internal/path",
+            "https://service.alt/path",
             "https://home.arpa/path",
             "https://device.home.arpa/path",
             "https://127-0-0-1.nip.io/path",
@@ -209,6 +212,8 @@ class ValidateRunTests(unittest.TestCase):
             "https://example.com/\x00hidden",
             "https://example.com/\x1fhidden",
             "https://example.com/\x7fhidden",
+            "https://example.com/\u0080hidden",
+            "https://example.com/\u009fhidden",
         )
 
         for value in invalid_urls:
@@ -925,7 +930,12 @@ class ValidateRunTests(unittest.TestCase):
         self.assertTrue(any("secret-like value" in error for error in errors), errors)
 
     def test_bearer_prose_and_placeholders_pass_but_realistic_credential_fails(self):
-        for summary in ("Bearer <token>", "Use a Bearer token for the request"):
+        for summary in (
+            "Bearer <token>",
+            "Use a Bearer token for the request",
+            "Bearer authentication-credentials-should-be-protected",
+            "Bearer token-based-authentication-for-api-requests",
+        ):
             with self.subTest(summary=summary):
                 item = evidence()
                 item["summary"] = summary
@@ -936,6 +946,15 @@ class ValidateRunTests(unittest.TestCase):
         item = evidence()
         item["summary"] = "Bearer abcdefghijklmnopqrstuvwxyz0123456789.ABCDEF"
         self.write("references.json", [reference()])
+        self.write("evidence.json", [item])
+        errors = validator.validate_phase(self.run, "research")
+        self.assertTrue(any("secret-like value" in error for error in errors), errors)
+
+        item["summary"] = (
+            "Bearer eyJhbGciOiJIUzI1NiJ9."
+            "eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        )
         self.write("evidence.json", [item])
         errors = validator.validate_phase(self.run, "research")
         self.assertTrue(any("secret-like value" in error for error in errors), errors)
