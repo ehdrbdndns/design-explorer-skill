@@ -47,6 +47,7 @@ def direction(identifier, **axes):
     defaults.update(axes)
     return {
         "id": identifier,
+        "kind": "primary",
         "name": identifier.title(),
         "concept": "A distinct checkout direction",
         "ux_problem": "reduce checkout uncertainty",
@@ -79,6 +80,14 @@ def distinct_directions():
             interaction="direct",
         ),
     ]
+
+
+def derived_direction(identifier, source_ids, **axes):
+    item = direction(identifier, **axes)
+    item["kind"] = "derived"
+    item["derived_from_ids"] = source_ids
+    item["combined_properties"] = {"layout": source_ids[0]}
+    return item
 
 
 class ValidateRunTests(unittest.TestCase):
@@ -316,6 +325,138 @@ class ValidateRunTests(unittest.TestCase):
             "directions[3] baseline_exceptions[0] missing justification",
             errors,
         )
+
+    def test_directions_require_kind_and_kind_specific_fields(self):
+        self.write("evidence.json", [evidence()])
+        directions = distinct_directions()
+        directions[0].pop("kind")
+        directions[1]["kind"] = "variant"
+        directions[2]["derived_from_ids"] = []
+        directions[3]["combined_properties"] = {}
+        directions[4]["kind"] = "derived"
+        self.write("directions.json", directions)
+
+        errors = validator.validate_phase(self.run, "directions")
+
+        self.assertIn("directions[0] kind must be primary or derived", errors)
+        self.assertIn("directions[1] kind must be primary or derived", errors)
+        self.assertIn(
+            "directions[2] primary must omit derived_from_ids",
+            errors,
+        )
+        self.assertIn(
+            "directions[3] primary must omit combined_properties",
+            errors,
+        )
+        self.assertIn(
+            "directions[4] derived_from_ids must be a non-empty list of unique non-empty strings",
+            errors,
+        )
+        self.assertIn(
+            "directions[4] combined_properties must be a non-empty object",
+            errors,
+        )
+
+    def test_derived_sources_reject_malformed_dangling_self_and_later_ids(self):
+        self.write("evidence.json", [evidence()])
+        cases = (
+            (42, "non-empty list of unique non-empty strings"),
+            (["editorial", "editorial"], "non-empty list of unique non-empty strings"),
+            (["editorial", " "], "non-empty list of unique non-empty strings"),
+            (["missing"], "previously declared direction IDs: missing"),
+            (["combined"], "previously declared direction IDs: combined"),
+        )
+        for source_ids, expected in cases:
+            with self.subTest(source_ids=source_ids):
+                directions = distinct_directions()
+                derived = derived_direction(
+                    "combined",
+                    ["editorial"],
+                    layout="combined-layout",
+                    typography="combined-type",
+                    palette="combined-palette",
+                    density="combined-density",
+                    imagery="combined-imagery",
+                    interaction="combined-interaction",
+                )
+                derived["derived_from_ids"] = source_ids
+                directions.append(derived)
+                self.write("directions.json", directions)
+
+                errors = validator.validate_phase(self.run, "directions")
+
+                self.assertTrue(any(expected in error for error in errors), errors)
+
+        directions = distinct_directions()
+        directions[0] = derived_direction(
+            "editorial",
+            ["dense"],
+            layout="combined-layout",
+            typography="combined-type",
+            palette="combined-palette",
+            density="combined-density",
+            imagery="combined-imagery",
+            interaction="combined-interaction",
+        )
+        self.write("directions.json", directions)
+        errors = validator.validate_phase(self.run, "directions")
+        self.assertTrue(
+            any("previously declared direction IDs: dense" in error for error in errors),
+            errors,
+        )
+
+    def test_derived_combined_properties_reject_invalid_or_unrelated_sources(self):
+        self.write("evidence.json", [evidence()])
+        invalid_properties = (
+            ([], "must be a non-empty object"),
+            ({}, "must be a non-empty object"),
+            ({"border_radius": "editorial"}, "unsupported key: border_radius"),
+            ({"layout": 42}, "layout must name a non-empty source ID"),
+            ({"layout": "dense"}, "layout source is not in derived_from_ids: dense"),
+        )
+        for combined_properties, expected in invalid_properties:
+            with self.subTest(combined_properties=combined_properties):
+                directions = distinct_directions()
+                derived = derived_direction(
+                    "combined",
+                    ["editorial"],
+                    layout="combined-layout",
+                    typography="combined-type",
+                    palette="combined-palette",
+                    density="combined-density",
+                    imagery="combined-imagery",
+                    interaction="combined-interaction",
+                )
+                derived["combined_properties"] = combined_properties
+                directions.append(derived)
+                self.write("directions.json", directions)
+
+                errors = validator.validate_phase(self.run, "directions")
+
+                self.assertTrue(any(expected in error for error in errors), errors)
+
+    def test_valid_derived_combination_passes(self):
+        self.write("evidence.json", [evidence()])
+        directions = distinct_directions()
+        derived = derived_direction(
+            "combined",
+            ["editorial", "visual"],
+            layout="combined-layout",
+            typography="combined-type",
+            palette="combined-palette",
+            density="combined-density",
+            imagery="combined-imagery",
+            interaction="combined-interaction",
+        )
+        derived["combined_properties"] = {
+            "layout": "editorial",
+            "palette": "visual",
+            "imagery": "visual",
+        }
+        directions.append(derived)
+        self.write("directions.json", directions)
+
+        self.assertEqual(validator.validate_phase(self.run, "directions"), [])
 
     def test_mockups_cover_every_approved_direction(self):
         self.write("run.json", {"approved_direction_ids": ["a", "b"]})

@@ -67,6 +67,62 @@ def axis_value(item, axis):
     return value.strip().casefold() if isinstance(value, str) else None
 
 
+def validate_direction_derivation(
+    item: dict,
+    index: int,
+    previous_ids: set[str],
+    errors: list[str],
+) -> None:
+    kind = item.get("kind")
+    if kind not in {"primary", "derived"}:
+        errors.append(f"directions[{index}] kind must be primary or derived")
+        return
+    if kind == "primary":
+        for field in ("derived_from_ids", "combined_properties"):
+            if field in item:
+                errors.append(f"directions[{index}] primary must omit {field}")
+        return
+
+    sources = item.get("derived_from_ids")
+    valid_sources = (
+        isinstance(sources, list)
+        and bool(sources)
+        and all(isinstance(source, str) and source.strip() for source in sources)
+        and len(set(sources)) == len(sources)
+    )
+    source_ids = set(sources) if valid_sources else None
+    if not valid_sources:
+        errors.append(
+            f"directions[{index}] derived_from_ids must be a non-empty list of unique non-empty strings"
+        )
+    else:
+        unavailable = source_ids - previous_ids
+        if unavailable:
+            errors.append(
+                f"directions[{index}] derived_from_ids must refer only to previously declared direction IDs: {', '.join(sorted(unavailable))}"
+            )
+
+    properties = item.get("combined_properties")
+    if not isinstance(properties, dict) or not properties:
+        errors.append(
+            f"directions[{index}] combined_properties must be a non-empty object"
+        )
+        return
+    for key, source in properties.items():
+        if key not in AXES:
+            errors.append(
+                f"directions[{index}] combined_properties has unsupported key: {key}"
+            )
+        if not isinstance(source, str) or not source.strip():
+            errors.append(
+                f"directions[{index}] combined_properties {key} must name a non-empty source ID"
+            )
+        elif source_ids is not None and source not in source_ids:
+            errors.append(
+                f"directions[{index}] combined_properties {key} source is not in derived_from_ids: {source}"
+            )
+
+
 def validate_sources(items, label: str, errors: list[str]) -> None:
     if not isinstance(items, list) or not items:
         errors.append(f"{label} must be a non-empty list")
@@ -172,11 +228,13 @@ def validate_directions(run_dir: Path) -> list[str]:
         ):
             if not isinstance(item.get(field), str) or not item[field].strip():
                 errors.append(f"directions[{index}] missing {field}")
+        previous_ids = set(ids)
         identifier = item.get("id")
         if isinstance(identifier, str) and identifier.strip():
             if identifier in ids:
                 errors.append(f"duplicate direction id: {identifier}")
             ids.add(identifier)
+        validate_direction_derivation(item, index, previous_ids, errors)
         axes = item.get("axes", {})
         if not isinstance(axes, dict):
             errors.append(f"directions[{index}] axes must be an object")

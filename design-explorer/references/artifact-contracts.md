@@ -43,11 +43,18 @@ python3 scripts/run_state.py transition --run <run-dir> --to mockups_generated
 python3 scripts/run_state.py transition --run <run-dir> --to implementation_selected --selected-direction <id>
 ```
 
-Build the isolated preview and write `implementation.json`, then continue:
+Build the isolated preview and write `implementation.json`, then validate it and stop at `prototype_ready`:
 
 ```bash
 python3 scripts/validate_run.py --run <run-dir> --phase implementation
 python3 scripts/run_state.py transition --run <run-dir> --to prototype_ready
+```
+
+Present and render the verified preview for the user. Stop and wait for explicit user integration approval; do not infer approval and do not run the integration command in the same sequence.
+
+Only after the user explicitly approves production integration, run this separate post-approval command:
+
+```bash
 python3 scripts/run_state.py transition --run <run-dir> --to integrated --approve-integration
 ```
 
@@ -100,6 +107,7 @@ Record the screen purpose, required content, target viewport, preservation const
 `directions.json` is a JSON array with at least five items. Every direction requires:
 
 - `id`
+- `kind`: exactly `primary` or `derived`
 - `name`
 - `concept`
 - `ux_problem`
@@ -113,7 +121,11 @@ Record the screen purpose, required content, target viewport, preservation const
 
 Every direction must link at least one `official` evidence item. Official accessibility and platform guidance is the common baseline; exceptions document constrained deviations, not permission to omit official evidence. Every pair must differ on at least three axes.
 
-A revised variation or combination is appended with a new first-class `id`, non-empty `derived_from_ids`, and non-empty `combined_properties` that maps varied/combined properties to their source direction. Never repurpose a primary direction ID.
+- A `primary` direction omits `derived_from_ids` and `combined_properties`.
+- A `derived` direction is appended after its sources. It requires a non-empty, unique `derived_from_ids` list of non-empty strings referring only to previously declared direction IDs. This ordering makes self-reference, forward-reference, dangling-reference, and cycles invalid.
+- A `derived` direction also requires a non-empty `combined_properties` object. Keys are limited to the six design axes (`layout`, `typography`, `palette`, `density`, `imagery`, `interaction`); every value is one of that direction's `derived_from_ids`.
+
+Never repurpose a primary direction ID. Append every revised variation or combination as a new first-class `derived` direction after its sources.
 
 `directions.json` is the machine-readable source of truth. `mood-directions.md` is its user-facing view and must retain direction/evidence IDs, difficulty, risks, trade-offs, and every baseline exception. Approving a direction explicitly approves its disclosed exceptions.
 

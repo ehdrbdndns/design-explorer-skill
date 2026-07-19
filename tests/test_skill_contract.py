@@ -76,6 +76,7 @@ class SkillContractTests(unittest.TestCase):
         for phrase in (
             "derived_from_ids",
             "combined_properties",
+            "after their sources",
             "only the newly approved IDs",
             "obtain explicit approval again",
             "bounded variations the user authorized",
@@ -101,6 +102,20 @@ class SkillContractTests(unittest.TestCase):
             contracts.index("Build the isolated preview and write `implementation.json`"),
             contracts.index("--phase implementation"),
         )
+        self.assertLess(
+            contracts.index("--to prototype_ready"),
+            contracts.index("wait for explicit user integration approval"),
+        )
+        self.assertLess(
+            contracts.index("wait for explicit user integration approval"),
+            contracts.index("--to integrated --approve-integration"),
+        )
+        for phrase in (
+            "`kind`: exactly `primary` or `derived`",
+            "previously declared direction IDs",
+            "six design axes",
+        ):
+            self.assertIn(phrase, contracts)
 
 
 if __name__ == "__main__":
