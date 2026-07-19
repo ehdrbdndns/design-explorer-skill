@@ -504,7 +504,13 @@ def lex_js(source: str) -> JsLexResult:
             _mask_span(output, index, end)
             index = end
             continue
-        if current == "/" and _slash_starts_regex(output, index):
+        jsx_closing_tag = (
+            current == "/"
+            and index > 0
+            and output[index - 1] == "<"
+            and (following.isalpha() or following in "_$")
+        )
+        if current == "/" and not jsx_closing_tag and _slash_starts_regex(output, index):
             end = index + 1
             character_class = False
             closed = False
@@ -591,7 +597,11 @@ def import_bindings(reference: JsModuleReference) -> dict[str, str]:
     named = re.search(r"\{(.*?)\}", clause, re.S)
     if named:
         for item in named.group(1).split(","):
-            item = re.sub(r"^\s*type\s+", "", item).strip()
+            item = item.strip()
+            if re.fullmatch(
+                rf"type\s+{IDENTIFIER}(?:\s+as\s+{IDENTIFIER})?", item
+            ):
+                continue
             match = re.fullmatch(
                 rf"({IDENTIFIER})(?:\s+as\s+({IDENTIFIER}))?", item
             )
@@ -601,9 +611,7 @@ def import_bindings(reference: JsModuleReference) -> dict[str, str]:
 
 
 def is_runtime_import(reference: JsModuleReference) -> bool:
-    return reference.kind == "import" and not re.match(
-        r"^\s*type\b", reference.clause
-    )
+    return reference.kind == "import" and bool(import_bindings(reference))
 
 
 def imported_locals(
@@ -632,8 +640,13 @@ JSX_TAG_PATTERN = re.compile(
     re.S,
 )
 JSX_ASSET_ATTRIBUTE_PATTERN = re.compile(
-    r"\b(?P<name>src|href|poster|srcSet)\s*=\s*(?P<quote>[\"'])",
+    r"\b(?P<name>src|href|poster|srcSet)\s*=\s*"
+    r"(?P<brace>\{\s*)?(?P<quote>[\"'])\s*(?P=quote)"
+    r"(?(brace)\s*\})(?=\s|/|$)",
     re.IGNORECASE,
+)
+SRCSET_LOCAL_REFERENCE_PATTERN = re.compile(
+    r"(?:^|[,\s])(?P<reference>\.{1,2}/[^,\s]+)"
 )
 
 
@@ -652,16 +665,12 @@ def normalize_local_asset_reference(value: str) -> str | None:
 
 
 def srcset_references(value: str) -> list[str]:
-    if "data:" in value.casefold():
-        return []
-    references = []
-    for candidate in value.split(","):
-        parts = candidate.strip().split()
-        if parts:
-            normalized = normalize_local_asset_reference(parts[0])
-            if normalized is not None:
-                references.append(normalized)
-    return references
+    return list(
+        dict.fromkeys(
+            match.group("reference")
+            for match in SRCSET_LOCAL_REFERENCE_PATTERN.finditer(value)
+        )
+    )
 
 
 def js_render_dependencies(lexed: JsLexResult) -> list[str]:
@@ -1584,7 +1593,7 @@ def validate_implementation(run_dir: Path) -> list[str]:
                     imported.add(resolved)
             if registry_path not in imported or component_path not in imported:
                 errors.append(
-                    "project route consumer must have real static imports of registry and component"
+                    "project route consumer must have real static imports with runtime bindings of registry and component"
                 )
 
         closure_roots = [value for value in (preview_path, consumer_path, component_path) if value]

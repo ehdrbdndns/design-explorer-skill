@@ -433,6 +433,60 @@ import {
 '''
         self.assertEqual(validator.js_dependencies(source), ["./real"])
 
+    def test_named_import_bindings_exclude_inline_type_and_side_effect_forms(self):
+        _, references = validator.js_module_references(
+            "import { type Meta, runtime as Registry, type Foo as Bar } "
+            "from './routes.json';\n"
+            "import type { EntirelyType } from './types';\n"
+            "import './side-effect';\n"
+            "import DefaultPreview from './default';\n"
+            "import * as PreviewNamespace from './namespace';"
+        )
+        by_path = {reference.specifier: reference for reference in references}
+        self.assertEqual(
+            validator.import_bindings(by_path["./routes.json"]),
+            {"runtime": "Registry"},
+        )
+        self.assertEqual(validator.import_bindings(by_path["./types"]), {})
+        self.assertEqual(validator.import_bindings(by_path["./side-effect"]), {})
+        self.assertEqual(
+            validator.import_bindings(by_path["./default"]),
+            {"default": "DefaultPreview"},
+        )
+        self.assertEqual(
+            validator.import_bindings(by_path["./namespace"]),
+            {"*": "PreviewNamespace"},
+        )
+
+    def test_project_route_wiring_requires_runtime_bindings_for_both_files(self):
+        consumer = self.project / "previews" / "App.tsx"
+        for source in (
+            "import './routes.json';\nimport './Checkout';",
+            "import { type Meta, runtime as Registry } from './routes.json';\n"
+            "import type { Preview } from './Checkout';",
+        ):
+            with self.subTest(source=source):
+                consumer.write_text(source, encoding="utf-8")
+                implementation = copy.deepcopy(self.implementation)
+                digest = preview_digest(self.project, implementation["preview_files"])
+                for check in implementation["verification"]["viewport_checks"].values():
+                    check["source_digest"] = digest
+                errors = self.validate(implementation=implementation)
+                self.assertTrue(any("runtime bindings" in error for error in errors), errors)
+
+        consumer.write_text(
+            "import { type Meta, runtime as Registry } from './routes.json';\n"
+            "import * as PreviewNamespace from './Checkout';\n"
+            "export const resolve = (path: string) => "
+            "Registry[path] ? PreviewNamespace.Preview : null;",
+            encoding="utf-8",
+        )
+        implementation = copy.deepcopy(self.implementation)
+        digest = preview_digest(self.project, implementation["preview_files"])
+        for check in implementation["verification"]["viewport_checks"].values():
+            check["source_digest"] = digest
+        self.assertEqual(self.validate(implementation=implementation), [])
+
     def test_standalone_calls_must_be_bound_to_real_multiline_imports(self):
         standalone = self.run / "standalone"
         (standalone / "src").mkdir(parents=True)
@@ -606,10 +660,15 @@ import {
         (self.project / "previews" / "icon.svg").write_text(
             "<svg id='icon'/>", encoding="utf-8"
         )
+        (self.project / "previews" / "retina.svg").write_text(
+            "<svg id='retina'/>", encoding="utf-8"
+        )
         actual.write_text(
             "import './styles.css';\n"
             "const hero = new URL('./hero.svg', import.meta.url);\n"
-            "export const Preview=()=> <main><img src='./icon.svg' /></main>;",
+            "export const Preview=()=> <main><img src={'./icon.svg'} "
+            "srcSet={'data:image/svg+xml,%3Csvg%3E 1x, ./retina.svg 2x, "
+            "https://example.com/remote.svg 3x'} /></main>;",
             encoding="utf-8",
         )
         implementation = copy.deepcopy(self.implementation)
@@ -618,11 +677,11 @@ import {
             check["source_digest"] = digest
         errors = self.validate(implementation=implementation)
         self.assertGreaterEqual(
-            sum("unlisted local dependency" in error for error in errors), 2, errors
+            sum("unlisted local dependency" in error for error in errors), 3, errors
         )
 
         implementation["preview_files"].extend(
-            ["previews/hero.svg", "previews/icon.svg"]
+            ["previews/hero.svg", "previews/icon.svg", "previews/retina.svg"]
         )
         digest = preview_digest(self.project, implementation["preview_files"])
         for check in implementation["verification"]["viewport_checks"].values():
@@ -635,13 +694,40 @@ import {
         errors = self.validate(implementation=implementation)
         self.assertTrue(any("source_digest" in error for error in errors), errors)
 
+    def test_jsx_brace_literals_and_mixed_srcset_extract_only_local_assets(self):
+        source = (
+            "const prose = './not-an-asset.svg';\n"
+            "export const Preview=()=> <main>"
+            "<img src='./direct.svg' />"
+            "<a href=\"./manual.pdf\">Manual</a>"
+            "<img src={'./icon.svg'} />"
+            "<a href={\"./guide.pdf\"}>Guide</a>"
+            "<video poster={'../poster.jpg'} />"
+            "<source srcSet={'data:image/svg+xml,%3Csvg%3E 1x, "
+            "./small.webp 1x, ../large.webp 2x, "
+            "https://example.com/remote.webp 3x'} />"
+            "</main>;"
+        )
+        self.assertEqual(
+            validator.js_dependencies(source),
+            [
+                "./direct.svg",
+                "./manual.pdf",
+                "./icon.svg",
+                "./guide.pdf",
+                "../poster.jpg",
+                "./small.webp",
+                "../large.webp",
+            ],
+        )
+
     def test_jsx_render_asset_symlink_escape_is_rejected(self):
         outside = self.root / "outside.svg"
         outside.write_text("<svg/>", encoding="utf-8")
         escape = self.project / "previews" / "escape.svg"
         escape.symlink_to(outside)
         (self.project / "previews" / "Actual.tsx").write_text(
-            "export const Preview=()=> <img src='./escape.svg' />;",
+            "export const Preview=()=> <img src={'./escape.svg'} />;",
             encoding="utf-8",
         )
         implementation = copy.deepcopy(self.implementation)

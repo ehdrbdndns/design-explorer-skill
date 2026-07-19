@@ -269,6 +269,25 @@ class SkillContractTests(unittest.TestCase):
         ):
             self.assertIn(phrase, combined)
 
+    def test_runtime_binding_and_braced_asset_details_are_documented(self):
+        contracts = (SKILL_DIR / "references/artifact-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        mockups = (SKILL_DIR / "references/mockups-implementation.md").read_text(
+            encoding="utf-8"
+        )
+        combined = "\n".join((contracts, mockups))
+        for phrase in (
+            "specifier-level runtime bindings",
+            "inline `type` specifiers",
+            "side-effect-only imports do not satisfy project wiring",
+            "brace-wrapped JSX literals",
+            "mixed data URI",
+            "each explicit `./` or `../` `srcSet` candidate",
+            "arbitrary prose",
+        ):
+            self.assertIn(phrase, combined)
+
 
 if __name__ == "__main__":
     unittest.main()
