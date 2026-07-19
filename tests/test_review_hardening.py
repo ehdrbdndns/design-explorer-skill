@@ -208,6 +208,10 @@ class StateInvariantTests(unittest.TestCase):
         self.write_json(
             "mockup-manifest.json",
             {
+                "schema_version": 1,
+                "generation_attempts_used": 1,
+                "last_generation_authorized_at": "2026-07-20T10:01:00Z",
+                "last_generation_direction_id": "d-0",
                 "mockups": [
                     {
                         "direction_id": "d-0",
@@ -222,11 +226,6 @@ class StateInvariantTests(unittest.TestCase):
                 ]
             },
         )
-        run_manifest = json.loads((self.run / "run.json").read_text())
-        run_manifest["generation_attempts_used"] = 1
-        run_manifest["last_generation_authorized_at"] = "2026-07-20T10:01:00Z"
-        run_manifest["last_generation_authorized_direction_id"] = "d-0"
-        self.write_json("run.json", run_manifest)
         run_state.transition_run(self.run, "mockups_generated")
         run_before = (self.run / "run.json").read_bytes()
         mockups_before = (self.run / "mockup-manifest.json").read_bytes()

@@ -62,6 +62,10 @@ class WorkflowIntegrationTests(unittest.TestCase):
             run_dir,
             "mockup-manifest.json",
             {
+                "schema_version": 1,
+                "generation_attempts_used": 0,
+                "last_generation_authorized_at": None,
+                "last_generation_direction_id": None,
                 "mockups": [
                     {
                         "direction_id": "d-0",

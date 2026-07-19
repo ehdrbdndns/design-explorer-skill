@@ -115,9 +115,6 @@ def run_manifest(**overrides):
         "required_content": ["Order summary"],
         "required_interactions": ["Edit order"],
         "production_paths": [],
-        "generation_attempts_used": 1,
-        "last_generation_authorized_at": "2026-07-19T12:00:00Z",
-        "last_generation_authorized_direction_id": "a",
     }
     value.update(overrides)
     return value
@@ -133,6 +130,37 @@ def mockup(direction_id="a", **overrides):
         "output_kind": "provider",
         "output_ref": f"provider:openai:{direction_id}",
         "attempt_count": 1,
+    }
+    value.update(overrides)
+    return value
+
+
+def mockup_manifest(mockups, **overrides):
+    attempts = sum(
+        item.get("attempt_count", 0)
+        for item in mockups
+        if isinstance(item, dict)
+        and isinstance(item.get("attempt_count", 0), int)
+        and not isinstance(item.get("attempt_count", 0), bool)
+    )
+    direction_id = next(
+        (
+            item.get("direction_id")
+            for item in reversed(mockups)
+            if isinstance(item, dict)
+            and isinstance(item.get("direction_id"), str)
+            and item["direction_id"].strip()
+        ),
+        None,
+    )
+    value = {
+        "schema_version": 1,
+        "generation_attempts_used": attempts,
+        "last_generation_authorized_at": (
+            "2026-07-19T12:00:00Z" if attempts else None
+        ),
+        "last_generation_direction_id": direction_id if attempts else None,
+        "mockups": mockups,
     }
     value.update(overrides)
     return value
@@ -634,9 +662,7 @@ class ValidateRunTests(unittest.TestCase):
         self.write("run.json", run_manifest(approved_direction_ids=["a", "b"]))
         self.write(
             "mockup-manifest.json",
-            {
-                "mockups": [mockup("a")]
-            },
+            mockup_manifest([mockup("a")]),
         )
         errors = validator.validate_phase(self.run, "mockups")
         self.assertIn("missing current mockup entries for: b", errors)
@@ -644,7 +670,7 @@ class ValidateRunTests(unittest.TestCase):
 
     def test_mockups_require_at_least_one_approved_direction(self):
         self.write("run.json", run_manifest(approved_direction_ids=[]))
-        self.write("mockup-manifest.json", {"mockups": []})
+        self.write("mockup-manifest.json", mockup_manifest([]))
 
         errors = validator.validate_phase(self.run, "mockups")
 
@@ -655,7 +681,7 @@ class ValidateRunTests(unittest.TestCase):
 
     def test_mockups_reject_invalid_or_duplicate_approved_direction_ids(self):
         self.write("run.json", run_manifest(approved_direction_ids=["a", " ", "a", 42]))
-        self.write("mockup-manifest.json", {"mockups": []})
+        self.write("mockup-manifest.json", mockup_manifest([]))
 
         errors = validator.validate_phase(self.run, "mockups")
 
@@ -672,8 +698,8 @@ class ValidateRunTests(unittest.TestCase):
         self.write("run.json", run_manifest(approved_direction_ids=["a"]))
         self.write(
             "mockup-manifest.json",
-            {
-                "mockups": [
+            mockup_manifest(
+                [
                     {"direction_id": "b", "status": "failed", "attempt_count": 1},
                     {
                         "direction_id": "a",
@@ -685,7 +711,7 @@ class ValidateRunTests(unittest.TestCase):
                     },
                     {"direction_id": 42, "status": "failed", "attempt_count": 1},
                 ]
-            },
+            ),
         )
 
         errors = validator.validate_phase(self.run, "mockups")
@@ -703,22 +729,22 @@ class ValidateRunTests(unittest.TestCase):
         cases = (
             (
                 run_manifest(generation_budget=5),
-                {"mockups": [mockup("a") for _ in range(100)]},
+                mockup_manifest([mockup("a") for _ in range(100)]),
                 "exceeds generation_budget",
             ),
             (
                 run_manifest(approved_direction_ids=["a", "b"]),
-                {"mockups": [mockup("a"), mockup("a"), mockup("b")]},
+                mockup_manifest([mockup("a"), mockup("a"), mockup("b")]),
                 "duplicate current direction_id: a",
             ),
             (
                 run_manifest(),
-                {"mockups": [mockup(status="complete")]},
+                mockup_manifest([mockup(status="complete")]),
                 "status must be pending, success, or failed",
             ),
             (
                 run_manifest(),
-                {"mockups": [mockup(attempt_count=999)]},
+                mockup_manifest([mockup(attempt_count=999)]),
                 "attempt_count exceeds max_attempts_per_direction",
             ),
         )
@@ -737,13 +763,12 @@ class ValidateRunTests(unittest.TestCase):
                 approved_direction_ids=approved,
                 generation_budget=8,
                 max_attempts_per_direction=3,
-                generation_attempts_used=24,
                 budget_expansion_approved_at="2026-07-19T12:01:00Z",
             ),
         )
         self.write(
             "mockup-manifest.json",
-            {"mockups": [mockup(identifier, attempt_count=3) for identifier in approved]},
+            mockup_manifest([mockup(identifier, attempt_count=3) for identifier in approved]),
         )
 
         self.assertEqual(validator.validate_phase(self.run, "mockups"), [])
@@ -771,7 +796,7 @@ class ValidateRunTests(unittest.TestCase):
         for run, expected in cases:
             with self.subTest(expected=expected):
                 self.write("run.json", run)
-                self.write("mockup-manifest.json", {"mockups": [mockup()]})
+                self.write("mockup-manifest.json", mockup_manifest([mockup()]))
                 errors = validator.validate_phase(self.run, "mockups")
                 self.assertTrue(any(expected in error for error in errors), errors)
 
@@ -779,12 +804,12 @@ class ValidateRunTests(unittest.TestCase):
         self.write("run.json", run_manifest(approved_direction_ids=["a", "b"]))
         self.write(
             "mockup-manifest.json",
-            {
-                "mockups": [
+            mockup_manifest(
+                [
                     mockup("a", status="pending", viewport="mobile"),
                     mockup("b", status="failed", prompt_digest="sha256:ABC"),
                 ]
-            },
+            ),
         )
 
         errors = validator.validate_phase(self.run, "mockups")
@@ -794,7 +819,7 @@ class ValidateRunTests(unittest.TestCase):
 
     def test_mockup_status_type_error_is_reported_without_cli_traceback(self):
         self.write("run.json", run_manifest())
-        self.write("mockup-manifest.json", {"mockups": [mockup(status=[])]})
+        self.write("mockup-manifest.json", mockup_manifest([mockup(status=[])]))
 
         errors = validator.validate_phase(self.run, "mockups")
         self.assertIn("mockups[0] status must be pending, success, or failed", errors)
@@ -833,13 +858,13 @@ class ValidateRunTests(unittest.TestCase):
             "provider:user@secret",
         ):
             with self.subTest(value=value):
-                self.write("mockup-manifest.json", {"mockups": [mockup(output_ref=value)]})
+                self.write("mockup-manifest.json", mockup_manifest([mockup(output_ref=value)]))
                 errors = validator.validate_phase(self.run, "mockups")
                 self.assertTrue(any("output_ref" in error for error in errors), errors)
 
         self.write(
             "mockup-manifest.json",
-            {"mockups": [mockup(output_ref="provider:openai:artifact_abc-123")]},
+            mockup_manifest([mockup(output_ref="provider:openai:artifact_abc-123")]),
         )
         self.assertEqual(validator.validate_phase(self.run, "mockups"), [])
 
@@ -847,14 +872,14 @@ class ValidateRunTests(unittest.TestCase):
         self.write("run.json", run_manifest())
         self.write(
             "mockup-manifest.json",
-            {
-                "mockups": [
+            mockup_manifest(
+                [
                     mockup(
                         status="failed",
                         output_ref="../private/result.png",
                     )
                 ]
-            },
+            ),
         )
 
         errors = validator.validate_phase(self.run, "mockups")
@@ -865,7 +890,7 @@ class ValidateRunTests(unittest.TestCase):
         artifacts = (
             ("research", "references.json", [dict(reference(), api_key="hidden")], "evidence.json", [evidence()]),
             ("directions", "directions.json", [dict(item) for item in distinct_directions()], "evidence.json", [evidence()]),
-            ("mockups", "mockup-manifest.json", {"mockups": [mockup(prompt_digest="Bearer abcdefghijklmnopqrstuvwxyz0123456789")]}, "run.json", run_manifest()),
+            ("mockups", "mockup-manifest.json", mockup_manifest([mockup(prompt_digest="Bearer abcdefghijklmnopqrstuvwxyz0123456789")]), "run.json", run_manifest()),
             ("implementation", "implementation.json", {
                 "selected_direction_id": "a",
                 "mode": "project",
@@ -906,11 +931,11 @@ class ValidateRunTests(unittest.TestCase):
         self.write("run.json", run_manifest())
         self.write(
             "mockup-manifest.json",
-            {
-                "mockups": [
+            mockup_manifest(
+                [
                     mockup(output_ref="openai:sk-proj-abcdefghijklmnopqrstuvwxyz")
                 ]
-            },
+            ),
         )
         errors = validator.validate_phase(self.run, "mockups")
         self.assertTrue(any("secret-like value" in error for error in errors), errors)

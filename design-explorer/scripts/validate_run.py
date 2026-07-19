@@ -1336,14 +1336,43 @@ def _mockup_manifest_errors(
     target_viewports = normalized_string_list(
         run.get("target_viewports"), "run.json target_viewports", errors
     )
-    attempts_used = run.get("generation_attempts_used")
+    if manifest.get("schema_version") != 1:
+        errors.append("mockup-manifest.json schema_version must be 1")
+    attempts_used = manifest.get("generation_attempts_used")
     if (
         not isinstance(attempts_used, int)
         or isinstance(attempts_used, bool)
         or attempts_used < 0
     ):
-        errors.append("run.json generation_attempts_used must be a non-negative integer")
+        errors.append(
+            "mockup-manifest generation_attempts_used must be a non-negative integer"
+        )
         attempts_used = None
+    authorized_at = manifest.get("last_generation_authorized_at")
+    authorized_direction = manifest.get("last_generation_direction_id")
+    if (authorized_at is None) != (authorized_direction is None):
+        errors.append("mockup-manifest generation audit fields must both be null or populated")
+    if attempts_used is not None and (attempts_used == 0) != (authorized_at is None):
+        errors.append("mockup-manifest generation use and audit fields must agree")
+    if authorized_at is not None and not valid_rfc3339(authorized_at):
+        errors.append("mockup-manifest last_generation_authorized_at must be RFC3339")
+    if authorized_direction is not None and (
+        not isinstance(authorized_direction, str) or not authorized_direction.strip()
+    ):
+        errors.append("mockup-manifest last_generation_direction_id must be nonblank")
+    elif (
+        authorized_direction is not None
+        and approved is not None
+        and authorized_direction not in approved
+    ):
+        errors.append("mockup-manifest audit must name an approved direction")
+    if (
+        attempts_used is not None
+        and approved is not None
+        and max_attempts is not None
+        and attempts_used > len(approved) * max_attempts
+    ):
+        errors.append("mockup-manifest generation attempts exceed authorization ceiling")
     mockups = manifest["mockups"]
     if budget is not None and len(mockups) > budget:
         errors.append(
@@ -1495,7 +1524,7 @@ def _mockup_manifest_errors(
             errors.append("mockup manifest must contain exactly one entry per approved direction")
     if attempts_used is not None and attempt_total != attempts_used:
         errors.append(
-            "mockup attempt_count total must equal run.json generation_attempts_used"
+            "mockup attempt_count total must equal manifest generation_attempts_used"
         )
     if require_success:
         missing = approved - successful if approved is not None else set()

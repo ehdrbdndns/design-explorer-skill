@@ -1,8 +1,10 @@
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -85,8 +87,22 @@ class PublicationGateTests(unittest.TestCase):
     def write_pending_manifest(self, approved=("d-0",)):
         self.write_json(
             "mockup-manifest.json",
-            {"mockups": [self.entry(identifier) for identifier in approved]},
+            self.ledger([self.entry(identifier) for identifier in approved]),
         )
+
+    def ledger(self, entries, used=None, authorized_at=None, direction_id=None):
+        used = sum(item.get("attempt_count", 0) for item in entries) if used is None else used
+        if used and authorized_at is None:
+            authorized_at = "2026-07-20T00:00:30Z"
+        if used and direction_id is None:
+            direction_id = entries[-1]["direction_id"]
+        return {
+            "schema_version": 1,
+            "generation_attempts_used": used,
+            "last_generation_authorized_at": authorized_at,
+            "last_generation_direction_id": direction_id,
+            "mockups": entries,
+        }
 
     def test_mockups_enforce_comparable_viewport_prompt_and_typed_outputs(self):
         self.advance_to_approved(("d-0", "d-1"))
@@ -94,10 +110,7 @@ class PublicationGateTests(unittest.TestCase):
         second = self.entry("d-1", "success", 1, output_kind="local", output_ref="mockups/d-1.png")
         write_png(self.run / "mockups" / "d-0.png", 390, 844)
         write_png(self.run / "mockups" / "d-1.png", 390, 844)
-        manifest = run_state.load_run(self.run)
-        manifest["generation_attempts_used"] = 2
-        self.write_json("run.json", manifest)
-        self.write_json("mockup-manifest.json", {"mockups": [first, second]})
+        self.write_json("mockup-manifest.json", self.ledger([first, second]))
         self.assertEqual(validator.validate_phase(self.run, "mockups"), [])
 
         cases = (
@@ -110,14 +123,14 @@ class PublicationGateTests(unittest.TestCase):
         )
         for changed, expected in cases:
             with self.subTest(expected=expected):
-                self.write_json("mockup-manifest.json", {"mockups": [first, changed]})
+                self.write_json("mockup-manifest.json", self.ledger([first, changed]))
                 errors = validator.validate_phase(self.run, "mockups")
                 self.assertTrue(any(expected in error for error in errors), errors)
 
         write_png(self.run / "mockups" / "wrong.png", 1280, 800)
         self.write_json(
             "mockup-manifest.json",
-            {"mockups": [first, {**second, "output_ref": "mockups/wrong.png"}]},
+            self.ledger([first, {**second, "output_ref": "mockups/wrong.png"}]),
         )
         self.assertTrue(
             any("dimensions" in error for error in validator.validate_phase(self.run, "mockups"))
@@ -125,16 +138,13 @@ class PublicationGateTests(unittest.TestCase):
 
     def test_provider_output_contract_is_strict_and_host_owned(self):
         self.advance_to_approved()
-        manifest = run_state.load_run(self.run)
-        manifest["generation_attempts_used"] = 1
-        self.write_json("run.json", manifest)
         valid = self.entry(
             status="success",
             attempts=1,
             output_kind="provider",
             output_ref="provider:openai:artifact_abc-123",
         )
-        self.write_json("mockup-manifest.json", {"mockups": [valid]})
+        self.write_json("mockup-manifest.json", self.ledger([valid]))
         self.assertEqual(validator.validate_phase(self.run, "mockups"), [])
         for output_ref in (
             "openai:artifact_abc-123",
@@ -145,7 +155,7 @@ class PublicationGateTests(unittest.TestCase):
         ):
             with self.subTest(output_ref=output_ref):
                 self.write_json(
-                    "mockup-manifest.json", {"mockups": [{**valid, "output_ref": output_ref}]}
+                    "mockup-manifest.json", self.ledger([{**valid, "output_ref": output_ref}])
                 )
                 self.assertTrue(validator.validate_phase(self.run, "mockups"))
 
@@ -183,7 +193,16 @@ class PublicationGateTests(unittest.TestCase):
         self.write_pending_manifest()
         self.assertFalse(run_state.image_generation_allowed(self.run, "unknown"))
         lock = self.run / ".generation.lock"
-        lock.write_text("held", encoding="utf-8")
+        lock.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "created_at": "2026-07-20T00:00:00Z",
+                    "transaction_id": "a" * 32,
+                }
+            ),
+            encoding="utf-8",
+        )
         before_run = (self.run / "run.json").read_bytes()
         before_mockups = (self.run / "mockup-manifest.json").read_bytes()
         with self.assertRaisesRegex(ValueError, "already in progress"):
@@ -192,37 +211,59 @@ class PublicationGateTests(unittest.TestCase):
         self.assertEqual((self.run / "mockup-manifest.json").read_bytes(), before_mockups)
         lock.unlink()
 
-        manifest = json.loads((self.run / "run.json").read_text())
-        manifest["generation_attempts_used"] = 1
-        self.write_json("run.json", manifest)
+        bad = self.ledger([self.entry()], used=1)
+        bad["mockups"][0]["attempt_count"] = 0
+        self.write_json("mockup-manifest.json", bad)
         self.assertFalse(run_state.image_generation_allowed(self.run, "d-0"))
 
-        manifest["generation_attempts_used"] = 0
-        self.write_json("run.json", manifest)
         entry = self.entry(
             status="success",
             attempts=1,
             output_kind="provider",
             output_ref="provider:openai:artifact-1",
         )
-        manifest["generation_attempts_used"] = 1
-        manifest["last_generation_authorized_at"] = "2026-07-20T00:01:00Z"
-        manifest["last_generation_authorized_direction_id"] = "d-0"
-        self.write_json("run.json", manifest)
-        self.write_json("mockup-manifest.json", {"mockups": [entry]})
+        self.write_json("mockup-manifest.json", self.ledger([entry]))
         self.assertFalse(run_state.image_generation_allowed(self.run, "d-0"))
 
     def test_generation_audit_fields_and_ceiling_are_manifest_invariants(self):
         self.advance_to_approved()
-        base = json.loads((self.run / "run.json").read_text())
+        pending = self.entry()
+        base = self.ledger([pending])
         cases = (
+            ({**base, "schema_version": 2}, "schema_version must be 1"),
             ({**base, "generation_attempts_used": 1}, "audit fields"),
+            (
+                {
+                    **base,
+                    "last_generation_authorized_at": "2026-07-20",
+                    "last_generation_direction_id": "d-0",
+                },
+                "generation use and audit fields",
+            ),
+            (
+                {
+                    **base,
+                    "generation_attempts_used": 1,
+                    "last_generation_authorized_at": "not-a-timestamp",
+                    "last_generation_direction_id": "d-0",
+                },
+                "must be RFC3339",
+            ),
             (
                 {
                     **base,
                     "generation_attempts_used": 1,
                     "last_generation_authorized_at": "2026-07-20T00:01:00Z",
-                    "last_generation_authorized_direction_id": "unknown",
+                    "last_generation_direction_id": "d-0",
+                },
+                "attempt_count total",
+            ),
+            (
+                {
+                    **base,
+                    "generation_attempts_used": 1,
+                    "last_generation_authorized_at": "2026-07-20T00:01:00Z",
+                    "last_generation_direction_id": "unknown",
                 },
                 "approved direction",
             ),
@@ -231,40 +272,174 @@ class PublicationGateTests(unittest.TestCase):
                     **base,
                     "generation_attempts_used": 3,
                     "last_generation_authorized_at": "2026-07-20T00:01:00Z",
-                    "last_generation_authorized_direction_id": "d-0",
+                    "last_generation_direction_id": "d-0",
                 },
                 "authorization ceiling",
             ),
         )
         for changed, expected in cases:
             with self.subTest(expected=expected):
-                self.write_json("run.json", changed)
-                with self.assertRaisesRegex(ValueError, expected):
-                    run_state.load_run(self.run)
+                self.write_json("mockup-manifest.json", changed)
+                errors = validator.validate_mockup_manifest_for_generation(self.run)
+                self.assertTrue(any(expected in error for error in errors), errors)
 
-    def test_two_file_reservation_rolls_back_if_second_replace_fails(self):
+    def test_single_manifest_reservation_keeps_run_bytes_unchanged(self):
         self.advance_to_approved()
         self.write_pending_manifest()
         before_run = (self.run / "run.json").read_bytes()
-        before_mockups = (self.run / "mockup-manifest.json").read_bytes()
-        real_replace = run_state._replace_path
-        calls = 0
+        reserved = run_state.authorize_generation(self.run, "d-0")
+        self.assertEqual((self.run / "run.json").read_bytes(), before_run)
+        self.assertEqual(reserved["generation_attempts_used"], 1)
+        self.assertEqual(
+            json.loads((self.run / "mockup-manifest.json").read_text())[
+                "generation_attempts_used"
+            ],
+            1,
+        )
+        self.assertFalse((self.run / ".generation.lock").exists())
+        self.assertEqual(list(self.run.glob(".mockup-manifest.json.generation-*.tmp")), [])
 
-        def fail_second(source, destination):
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                raise OSError("injected second replace failure")
-            return real_replace(source, destination)
+    def test_generation_failure_injection_preserves_valid_single_ledger(self):
+        cases = (
+            ("_write_generation_temp", OSError("stage failed"), False),
+            ("_write_generation_temp", KeyboardInterrupt(), False),
+            ("_fsync_generation_file", OSError("fsync failed"), False),
+            ("_replace_path", OSError("replace failed"), False),
+        )
+        for helper, failure, expect_new in cases:
+            with self.subTest(helper=helper, failure=type(failure).__name__):
+                with tempfile.TemporaryDirectory() as temp:
+                    self.root = Path(temp)
+                    self.run = run_state.init_run(
+                        self.root,
+                        "failure",
+                        run_id=f"failure-{helper.strip('_').replace('_', '-')}-{type(failure).__name__.lower()}",
+                        target_viewports=["390x844"],
+                        required_content=["Order summary"],
+                        required_interactions=["Edit order"],
+                    )
+                    self.advance_to_approved()
+                    self.write_pending_manifest()
+                    before_run = (self.run / "run.json").read_bytes()
+                    before_ledger = (self.run / "mockup-manifest.json").read_bytes()
+                    with mock.patch.object(run_state, helper, side_effect=failure):
+                        with self.assertRaises(type(failure)):
+                            run_state.authorize_generation(self.run, "d-0")
+                    self.assertEqual((self.run / "run.json").read_bytes(), before_run)
+                    self.assertEqual((self.run / "mockup-manifest.json").read_bytes(), before_ledger)
+                    self.assertFalse((self.run / ".generation.lock").exists())
+                    self.assertEqual(
+                        list(self.run.glob(".mockup-manifest.json.generation-*.tmp")), []
+                    )
 
-        with mock.patch.object(run_state, "_replace_path", side_effect=fail_second):
-            with self.assertRaisesRegex(OSError, "injected"):
+    def test_partial_staging_interrupt_removes_transaction_temp(self):
+        self.advance_to_approved()
+        self.write_pending_manifest()
+        before_run = (self.run / "run.json").read_bytes()
+        before_ledger = (self.run / "mockup-manifest.json").read_bytes()
+
+        def write_part_then_interrupt(path, data):
+            path.write_bytes(data[:17])
+            raise KeyboardInterrupt()
+
+        with mock.patch.object(
+            run_state, "_write_generation_temp", side_effect=write_part_then_interrupt
+        ):
+            with self.assertRaises(KeyboardInterrupt):
                 run_state.authorize_generation(self.run, "d-0")
         self.assertEqual((self.run / "run.json").read_bytes(), before_run)
-        self.assertEqual((self.run / "mockup-manifest.json").read_bytes(), before_mockups)
+        self.assertEqual((self.run / "mockup-manifest.json").read_bytes(), before_ledger)
         self.assertFalse((self.run / ".generation.lock").exists())
-        self.assertEqual(list(self.run.glob("*.tmp-*")), [])
-        self.assertEqual(list(self.run.glob("*.rollback-*")), [])
+        self.assertEqual(list(self.run.glob(".mockup-manifest.json.generation-*.tmp")), [])
+
+    def test_lock_write_retries_short_writes_and_release_preserves_replacement(self):
+        real_write = os.write
+
+        def short_write(descriptor, data):
+            return real_write(descriptor, data[:3])
+
+        with mock.patch.object(run_state.os, "write", side_effect=short_write):
+            transaction_id = run_state._acquire_generation_lock(
+                self.run, "2026-07-20T00:01:00Z"
+            )
+        lock = self.run / ".generation.lock"
+        payload = json.loads(lock.read_text(encoding="utf-8"))
+        self.assertEqual(payload["transaction_id"], transaction_id)
+
+        replacement = {
+            "pid": os.getpid(),
+            "created_at": "2026-07-20T00:02:00Z",
+            "transaction_id": "f" * 32,
+        }
+        real_loads = json.loads
+
+        def replace_after_parse(value):
+            parsed = real_loads(value)
+            lock.unlink()
+            lock.write_text(json.dumps(replacement), encoding="utf-8")
+            return parsed
+
+        with mock.patch.object(run_state.json, "loads", side_effect=replace_after_parse):
+            run_state._release_generation_lock(self.run, transaction_id)
+        self.assertEqual(json.loads(lock.read_text(encoding="utf-8")), replacement)
+
+    def test_interrupt_after_replace_leaves_valid_new_ledger_and_no_residue(self):
+        self.advance_to_approved()
+        self.write_pending_manifest()
+        before_run = (self.run / "run.json").read_bytes()
+        real_replace = run_state._replace_path
+
+        def replace_then_interrupt(source, destination):
+            real_replace(source, destination)
+            raise KeyboardInterrupt()
+
+        with mock.patch.object(run_state, "_replace_path", side_effect=replace_then_interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                run_state.authorize_generation(self.run, "d-0")
+        self.assertEqual((self.run / "run.json").read_bytes(), before_run)
+        ledger = json.loads((self.run / "mockup-manifest.json").read_text())
+        self.assertEqual(validator.validate_mockup_manifest_for_generation(self.run), [])
+        self.assertEqual(ledger["generation_attempts_used"], 1)
+        self.assertFalse((self.run / ".generation.lock").exists())
+        self.assertEqual(list(self.run.glob(".mockup-manifest.json.generation-*.tmp")), [])
+
+    def test_dead_and_old_malformed_locks_recover_matching_temp_files(self):
+        self.advance_to_approved()
+        self.write_pending_manifest()
+        lock = self.run / ".generation.lock"
+        transaction_id = "b" * 32
+        stale_temp = self.run / f".mockup-manifest.json.generation-{transaction_id}.tmp"
+        foreign_temp = self.run / f".mockup-manifest.json.generation-{'c' * 32}.tmp"
+        stale_temp.write_text("partial", encoding="utf-8")
+        foreign_temp.write_text("foreign", encoding="utf-8")
+        lock.write_text(
+            json.dumps(
+                {
+                    "pid": 99_999_999,
+                    "created_at": "2026-07-20T00:00:00Z",
+                    "transaction_id": transaction_id,
+                }
+            ),
+            encoding="utf-8",
+        )
+        run_state.authorize_generation(self.run, "d-0")
+        self.assertFalse(lock.exists())
+        self.assertFalse(stale_temp.exists())
+        self.assertEqual(foreign_temp.read_text(encoding="utf-8"), "foreign")
+
+        ledger = json.loads((self.run / "mockup-manifest.json").read_text())
+        ledger["mockups"][0]["status"] = "failed"
+        self.write_json("mockup-manifest.json", ledger)
+        lock.write_text("{malformed", encoding="utf-8")
+        recent_mtime = time.time()
+        os.utime(lock, (recent_mtime, recent_mtime))
+        with self.assertRaisesRegex(ValueError, "malformed.*recent"):
+            run_state.authorize_generation(self.run, "d-0")
+        old_mtime = time.time() - run_state.MALFORMED_LOCK_STALE_SECONDS - 1
+        os.utime(lock, (old_mtime, old_mtime))
+        run_state.authorize_generation(self.run, "d-0")
+        self.assertFalse(lock.exists())
+        self.assertEqual(foreign_temp.read_text(encoding="utf-8"), "foreign")
 
     def test_cli_requires_direction_and_authorizes_concisely(self):
         self.advance_to_approved()

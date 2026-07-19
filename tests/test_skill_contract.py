@@ -196,6 +196,31 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("Interactive requirements: none", research)
         self.assertIn("can-generate", skill)
 
+    def test_single_generation_ledger_and_durable_lock_are_documented(self):
+        skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_DIR / "references/artifact-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        mockups = (SKILL_DIR / "references/mockups-implementation.md").read_text(
+            encoding="utf-8"
+        )
+        combined = (skill + contracts + mockups).lower()
+        for phrase in (
+            "mockup-manifest.json is the single authoritative generation ledger",
+            "schema_version: 1",
+            "generation_attempts_used: 0",
+            "last_generation_authorized_at: null",
+            "last_generation_direction_id: null",
+            "run.json is unchanged",
+            "one atomic replace",
+            "pid, created_at, and transaction_id",
+            "never steal a live lock",
+            "malformed lock",
+            "same-host pid trust boundary",
+            "absence, creation, and archival of the manifest",
+        ):
+            self.assertIn(phrase, combined)
+
     def test_review_hardening_contracts_are_documented(self):
         skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
         contracts = (SKILL_DIR / "references/artifact-contracts.md").read_text(

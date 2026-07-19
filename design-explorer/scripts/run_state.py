@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import errno
 import hashlib
 import importlib.util
 import json
 import os
 import re
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +28,10 @@ NEXT_STATE = dict(zip(STATES, STATES[1:]))
 SCHEMA_VERSION = 2
 DEFAULT_GENERATION_BUDGET = 5
 DEFAULT_MAX_ATTEMPTS_PER_DIRECTION = 2
+MALFORMED_LOCK_STALE_SECONDS = 30
+GENERATION_TEMP_PATTERN = re.compile(
+    r"\.mockup-manifest\.json\.generation-([0-9a-f]{32})\.tmp"
+)
 RFC3339_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
 )
@@ -193,9 +199,6 @@ def init_run(
         "required_content": normalized_content,
         "required_interactions": normalized_interactions,
         "production_paths": normalized_production_paths,
-        "generation_attempts_used": 0,
-        "last_generation_authorized_at": None,
-        "last_generation_authorized_direction_id": None,
     }
     validate_run_manifest(manifest)
     run_dir = Path(root).expanduser() / identifier
@@ -244,9 +247,6 @@ def validate_run_manifest(manifest: object) -> None:
         "required_content",
         "required_interactions",
         "production_paths",
-        "generation_attempts_used",
-        "last_generation_authorized_at",
-        "last_generation_authorized_direction_id",
     )
     for key in required:
         if key not in manifest:
@@ -293,53 +293,6 @@ def validate_run_manifest(manifest: object) -> None:
     for key in ("generation_budget", "max_attempts_per_direction"):
         if not _positive_integer(manifest[key]):
             raise ValueError(f"invalid run.json: {key} must be a positive integer")
-    attempts_used = manifest["generation_attempts_used"]
-    if (
-        not isinstance(attempts_used, int)
-        or isinstance(attempts_used, bool)
-        or attempts_used < 0
-    ):
-        raise ValueError(
-            "invalid run.json: generation_attempts_used must be a non-negative integer"
-        )
-    authorized_at = manifest["last_generation_authorized_at"]
-    authorized_direction = manifest["last_generation_authorized_direction_id"]
-    if (authorized_at is None) != (authorized_direction is None):
-        raise ValueError(
-            "invalid run.json: generation authorization audit fields must both be null or populated"
-        )
-    if authorized_at is not None:
-        if not valid_rfc3339(authorized_at):
-            raise ValueError(
-                "invalid run.json: last_generation_authorized_at must be RFC3339"
-            )
-        if not isinstance(authorized_direction, str) or not authorized_direction.strip():
-            raise ValueError(
-                "invalid run.json: last_generation_authorized_direction_id must be nonblank"
-            )
-    if (attempts_used == 0) != (authorized_at is None):
-        raise ValueError(
-            "invalid run.json: generation attempt use and audit fields must agree"
-        )
-    if attempts_used and manifest["state"] in {
-        "initialized",
-        "brief_ready",
-        "research_complete",
-        "directions_pending_approval",
-    }:
-        raise ValueError(
-            "invalid run.json: generation attempts require approved directions"
-        )
-    if attempts_used:
-        if authorized_direction not in approved:
-            raise ValueError(
-                "invalid run.json: last generation authorization must name an approved direction"
-            )
-        authorization_ceiling = len(approved) * manifest["max_attempts_per_direction"]
-        if attempts_used > authorization_ceiling:
-            raise ValueError(
-                "invalid run.json: generation attempts exceed authorization ceiling"
-            )
     normalized_viewports = _normalize_viewports(manifest["target_viewports"])
     if normalized_viewports != manifest["target_viewports"]:
         raise ValueError("invalid run.json: target_viewports must be normalized and unique")
@@ -589,9 +542,6 @@ def transition_run(
         manifest["approved_direction_ids"] = list(approved_direction_ids)
         manifest["generation_budget"] = effective_budget
         manifest["max_attempts_per_direction"] = effective_attempts
-        manifest["generation_attempts_used"] = 0
-        manifest["last_generation_authorized_at"] = None
-        manifest["last_generation_authorized_direction_id"] = None
         if expanded:
             manifest["budget_expansion_approved_at"] = timestamp
         else:
@@ -647,9 +597,6 @@ def revise_run(
     manifest["selected_direction_id"] = None
     manifest["generation_budget"] = DEFAULT_GENERATION_BUDGET
     manifest["max_attempts_per_direction"] = DEFAULT_MAX_ATTEMPTS_PER_DIRECTION
-    manifest["generation_attempts_used"] = 0
-    manifest["last_generation_authorized_at"] = None
-    manifest["last_generation_authorized_direction_id"] = None
     manifest.pop("budget_expansion_approved_at", None)
     manifest["updated_at"] = timestamp
     validate_run_manifest(manifest)
@@ -706,7 +653,7 @@ def _generation_preflight(run_dir: Path, direction_id: str) -> tuple[dict, dict,
         len(manifest["approved_direction_ids"])
         * manifest["max_attempts_per_direction"]
     )
-    if manifest["generation_attempts_used"] >= total_ceiling:
+    if mockup_manifest["generation_attempts_used"] >= total_ceiling:
         raise ValueError("generation total attempt authorization ceiling exhausted")
     return manifest, mockup_manifest, entry
 
@@ -726,85 +673,213 @@ def _replace_path(source: Path, destination: Path) -> None:
     os.replace(source, destination)
 
 
-def _write_two_json_atomic(
-    first_path: Path,
-    first_value: dict,
-    second_path: Path,
-    second_value: dict,
-) -> None:
-    original_first = first_path.read_bytes()
-    original_second = second_path.read_bytes()
-    suffix = f".tmp-{uuid.uuid4().hex}"
-    first_temp = first_path.with_name(first_path.name + suffix)
-    second_temp = second_path.with_name(second_path.name + suffix)
-    first_temp.write_text(json.dumps(first_value, indent=2) + "\n", encoding="utf-8")
-    second_temp.write_text(json.dumps(second_value, indent=2) + "\n", encoding="utf-8")
-    first_replaced = False
-    second_replaced = False
+def _fsync_generation_file(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
+def _write_generation_temp(path: Path, data: bytes) -> None:
+    with path.open("xb") as stream:
+        stream.write(data)
+        stream.flush()
+        _fsync_generation_file(stream.fileno())
+
+
+def _fsync_run_directory(run_dir: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(run_dir, flags)
     try:
-        _replace_path(first_temp, first_path)
-        first_replaced = True
-        _replace_path(second_temp, second_path)
-        second_replaced = True
-    except Exception:
-        restore_suffix = f".rollback-{uuid.uuid4().hex}"
-        if first_replaced:
-            restore_first = first_path.with_name(first_path.name + restore_suffix)
-            restore_first.write_bytes(original_first)
-            _replace_path(restore_first, first_path)
-        if second_replaced:
-            restore_second = second_path.with_name(second_path.name + restore_suffix)
-            restore_second.write_bytes(original_second)
-            _replace_path(restore_second, second_path)
-        raise
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            if error.errno not in {errno.EINVAL, errno.ENOTSUP, errno.EBADF}:
+                raise
     finally:
-        for temporary in (first_temp, second_temp):
+        os.close(descriptor)
+
+
+def _write_mockup_manifest_atomic(
+    run_dir: Path, value: dict, transaction_id: str
+) -> None:
+    destination = run_dir / "mockup-manifest.json"
+    temporary = run_dir / (
+        f".mockup-manifest.json.generation-{transaction_id}.tmp"
+    )
+    data = (json.dumps(value, indent=2) + "\n").encode("utf-8")
+    try:
+        _write_generation_temp(temporary, data)
+        _replace_path(temporary, destination)
+        _fsync_run_directory(run_dir)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _generation_temp_paths(run_dir: Path, transaction_id: str | None) -> list[Path]:
+    paths = []
+    for path in run_dir.glob(".mockup-manifest.json.generation-*.tmp"):
+        match = GENERATION_TEMP_PATTERN.fullmatch(path.name)
+        if match and (transaction_id is None or match.group(1) == transaction_id):
+            paths.append(path)
+    return paths
+
+
+def _valid_lock_payload(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("pid"), int)
+        and not isinstance(value.get("pid"), bool)
+        and value["pid"] > 0
+        and valid_rfc3339(value.get("created_at"))
+        and isinstance(value.get("transaction_id"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", value["transaction_id"]) is not None
+    )
+
+
+def _process_is_live(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+
+
+def _recover_generation_lock(run_dir: Path, lock_path: Path) -> None:
+    try:
+        original = lock_path.read_bytes()
+        stat = lock_path.stat()
+    except OSError:
+        raise ValueError("generation authorization lock changed during recovery") from None
+    try:
+        payload = json.loads(original)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload = None
+    transaction_id = None
+    if _valid_lock_payload(payload):
+        if _process_is_live(payload["pid"]):
+            raise ValueError("generation authorization is already in progress")
+        transaction_id = payload["transaction_id"]
+    elif time.time() - stat.st_mtime < MALFORMED_LOCK_STALE_SECONDS:
+        raise ValueError("generation authorization lock is malformed but recent")
+    try:
+        current_stat = lock_path.stat()
+        if (
+            (current_stat.st_dev, current_stat.st_ino) != (stat.st_dev, stat.st_ino)
+            or lock_path.read_bytes() != original
+        ):
+            raise ValueError("generation authorization lock changed during recovery")
+        lock_path.unlink()
+    except FileNotFoundError:
+        raise ValueError("generation authorization lock changed during recovery") from None
+    if transaction_id is not None:
+        for temporary in _generation_temp_paths(run_dir, transaction_id):
             try:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
 
 
+def _acquire_generation_lock(run_dir: Path, timestamp: str) -> str:
+    lock_path = run_dir / ".generation.lock"
+    for attempt in range(2):
+        transaction_id = uuid.uuid4().hex
+        try:
+            descriptor = os.open(
+                lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+            )
+        except FileExistsError:
+            if attempt:
+                raise ValueError("generation authorization is already in progress") from None
+            _recover_generation_lock(run_dir, lock_path)
+            continue
+        stat = os.fstat(descriptor)
+        payload = (
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "created_at": timestamp,
+                    "transaction_id": transaction_id,
+                }
+            )
+            + "\n"
+        ).encode("utf-8")
+        try:
+            remaining = memoryview(payload)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("generation authorization lock write made no progress")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+            _fsync_run_directory(run_dir)
+        except BaseException:
+            try:
+                current = lock_path.stat()
+                if (current.st_dev, current.st_ino) == (stat.st_dev, stat.st_ino):
+                    lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        finally:
+            os.close(descriptor)
+        return transaction_id
+    raise ValueError("unable to acquire generation authorization lock")
+
+
+def _release_generation_lock(run_dir: Path, transaction_id: str) -> None:
+    lock_path = run_dir / ".generation.lock"
+    try:
+        original = lock_path.read_bytes()
+        stat = lock_path.stat()
+        payload = json.loads(original)
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return
+    if isinstance(payload, dict) and payload.get("transaction_id") == transaction_id:
+        try:
+            current = lock_path.stat()
+            if (
+                (current.st_dev, current.st_ino) != (stat.st_dev, stat.st_ino)
+                or lock_path.read_bytes() != original
+            ):
+                return
+            lock_path.unlink()
+        except (FileNotFoundError, OSError):
+            pass
+
+
 def authorize_generation(
     run_dir: Path, direction_id: str, now: str | None = None
 ) -> dict:
     run_dir = Path(run_dir)
-    lock_path = run_dir / ".generation.lock"
+    timestamp = now or utc_now()
+    if not valid_rfc3339(timestamp):
+        raise ValueError("generation authorization timestamp must be RFC3339")
+    transaction_id = _acquire_generation_lock(run_dir, timestamp)
     try:
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        raise ValueError("generation authorization is already in progress") from None
-    try:
-        os.close(descriptor)
-        manifest, mockup_manifest, entry = _generation_preflight(
+        _manifest, mockup_manifest, entry = _generation_preflight(
             run_dir, direction_id
         )
-        timestamp = now or utc_now()
-        if not valid_rfc3339(timestamp):
-            raise ValueError("generation authorization timestamp must be RFC3339")
         entry["attempt_count"] += 1
         entry["status"] = "pending"
         for key in ("failure", "output_kind", "output_ref"):
             entry.pop(key, None)
-        manifest["generation_attempts_used"] += 1
-        manifest["last_generation_authorized_at"] = timestamp
-        manifest["last_generation_authorized_direction_id"] = direction_id
-        manifest["updated_at"] = timestamp
-        validate_run_manifest(manifest)
-        run_path = run_dir / "run.json"
-        mockup_path = run_dir / "mockup-manifest.json"
-        _write_two_json_atomic(run_path, manifest, mockup_path, mockup_manifest)
+        mockup_manifest["generation_attempts_used"] += 1
+        mockup_manifest["last_generation_authorized_at"] = timestamp
+        mockup_manifest["last_generation_direction_id"] = direction_id
+        _write_mockup_manifest_atomic(run_dir, mockup_manifest, transaction_id)
         return {
             "direction_id": direction_id,
             "attempt_count": entry["attempt_count"],
-            "generation_attempts_used": manifest["generation_attempts_used"],
+            "generation_attempts_used": mockup_manifest["generation_attempts_used"],
             "authorized_at": timestamp,
         }
     finally:
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
+        _release_generation_lock(run_dir, transaction_id)
 
 
 def main() -> int:

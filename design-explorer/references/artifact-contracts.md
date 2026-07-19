@@ -44,7 +44,7 @@ python3 scripts/run_state.py can-generate --run <run-dir> --direction <id>
 python3 scripts/run_state.py authorize-generation --run <run-dir> --direction <id>
 ```
 
-Repeat `--approved-direction <id>` for every explicitly approved direction. Later states cumulatively revalidate every prerequisite phase. Before generation, create prompt files and exactly one pending manifest entry per approved direction with `attempt_count: 0`. Run `can-generate --run <run-dir> --direction <id>`, then `authorize-generation --run <run-dir> --direction <id>` immediately before that direction's provider call. Do not call the provider without a successful reservation. Authorization atomically reserves one attempt in both files; the host then records `failed` or `success`.
+Repeat `--approved-direction <id>` for every explicitly approved direction. Later states cumulatively revalidate every prerequisite phase. Before generation, create prompt files and exactly one pending manifest entry per approved direction with `attempt_count: 0`. Run `can-generate --run <run-dir> --direction <id>`, then `authorize-generation --run <run-dir> --direction <id>` immediately before that direction's provider call. Do not call the provider without a successful reservation. Authorization reserves one attempt with one atomic replace of the manifest; run.json is unchanged. The host then records `failed` or `success`.
 
 The approval count cannot exceed `generation_budget`. A user-approved expansion is explicit and auditable. Whenever either limit exceeds its default, `budget_expansion_approved_at` is required and must be a valid RFC3339 timestamp; the field is forbidden when neither limit is expanded:
 
@@ -152,7 +152,17 @@ Never repurpose a primary direction ID. Append every revised variation or combin
 
 ### Mockup artifact
 
-`mockup-manifest.json` contains a `mockups` list. A successful mockup requires:
+mockup-manifest.json is the single authoritative generation ledger. Create it with these top-level fields before any provider call:
+
+```yaml
+schema_version: 1
+generation_attempts_used: 0
+last_generation_authorized_at: null
+last_generation_direction_id: null
+mockups: [...]
+```
+
+The audit fields become a valid RFC3339 timestamp and the just-authorized approved direction ID together. The top-level total equals the sum of entry attempts and cannot exceed the approved-direction ceiling. A successful mockup requires:
 
 - `direction_id`
 - `status` set to `success`
@@ -163,9 +173,9 @@ Never repurpose a primary direction ID. Append every revised variation or combin
 - `output_ref`
 - positive integer `attempt_count`
 
-The list contains exactly one current entry per approved direction. All entries use one shared target viewport from the locked run targets. The digest equals the exact `prompt_ref` bytes. Initial pending entries use attempt zero; authorization increments the entry and `generation_attempts_used`. One technical retry is the default maximum of two attempts.
+The list contains exactly one current entry per approved direction. All entries use one shared target viewport from the locked run targets. The digest equals the exact `prompt_ref` bytes. Initial pending entries use attempt zero; authorization increments that entry and the manifest total. One technical retry is the default maximum of two attempts.
 
-A local success uses a contained existing complete PNG whose dimensions exactly match the viewport. A provider success uses `provider:<lowercase-provider>:<safe-artifact-id>`; provider artifact existence is the host's responsibility. Pending/failed entries may omit output fields, but present outputs satisfy their typed contract. Every approved direction succeeds, and attempt totals match `run.json`, before `mockups_generated`.
+A local success uses a contained existing complete PNG whose dimensions exactly match the viewport. A provider success uses `provider:<lowercase-provider>:<safe-artifact-id>`; provider artifact existence is the host's responsibility. Pending/failed entries may omit output fields, but present outputs satisfy their typed contract. Every approved direction succeeds, and manifest attempt totals reconcile, before `mockups_generated`.
 
 ### Implementation artifact
 

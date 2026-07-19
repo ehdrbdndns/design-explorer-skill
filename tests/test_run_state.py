@@ -226,19 +226,24 @@ class RunStateTests(unittest.TestCase):
                 value.pop("output_ref", None)
         self.write(
             "mockup-manifest.json",
-            {"mockups": values},
+            {
+                "schema_version": 1,
+                "generation_attempts_used": sum(
+                    value["attempt_count"] for value in values
+                ),
+                "last_generation_authorized_at": (
+                    "2026-07-19T12:00:00Z"
+                    if any(value["attempt_count"] for value in values)
+                    else None
+                ),
+                "last_generation_direction_id": (
+                    identifiers[-1]
+                    if any(value["attempt_count"] for value in values)
+                    else None
+                ),
+                "mockups": values,
+            },
         )
-        manifest = json.loads((self.run_dir / "run.json").read_text())
-        manifest["generation_attempts_used"] = sum(
-            value["attempt_count"] for value in values
-        )
-        if manifest["generation_attempts_used"]:
-            manifest["last_generation_authorized_at"] = "2026-07-19T12:00:00Z"
-            manifest["last_generation_authorized_direction_id"] = identifiers[-1]
-        else:
-            manifest["last_generation_authorized_at"] = None
-            manifest["last_generation_authorized_direction_id"] = None
-        self.write("run.json", manifest)
 
     def advance_to_pending(self, direction_count=5):
         self.write_brief()
@@ -269,9 +274,9 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(manifest["generation_budget"], 5)
         self.assertEqual(manifest["max_attempts_per_direction"], 2)
-        self.assertEqual(manifest["generation_attempts_used"], 0)
-        self.assertIsNone(manifest["last_generation_authorized_at"])
-        self.assertIsNone(manifest["last_generation_authorized_direction_id"])
+        self.assertNotIn("generation_attempts_used", manifest)
+        self.assertNotIn("last_generation_authorized_at", manifest)
+        self.assertNotIn("last_generation_direction_id", manifest)
         self.assertEqual(manifest["target_viewports"], ["390x844"])
         self.assertEqual(manifest["required_content"], ["Order summary"])
         self.assertEqual(manifest["required_interactions"], ["Edit order"])
@@ -606,9 +611,9 @@ class RunStateTests(unittest.TestCase):
         self.assertIsNone(revised["selected_direction_id"])
         self.assertEqual(revised["generation_budget"], 5)
         self.assertEqual(revised["max_attempts_per_direction"], 2)
-        self.assertEqual(revised["generation_attempts_used"], 0)
-        self.assertIsNone(revised["last_generation_authorized_at"])
-        self.assertIsNone(revised["last_generation_authorized_direction_id"])
+        self.assertNotIn("generation_attempts_used", revised)
+        self.assertNotIn("last_generation_authorized_at", revised)
+        self.assertNotIn("last_generation_direction_id", revised)
         self.assertNotIn("budget_expansion_approved_at", revised)
         self.assertFalse((self.run_dir / "mockup-manifest.json").exists())
         self.assertTrue(
@@ -953,9 +958,9 @@ class RunStateTests(unittest.TestCase):
 
         self.assertEqual(approved["generation_budget"], 5)
         self.assertEqual(approved["max_attempts_per_direction"], 2)
-        self.assertEqual(approved["generation_attempts_used"], 0)
-        self.assertIsNone(approved["last_generation_authorized_at"])
-        self.assertIsNone(approved["last_generation_authorized_direction_id"])
+        self.assertNotIn("generation_attempts_used", approved)
+        self.assertNotIn("last_generation_authorized_at", approved)
+        self.assertNotIn("last_generation_direction_id", approved)
         self.assertNotIn("budget_expansion_approved_at", approved)
         reloaded = run_state.load_run(self.run_dir)
         self.assertEqual(reloaded, approved)
