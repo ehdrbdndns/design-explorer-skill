@@ -24,6 +24,9 @@ NEXT_STATE = dict(zip(STATES, STATES[1:]))
 SCHEMA_VERSION = 2
 DEFAULT_GENERATION_BUDGET = 5
 DEFAULT_MAX_ATTEMPTS_PER_DIRECTION = 2
+RFC3339_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
+)
 REQUIRED_FILES = {
     "brief_ready": ("brief.md",),
     "research_complete": (
@@ -57,6 +60,16 @@ _VALIDATOR = None
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def valid_rfc3339(value) -> bool:
+    if not isinstance(value, str) or not RFC3339_PATTERN.fullmatch(value):
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
 
 
 def write_json_atomic(path: Path, value: dict) -> None:
@@ -178,11 +191,27 @@ def validate_run_manifest(manifest: object) -> None:
     for key in ("generation_budget", "max_attempts_per_direction"):
         if not _positive_integer(manifest[key]):
             raise ValueError(f"invalid run.json: {key} must be a positive integer")
-    for key in ("budget_expansion_approved_at", "integration_approved_at"):
-        if key in manifest and (
-            not isinstance(manifest[key], str) or not manifest[key].strip()
-        ):
-            raise ValueError(f"invalid run.json: {key} must be a non-empty string")
+    expanded = (
+        manifest["generation_budget"] > DEFAULT_GENERATION_BUDGET
+        or manifest["max_attempts_per_direction"]
+        > DEFAULT_MAX_ATTEMPTS_PER_DIRECTION
+    )
+    budget_approval = manifest.get("budget_expansion_approved_at")
+    if expanded and not valid_rfc3339(budget_approval):
+        raise ValueError(
+            "invalid run.json: expanded budget requires valid budget_expansion_approved_at"
+        )
+    if not expanded and "budget_expansion_approved_at" in manifest:
+        raise ValueError(
+            "invalid run.json: budget_expansion_approved_at requires an expanded budget"
+        )
+    if "integration_approved_at" in manifest and (
+        not isinstance(manifest["integration_approved_at"], str)
+        or not manifest["integration_approved_at"].strip()
+    ):
+        raise ValueError(
+            "invalid run.json: integration_approved_at must be a non-empty string"
+        )
 
 
 def _require_files(run_dir: Path, target: str) -> None:
@@ -288,6 +317,10 @@ def transition_run(
         )
         if expanded and not budget_expansion_approved:
             raise ValueError("expanded budget requires explicit budget expansion approval")
+        if expanded and not valid_rfc3339(timestamp):
+            raise ValueError(
+                "expanded budget requires a valid RFC3339 approval timestamp"
+            )
         if len(approved_direction_ids) > effective_budget:
             raise ValueError(
                 f"approved directions exceed generation budget {effective_budget}"
@@ -321,7 +354,7 @@ def revise_run(
     current = manifest["state"]
     if current != "mockups_generated":
         raise ValueError(f"illegal revision from {current}")
-    _require_files(run_dir, "mockups_generated")
+    _validate_target(run_dir, "mockups_generated")
 
     revision_count = manifest.get("revision_count", 0)
     if (

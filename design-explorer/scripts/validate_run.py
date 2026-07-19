@@ -4,6 +4,7 @@ import ipaddress
 import json
 import re
 import sys
+from datetime import datetime
 from itertools import combinations
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
@@ -24,12 +25,42 @@ SECRET_KEY_PATTERN = re.compile(
     r"(?:api|access|refresh|auth|bearer|pairing)?token|api(?:key|secret)|clientsecret"
 )
 SECRET_VALUE_PATTERNS = (
-    re.compile(r"\bBearer\s+\S+", re.IGNORECASE),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{10,}"),
-    re.compile(r"\bghp_[A-Za-z0-9]{10,}"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{24,}={0,2}\b", re.IGNORECASE),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bsk_live_[A-Za-z0-9]{16,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"),
+    re.compile(r"\bsk-proj-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
 )
+RFC3339_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
+)
+VIEWPORT_PATTERN = re.compile(r"[1-9]\d*x[1-9]\d*")
+PROMPT_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+BLOCKED_HOST_SUFFIXES = (
+    "localhost",
+    "local",
+    "test",
+    "invalid",
+    "example",
+    "home.arpa",
+    "nip.io",
+    "sslip.io",
+)
+
+
+def valid_rfc3339(value) -> bool:
+    if not isinstance(value, str) or not RFC3339_PATTERN.fullmatch(value):
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
 
 
 def read_json(run_dir: Path, name: str, errors: list[str]):
@@ -66,7 +97,8 @@ def valid_hostname(value: str) -> bool:
 
 def valid_url(value) -> bool:
     if not isinstance(value, str) or not value or any(
-        character.isspace() for character in value
+        character.isspace() or ord(character) < 32 or ord(character) == 127
+        for character in value
     ):
         return False
     try:
@@ -84,8 +116,10 @@ def valid_url(value) -> bool:
     ):
         return False
     normalized_hostname = hostname.rstrip(".").casefold()
-    if normalized_hostname == "localhost" or normalized_hostname.endswith(
-        (".localhost", ".local")
+    if any(
+        normalized_hostname == suffix
+        or normalized_hostname.endswith(f".{suffix}")
+        for suffix in BLOCKED_HOST_SUFFIXES
     ):
         return False
     try:
@@ -429,6 +463,26 @@ def positive_integer_field(run: dict, field: str, errors: list[str]):
     return value
 
 
+def validate_budget_approval(
+    run: dict,
+    budget: int | None,
+    max_attempts: int | None,
+    errors: list[str],
+) -> None:
+    if budget is None or max_attempts is None:
+        return
+    expanded = budget > 5 or max_attempts > 2
+    approval = run.get("budget_expansion_approved_at")
+    if expanded and not valid_rfc3339(approval):
+        errors.append(
+            "run.json expanded budget requires valid budget_expansion_approved_at"
+        )
+    elif not expanded and "budget_expansion_approved_at" in run:
+        errors.append(
+            "run.json budget_expansion_approved_at requires an expanded budget"
+        )
+
+
 def validate_mockups(run_dir: Path) -> list[str]:
     errors = []
     run = read_json(run_dir, "run.json", errors)
@@ -446,6 +500,7 @@ def validate_mockups(run_dir: Path) -> list[str]:
     approved = approved_direction_ids(run, errors)
     budget = positive_integer_field(run, "generation_budget", errors)
     max_attempts = positive_integer_field(run, "max_attempts_per_direction", errors)
+    validate_budget_approval(run, budget, max_attempts, errors)
     mockups = manifest["mockups"]
     if budget is not None and len(mockups) > budget:
         errors.append(
@@ -475,7 +530,7 @@ def validate_mockups(run_dir: Path) -> list[str]:
                 errors.append(f"duplicate current direction_id: {direction_id}")
             seen_direction_ids.add(direction_id)
         status = item.get("status")
-        if status not in ALLOWED_MOCKUP_STATUSES:
+        if not isinstance(status, str) or status not in ALLOWED_MOCKUP_STATUSES:
             errors.append(
                 f"mockups[{index}] status must be pending, success, or failed"
             )
@@ -497,12 +552,27 @@ def validate_mockups(run_dir: Path) -> list[str]:
         ):
             errors.append(f"mockups[{index}] output_ref must be a safe artifact reference")
             output_ref_is_valid = False
+        viewport = item.get("viewport")
+        if not isinstance(viewport, str) or not VIEWPORT_PATTERN.fullmatch(viewport):
+            errors.append(f"mockups[{index}] viewport must use WIDTHxHEIGHT")
+        prompt_digest = item.get("prompt_digest")
+        if not isinstance(prompt_digest, str) or not PROMPT_DIGEST_PATTERN.fullmatch(
+            prompt_digest
+        ):
+            errors.append(
+                f"mockups[{index}] prompt_digest must be sha256 plus 64 lowercase hex"
+            )
         if status == "success":
             fields_are_valid = True
-            for field in ("viewport", "prompt_digest", "output_ref"):
-                if not isinstance(item.get(field), str) or not item[field].strip():
-                    errors.append(f"mockups[{index}] missing {field}")
-                    fields_are_valid = False
+            if not isinstance(output_ref, str) or not output_ref.strip():
+                errors.append(f"mockups[{index}] missing output_ref")
+                fields_are_valid = False
+            if not isinstance(viewport, str) or not VIEWPORT_PATTERN.fullmatch(viewport):
+                fields_are_valid = False
+            if not isinstance(prompt_digest, str) or not PROMPT_DIGEST_PATTERN.fullmatch(
+                prompt_digest
+            ):
+                fields_are_valid = False
             if not output_ref_is_valid:
                 fields_are_valid = False
             if direction_is_approved and fields_are_valid:

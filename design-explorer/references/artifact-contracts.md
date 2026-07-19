@@ -37,7 +37,7 @@ python3 scripts/run_state.py transition --run <run-dir> --to directions_approved
 
 Repeat `--approved-direction <id>` for every explicitly approved direction. After image output is recorded, execute the remaining steps in this order:
 
-The approval count cannot exceed `generation_budget`. A user-approved expansion is explicit and auditable:
+The approval count cannot exceed `generation_budget`. A user-approved expansion is explicit and auditable. Whenever either limit exceeds its default, `budget_expansion_approved_at` is required and must be a valid RFC3339 timestamp; the field is forbidden when neither limit is expanded:
 
 ```bash
 python3 scripts/run_state.py transition --run <run-dir> --to directions_approved \
@@ -74,7 +74,7 @@ When the user requests a bounded variation or combination instead of selecting, 
 python3 scripts/run_state.py revise --run <run-dir> --reason "<user-request>"
 ```
 
-`revise` requires a non-empty reason. It archives `mockup-manifest.json` as `mockup-manifest.revision-<n>.json`, increments `revision_count`, records `last_revision_reason` and `last_revision_at`, clears approved/selected IDs, resets the generation/attempt budgets to defaults, clears the expansion timestamp, and returns to `directions_pending_approval`. Append the derived direction, validate and present it, obtain explicit approval again, and then create a new manifest containing only newly approved IDs.
+`revise` requires a non-empty reason and validates the current mockup manifest before archiving or mutating anything. It archives `mockup-manifest.json` as `mockup-manifest.revision-<n>.json`, increments `revision_count`, records `last_revision_reason` and `last_revision_at`, clears approved/selected IDs, resets the generation/attempt budgets to defaults, clears the expansion timestamp, and returns to `directions_pending_approval`. Append the derived direction, validate and present it, obtain explicit approval again, and then create a new manifest containing only newly approved IDs.
 
 ## Structured artifacts
 
@@ -94,7 +94,7 @@ Record the screen purpose, required content, target viewport, preservation const
 - `relevance`
 - `observations`, containing non-empty `layout`, `typography`, `palette`, `density`, `imagery`, and `interaction`
 
-`capture_path` is optional and must be a safe relative artifact path with no absolute path, traversal, backslash escape, URL, or credentials. Store only a sanitized local capture, never session data or credentials. Source URLs must be public HTTP(S): no URL userinfo, localhost, `.local`, or literal non-public IP hosts.
+`capture_path` is optional and must be a safe relative artifact path with no absolute path, traversal, backslash escape, URL, or credentials. Store only a sanitized local capture, never session data or credentials. Source URLs must be public HTTP(S): no controls, URL userinfo, deterministic special-use/local/wildcard suffixes, or literal non-public IP hosts. The fetch/browser step must separately verify the final redirect URL and resolved destination because validation performs no live DNS.
 
 `evidence.json` is a JSON array. Every evidence item requires:
 
@@ -145,12 +145,12 @@ Never repurpose a primary direction ID. Append every revised variation or combin
 
 - `direction_id`
 - `status` set to `success`
-- `viewport`
-- `prompt_digest`
+- `viewport` as positive `WIDTHxHEIGHT`
+- `prompt_digest` as `sha256:` followed by 64 lowercase hexadecimal characters
 - `output_ref`
 - positive integer `attempt_count`
 
-The list cannot exceed `generation_budget`. It contains exactly one current entry per approved direction, no unapproved or duplicate IDs, and only `pending`, `success`, or `failed` status. Every attempt count is at most the authorized `max_attempts_per_direction`. Every approved direction needs one successful entry before `mockups_generated`. `output_ref`, when present, is a safe relative path or conservative provider artifact hint without userinfo or secrets. Pending or failed entries retain the direction ID, status, viewport, prompt digest, attempt count, and failure detail when available.
+The list cannot exceed `generation_budget`. It contains exactly one current entry per approved direction, no unapproved or duplicate IDs, and only `pending`, `success`, or `failed` status. Every entry, including pending/failed, requires the formatted viewport, digest, and an attempt count no greater than the authorized `max_attempts_per_direction`. Every approved direction needs one successful entry before `mockups_generated`. `output_ref`, when present, is a safe relative path or conservative provider artifact hint without userinfo or secrets. Pending or failed entries retain failure detail when available.
 
 ### Implementation artifact
 
@@ -165,4 +165,4 @@ Validate this file before `prototype_ready`. The isolated preview remains separa
 
 ## Confidentiality
 
-Credentials, cookies, API keys, and pairing tokens never belong in run artifacts. Validation recursively rejects secret-like JSON keys and high-confidence credential values in research, direction, mockup, and implementation artifacts. Normal prose discussing password UX is allowed. Do not copy browser storage, authorization headers, environment secrets, or raw sensitive screenshots into the run directory. Redact or omit sensitive material and record only the safe design observation needed for the exploration.
+Credentials, cookies, API keys, and pairing tokens never belong in run artifacts. Validation recursively rejects secret-like JSON keys and realistic high-confidence Bearer, Slack, GitHub, Stripe, Google, AWS, OpenAI, and private-key values in research, direction, mockup, provider-hint, and implementation artifacts. Placeholders such as `Bearer <token>` and normal authentication UX prose are allowed. Do not copy browser storage, authorization headers, environment secrets, or raw sensitive screenshots into the run directory. Redact or omit sensitive material and record only the safe design observation needed for the exploration.

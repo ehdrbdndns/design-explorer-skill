@@ -10,6 +10,7 @@ from design_explorer_import import load_script_module
 
 
 validator = load_script_module("validate_run", "design-explorer/scripts/validate_run.py")
+DIGEST = "sha256:" + "a" * 64
 
 
 def reference(identifier="ref-1"):
@@ -117,7 +118,7 @@ def mockup(direction_id="a", **overrides):
         "direction_id": direction_id,
         "status": "success",
         "viewport": "390x844",
-        "prompt_digest": "sha256:abc",
+        "prompt_digest": DIGEST,
         "output_ref": "mockups/a.png",
         "attempt_count": 1,
     }
@@ -189,6 +190,15 @@ class ValidateRunTests(unittest.TestCase):
             "http://localhost/path",
             "http://intranet/path",
             "https://service.local/path",
+            "https://service.localhost/path",
+            "https://service.test/path",
+            "https://service.invalid/path",
+            "https://service.example/path",
+            "https://home.arpa/path",
+            "https://device.home.arpa/path",
+            "https://127-0-0-1.nip.io/path",
+            "https://private.127-0-0-1.nip.io/path",
+            "https://127-0-0-1.sslip.io/path",
             "https://127.0.0.1/path",
             "https://10.0.0.1/path",
             "https://169.254.1.1/path",
@@ -196,6 +206,9 @@ class ValidateRunTests(unittest.TestCase):
             "https://0.0.0.0/path",
             "https://192.0.2.1/path",
             "https://[::1]/path",
+            "https://example.com/\x00hidden",
+            "https://example.com/\x1fhidden",
+            "https://example.com/\x7fhidden",
         )
 
         for value in invalid_urls:
@@ -607,7 +620,7 @@ class ValidateRunTests(unittest.TestCase):
                         "direction_id": "a",
                         "status": "success",
                         "viewport": "390x844",
-                        "prompt_digest": "sha256:abc",
+                        "prompt_digest": DIGEST,
                         "output_ref": "mockups/a.png",
                         "attempt_count": 1,
                     }
@@ -666,8 +679,10 @@ class ValidateRunTests(unittest.TestCase):
         errors = validator.validate_phase(self.run, "mockups")
 
         self.assertIn("mockups[0] direction_id is not approved: b", errors)
-        self.assertIn("mockups[1] missing viewport", errors)
-        self.assertIn("mockups[1] missing prompt_digest", errors)
+        self.assertIn("mockups[1] viewport must use WIDTHxHEIGHT", errors)
+        self.assertIn(
+            "mockups[1] prompt_digest must be sha256 plus 64 lowercase hex", errors
+        )
         self.assertIn("mockups[1] missing output_ref", errors)
         self.assertIn("mockups[2] direction_id must be a non-empty string", errors)
         self.assertIn("missing successful mockups for: a", errors)
@@ -720,6 +735,74 @@ class ValidateRunTests(unittest.TestCase):
 
         self.assertEqual(validator.validate_phase(self.run, "mockups"), [])
 
+    def test_mockup_budget_expansion_requires_valid_matching_approval_timestamp(self):
+        cases = (
+            (
+                run_manifest(generation_budget=6),
+                "expanded budget requires valid budget_expansion_approved_at",
+            ),
+            (
+                run_manifest(
+                    max_attempts_per_direction=3,
+                    budget_expansion_approved_at="not-a-timestamp",
+                ),
+                "expanded budget requires valid budget_expansion_approved_at",
+            ),
+            (
+                run_manifest(
+                    budget_expansion_approved_at="2026-07-19T12:01:00Z"
+                ),
+                "budget_expansion_approved_at requires an expanded budget",
+            ),
+        )
+        for run, expected in cases:
+            with self.subTest(expected=expected):
+                self.write("run.json", run)
+                self.write("mockup-manifest.json", {"mockups": [mockup()]})
+                errors = validator.validate_phase(self.run, "mockups")
+                self.assertTrue(any(expected in error for error in errors), errors)
+
+    def test_pending_and_failed_mockups_require_valid_viewport_and_digest(self):
+        self.write("run.json", run_manifest(approved_direction_ids=["a", "b"]))
+        self.write(
+            "mockup-manifest.json",
+            {
+                "mockups": [
+                    mockup("a", status="pending", viewport="mobile"),
+                    mockup("b", status="failed", prompt_digest="sha256:ABC"),
+                ]
+            },
+        )
+
+        errors = validator.validate_phase(self.run, "mockups")
+
+        self.assertIn("mockups[0] viewport must use WIDTHxHEIGHT", errors)
+        self.assertIn("mockups[1] prompt_digest must be sha256 plus 64 lowercase hex", errors)
+
+    def test_mockup_status_type_error_is_reported_without_cli_traceback(self):
+        self.write("run.json", run_manifest())
+        self.write("mockup-manifest.json", {"mockups": [mockup(status=[])]})
+
+        errors = validator.validate_phase(self.run, "mockups")
+        self.assertIn("mockups[0] status must be pending, success, or failed", errors)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                validator.__file__,
+                "--run",
+                str(self.run),
+                "--phase",
+                "mockups",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("status must be pending", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_artifact_paths_and_provider_refs_reject_escaping_or_credentials(self):
         bad_reference = reference()
         bad_reference["capture_path"] = "../cookies/session.png"
@@ -769,7 +852,7 @@ class ValidateRunTests(unittest.TestCase):
         artifacts = (
             ("research", "references.json", [dict(reference(), api_key="hidden")], "evidence.json", [evidence()]),
             ("directions", "directions.json", [dict(item) for item in distinct_directions()], "evidence.json", [evidence()]),
-            ("mockups", "mockup-manifest.json", {"mockups": [mockup(prompt_digest="Bearer abcdefghijklmnop")]}, "run.json", run_manifest()),
+            ("mockups", "mockup-manifest.json", {"mockups": [mockup(prompt_digest="Bearer abcdefghijklmnopqrstuvwxyz0123456789")]}, "run.json", run_manifest()),
             ("implementation", "implementation.json", {
                 "selected_direction_id": "a",
                 "mode": "project",
@@ -782,11 +865,80 @@ class ValidateRunTests(unittest.TestCase):
             with self.subTest(phase=phase):
                 value = copy.deepcopy(first_value)
                 if phase == "directions":
-                    value[0]["concept"] = "sk-abcdefghijklmnop"
+                    value[0]["concept"] = "sk-abcdefghijklmnopqrstuvwxyz0123456789"
                 self.write(first_name, value)
                 self.write(second_name, second_value)
                 errors = validator.validate_phase(self.run, phase)
                 self.assertTrue(any("secret-like" in error for error in errors), errors)
+
+    def test_realistic_secret_formats_and_provider_hints_are_rejected(self):
+        credentials = (
+            "xoxb-123456789012-abcdefghijklmnopqrstuvwx",
+            "github_pat_11AAabcdefghijklmnopqrstuvwxyz012345",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            "sk_live_abcdefghijklmnopqrstuvwxyz",
+            "AIzaSyA1234567890abcdefghijklmnopqrst",
+            "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+            "sk-abcdefghijklmnopqrstuvwxyz0123456789",
+        )
+        for credential in credentials:
+            with self.subTest(credential=credential[:10]):
+                item = reference()
+                item["relevance"] = credential
+                self.write("references.json", [item])
+                self.write("evidence.json", [evidence()])
+                errors = validator.validate_phase(self.run, "research")
+                self.assertTrue(any("secret-like value" in error for error in errors), errors)
+
+        self.write("run.json", run_manifest())
+        self.write(
+            "mockup-manifest.json",
+            {
+                "mockups": [
+                    mockup(output_ref="openai:sk-proj-abcdefghijklmnopqrstuvwxyz")
+                ]
+            },
+        )
+        errors = validator.validate_phase(self.run, "mockups")
+        self.assertTrue(any("secret-like value" in error for error in errors), errors)
+
+        self.write(
+            "run.json",
+            run_manifest(state="implementation_selected", selected_direction_id="a"),
+        )
+        value = {
+            "selected_direction_id": "a",
+            "mode": "project",
+            "preview_path": "src/preview.tsx",
+            "verification": {
+                "rendered_viewports": ["390x844"],
+                "checks": {
+                    "content": "pass",
+                    "overflow": "pass",
+                    "accessibility": "pass",
+                },
+            },
+            "note": "sk_live_abcdefghijklmnopqrstuvwxyz",
+        }
+        self.write("implementation.json", value)
+        errors = validator.validate_phase(self.run, "implementation")
+        self.assertTrue(any("secret-like value" in error for error in errors), errors)
+
+    def test_bearer_prose_and_placeholders_pass_but_realistic_credential_fails(self):
+        for summary in ("Bearer <token>", "Use a Bearer token for the request"):
+            with self.subTest(summary=summary):
+                item = evidence()
+                item["summary"] = summary
+                self.write("references.json", [reference()])
+                self.write("evidence.json", [item])
+                self.assertEqual(validator.validate_phase(self.run, "research"), [])
+
+        item = evidence()
+        item["summary"] = "Bearer abcdefghijklmnopqrstuvwxyz0123456789.ABCDEF"
+        self.write("references.json", [reference()])
+        self.write("evidence.json", [item])
+        errors = validator.validate_phase(self.run, "research")
+        self.assertTrue(any("secret-like value" in error for error in errors), errors)
 
     def test_normal_prose_about_passwords_is_not_a_secret(self):
         item = evidence()

@@ -14,6 +14,7 @@ run_state = load_script_module("run_state", "design-explorer/scripts/run_state.p
 
 
 AXES = ("layout", "typography", "palette", "density", "imagery", "interaction")
+DIGEST = "sha256:" + "a" * 64
 
 
 def reference():
@@ -120,22 +121,23 @@ class RunStateTests(unittest.TestCase):
         self.write("mood-directions.md", "# Mood directions")
         return values
 
+    def _mockup(self, identifier):
+        return {
+            "direction_id": identifier,
+            "status": "success",
+            "viewport": "390x844",
+            "prompt_digest": DIGEST,
+            "output_ref": f"mockups/{identifier}.png",
+            "attempt_count": 1,
+        }
+
     def write_mockups(self, identifiers, attempt_count=1):
+        values = [self._mockup(identifier) for identifier in identifiers]
+        for value in values:
+            value["attempt_count"] = attempt_count
         self.write(
             "mockup-manifest.json",
-            {
-                "mockups": [
-                    {
-                        "direction_id": identifier,
-                        "status": "success",
-                        "viewport": "390x844",
-                        "prompt_digest": f"sha256:{identifier}",
-                        "output_ref": f"mockups/{identifier}.png",
-                        "attempt_count": attempt_count,
-                    }
-                    for identifier in identifiers
-                ]
-            },
+            {"mockups": values},
         )
 
     def advance_to_pending(self, direction_count=5):
@@ -323,7 +325,7 @@ class RunStateTests(unittest.TestCase):
                         "direction_id": "a",
                         "status": "success",
                         "viewport": "390x844",
-                        "prompt_digest": "sha256:a",
+                        "prompt_digest": DIGEST,
                         "output_ref": "mockups/a.png",
                         "attempt_count": 1,
                     }
@@ -343,10 +345,13 @@ class RunStateTests(unittest.TestCase):
 
     def test_revision_preserves_current_manifest_on_archive_collision(self):
         self.set_state("mockups_generated")
-        current = {"mockups": [{"direction_id": "current"}]}
+        current = {"mockups": [self._mockup("current")]}
         archived = {"mockups": [{"direction_id": "archived"}]}
         self.write("mockup-manifest.json", current)
         self.write("mockup-manifest.revision-1.json", archived)
+        manifest = run_state.load_run(self.run_dir)
+        manifest["approved_direction_ids"] = ["current"]
+        self.write("run.json", manifest)
 
         with self.assertRaisesRegex(ValueError, "archive already exists"):
             run_state.revise_run(self.run_dir, "Create a variation")
@@ -365,8 +370,11 @@ class RunStateTests(unittest.TestCase):
 
     def test_revision_rolls_back_archive_when_run_write_fails(self):
         self.set_state("mockups_generated")
-        current = {"mockups": [{"direction_id": "current"}]}
+        current = {"mockups": [self._mockup("current")]}
         self.write("mockup-manifest.json", current)
+        manifest = run_state.load_run(self.run_dir)
+        manifest["approved_direction_ids"] = ["current"]
+        self.write("run.json", manifest)
 
         with mock.patch.object(
             run_state, "write_json_atomic", side_effect=OSError("disk full")
@@ -401,6 +409,75 @@ class RunStateTests(unittest.TestCase):
         self.write("run.json", manifest)
         with self.assertRaisesRegex(ValueError, "missing required key: state"):
             run_state.load_run(self.run_dir)
+
+    def test_load_rejects_unaudited_or_stale_budget_expansion(self):
+        base = json.loads((self.run_dir / "run.json").read_text())
+        cases = (
+            (
+                dict(base, generation_budget=6),
+                "expanded budget requires valid budget_expansion_approved_at",
+            ),
+            (
+                dict(
+                    base,
+                    max_attempts_per_direction=3,
+                    budget_expansion_approved_at="yesterday",
+                ),
+                "expanded budget requires valid budget_expansion_approved_at",
+            ),
+            (
+                dict(
+                    base,
+                    budget_expansion_approved_at="2026-07-19T12:01:00Z",
+                ),
+                "budget_expansion_approved_at requires an expanded budget",
+            ),
+        )
+        for manifest, expected in cases:
+            with self.subTest(expected=expected):
+                self.write("run.json", manifest)
+                before = (self.run_dir / "run.json").read_bytes()
+                with self.assertRaisesRegex(ValueError, expected):
+                    run_state.load_run(self.run_dir)
+                with self.assertRaisesRegex(ValueError, expected):
+                    run_state.transition_run(self.run_dir, "brief_ready")
+                self.assertEqual((self.run_dir / "run.json").read_bytes(), before)
+
+    def test_revision_validates_mockups_before_archiving_or_mutating(self):
+        cases = (
+            {**self._mockup("b")},
+            {**self._mockup("a"), "attempt_count": 999},
+            {**self._mockup("a"), "output_ref": "../private.png"},
+            {**self._mockup("a"), "status": "complete"},
+        )
+        for index, invalid in enumerate(cases):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as temp:
+                run_dir = run_state.init_run(
+                    Path(temp),
+                    "revision",
+                    now="2026-07-19T12:00:00Z",
+                    run_id=f"revision-{index}",
+                )
+                manifest = run_state.load_run(run_dir)
+                manifest["state"] = "mockups_generated"
+                manifest["approved_direction_ids"] = ["a"]
+                (run_dir / "run.json").write_text(json.dumps(manifest), encoding="utf-8")
+                (run_dir / "mockup-manifest.json").write_text(
+                    json.dumps({"mockups": [invalid]}), encoding="utf-8"
+                )
+                run_before = (run_dir / "run.json").read_bytes()
+                mockups_before = (run_dir / "mockup-manifest.json").read_bytes()
+
+                with self.assertRaisesRegex(ValueError, "mockups validation failed"):
+                    run_state.revise_run(run_dir, "Try a revision")
+
+                self.assertEqual((run_dir / "run.json").read_bytes(), run_before)
+                self.assertEqual(
+                    (run_dir / "mockup-manifest.json").read_bytes(), mockups_before
+                )
+                self.assertFalse(
+                    (run_dir / "mockup-manifest.revision-1.json").exists()
+                )
 
     def test_invalid_consuming_artifacts_cannot_bypass_transition_or_mutate_state(self):
         self.write("brief.md", "   ")
@@ -568,7 +645,10 @@ class RunStateTests(unittest.TestCase):
 
     def test_cli_revises_mockups_with_an_audit_reason(self):
         self.set_state("mockups_generated")
-        self.write("mockup-manifest.json", {"mockups": []})
+        self.write_mockups(["current"])
+        manifest = run_state.load_run(self.run_dir)
+        manifest["approved_direction_ids"] = ["current"]
+        self.write("run.json", manifest)
 
         result = subprocess.run(
             [
