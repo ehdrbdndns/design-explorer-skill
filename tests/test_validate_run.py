@@ -1047,12 +1047,19 @@ class ValidateRunTests(unittest.TestCase):
             encoding="utf-8",
         )
         (self.run / "standalone" / "vite.config.ts").write_text(
-            "import react from '@vitejs/plugin-react'; export default {plugins:[react()]}",
+            "import { defineConfig } from 'vite';\n"
+            "import react from '@vitejs/plugin-react';\n"
+            "export default defineConfig({plugins:[react()]})",
             encoding="utf-8",
         )
-        (self.run / "standalone" / "tsconfig.json").write_text("{}", encoding="utf-8")
+        (self.run / "standalone" / "tsconfig.json").write_text(
+            '{"compilerOptions":{"jsx":"react-jsx","module":"ESNext"}}',
+            encoding="utf-8",
+        )
         (standalone / "main.tsx").write_text(
-            "import {createRoot} from 'react-dom/client'; import App from './App'; "
+            "import React from 'react';\n"
+            "import {createRoot} from 'react-dom/client';\n"
+            "import App from './App';\n"
             "createRoot(document.getElementById('root')!).render(<App/>);",
             encoding="utf-8",
         )

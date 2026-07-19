@@ -1,8 +1,12 @@
 import hashlib
 import json
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import urlopen
 
 from design_explorer_import import load_script_module
 from test_preview_evidence import preview_digest, write_png
@@ -74,7 +78,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self, source_root: Path, preview_path: str, preview_files: list[str]
     ):
         source_digest = preview_digest(source_root, preview_files)
-        return {
+        value = {
             "selected_direction_id": "d-0",
             "mode": "project" if preview_path.startswith("previews/") else "standalone",
             "preview_path": preview_path,
@@ -105,14 +109,45 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 },
             },
         }
+        if value["mode"] == "project":
+            value["route_registry_path"] = "previews/routes.json"
+            value["route_consumer_path"] = "previews/App.tsx"
+        return value
 
     def offline_http_get(self, project: Path, route: str) -> tuple[int, str]:
-        app_source = (project / "src" / "App.tsx").read_text(encoding="utf-8")
-        routes = json.loads((project / "previews" / "routes.json").read_text())
-        wiring = "../previews/routes.json" in app_source and "../previews/Checkout" in app_source
-        if wiring and route in routes:
-            return 200, (project / "previews" / "Checkout.tsx").read_text(encoding="utf-8")
-        return 404, "not found"
+        registry_path = project / "previews" / "routes.json"
+
+        class RegistryHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                routes = json.loads(registry_path.read_text(encoding="utf-8"))
+                entry = routes.get(self.path)
+                if not isinstance(entry, dict):
+                    self.send_error(404, "not found")
+                    return
+                body = (project / entry["component_path"]).read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), RegistryHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_port}{route}"
+            try:
+                with urlopen(url, timeout=2) as response:
+                    return response.status, response.read().decode("utf-8")
+            except HTTPError as error:
+                return error.code, error.read().decode("utf-8")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     def test_project_lifecycle_gates_provider_and_preserves_production(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -124,9 +159,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
             )
             production = project / "src" / "App.tsx"
             production.write_text(
-                "import { Preview } from '../previews/Checkout';\n"
-                "import routes from '../previews/routes.json';\n"
-                "export const resolve = (path: string) => routes[path] ? Preview : null;",
+                "export const production = true;",
                 encoding="utf-8",
             )
             production_hash = hashlib.sha256(production.read_bytes()).hexdigest()
@@ -161,14 +194,25 @@ class WorkflowIntegrationTests(unittest.TestCase):
             self.reload_at(run_dir, "implementation_selected")
 
             (project / "previews").mkdir()
+            (project / "previews" / "App.tsx").write_text(
+                "import routes from './routes.json';\n"
+                "import { Preview } from './Checkout';\n"
+                "export const resolve = (path: string) => routes[path] ? Preview : null;",
+                encoding="utf-8",
+            )
             (project / "previews" / "Checkout.tsx").write_text(
-                "export const Preview = () => <main>Expected preview shell</main>;",
+                "export const Preview = () => <main id='checkout-shell'>Expected preview shell</main>;",
                 encoding="utf-8",
             )
             (project / "previews" / "routes.json").write_text(
-                '{"/design-explorer/checkout":"Checkout"}', encoding="utf-8"
+                '{"/design-explorer/checkout":{"component_path":"previews/Checkout.tsx","shell_id":"checkout-shell"}}',
+                encoding="utf-8",
             )
-            project_files = ["previews/Checkout.tsx", "previews/routes.json"]
+            project_files = [
+                "previews/App.tsx",
+                "previews/Checkout.tsx",
+                "previews/routes.json",
+            ]
             for viewport in ("390x844", "1280x800"):
                 width, height = (int(part) for part in viewport.split("x"))
                 write_png(run_dir / "evidence" / f"{viewport}.png", width, height)
@@ -235,12 +279,19 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (run_dir / "standalone" / "vite.config.ts").write_text(
-                "import react from '@vitejs/plugin-react'; export default {plugins:[react()]}",
+                "import { defineConfig } from 'vite';\n"
+                "import react from '@vitejs/plugin-react';\n"
+                "export default defineConfig({plugins:[react()]})",
                 encoding="utf-8",
             )
-            (run_dir / "standalone" / "tsconfig.json").write_text("{}", encoding="utf-8")
+            (run_dir / "standalone" / "tsconfig.json").write_text(
+                '{"compilerOptions":{"jsx":"react-jsx","module":"ESNext"}}',
+                encoding="utf-8",
+            )
             (run_dir / "standalone" / "src" / "main.tsx").write_text(
-                "import {createRoot} from 'react-dom/client'; import App from './App'; "
+                "import React from 'react';\n"
+                "import {createRoot} from 'react-dom/client';\n"
+                "import App from './App';\n"
                 "createRoot(document.getElementById('root')!).render(<App/>);",
                 encoding="utf-8",
             )

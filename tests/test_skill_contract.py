@@ -223,6 +223,31 @@ class SkillContractTests(unittest.TestCase):
         ):
             self.assertIn(phrase, contracts)
 
+    def test_final_preview_topology_contracts_are_documented(self):
+        skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_DIR / "references/artifact-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        mockups = (SKILL_DIR / "references/mockups-implementation.md").read_text(
+            encoding="utf-8"
+        )
+        research = (SKILL_DIR / "references/research-evidence.md").read_text(
+            encoding="utf-8"
+        )
+        combined = "\n".join((skill, contracts, mockups, research))
+        for phrase in (
+            "route_registry_path",
+            "route_consumer_path",
+            "component_path",
+            "shell_id",
+            "recursive local dependency closure",
+            "runtime-computed imports",
+            "in-process localhost HTTP",
+            "strict UTF-8 percent decoding",
+            "before any archive or manifest write",
+        ):
+            self.assertIn(phrase, combined)
+
 
 if __name__ == "__main__":
     unittest.main()

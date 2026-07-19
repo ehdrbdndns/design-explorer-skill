@@ -77,8 +77,14 @@ def implementation(identifier="d-0", source_digest=None):
         "selected_direction_id": identifier,
         "mode": "project",
         "preview_path": "previews/Checkout.tsx",
-        "preview_files": ["previews/Checkout.tsx", "previews/routes.json"],
+        "preview_files": [
+            "previews/App.tsx",
+            "previews/Checkout.tsx",
+            "previews/routes.json",
+        ],
         "preview_route": "/design-explorer/checkout",
+        "route_registry_path": "previews/routes.json",
+        "route_consumer_path": "previews/App.tsx",
         "verification": {
             "rendered_viewports": ["390x844"],
             "checks": {
@@ -109,16 +115,23 @@ class RunStateTests(unittest.TestCase):
         self.project_dir = self.root / "project"
         (self.project_dir / "src").mkdir(parents=True)
         (self.project_dir / "src" / "App.tsx").write_text(
-            "import { Preview } from '../previews/Checkout';\n"
-            "import routes from '../previews/routes.json';",
+            "export const production = true;",
             encoding="utf-8",
         )
         (self.project_dir / "previews").mkdir()
+        (self.project_dir / "previews" / "App.tsx").write_text(
+            "import routes from './routes.json';\n"
+            "import { Preview } from './Checkout';\n"
+            "export const resolve = (path: string) => routes[path] ? Preview : null;",
+            encoding="utf-8",
+        )
         (self.project_dir / "previews" / "Checkout.tsx").write_text(
-            "preview", encoding="utf-8"
+            "export const Preview = () => <main id='checkout-shell'>Preview</main>;",
+            encoding="utf-8",
         )
         (self.project_dir / "previews" / "routes.json").write_text(
-            '{"/design-explorer/checkout":"Checkout"}', encoding="utf-8"
+            '{"/design-explorer/checkout":{"component_path":"previews/Checkout.tsx","shell_id":"checkout-shell"}}',
+            encoding="utf-8",
         )
         self.run_dir = run_state.init_run(
             self.root,
@@ -166,7 +179,11 @@ class RunStateTests(unittest.TestCase):
         self.write("run.json", manifest)
 
     def implementation(self, identifier="d-0"):
-        files = ["previews/Checkout.tsx", "previews/routes.json"]
+        files = [
+            "previews/App.tsx",
+            "previews/Checkout.tsx",
+            "previews/routes.json",
+        ]
         return implementation(identifier, preview_digest(self.project_dir, files))
 
     def write_brief(self):

@@ -177,8 +177,8 @@ def init_run(
     )
     normalized_production_paths = _normalize_production_paths(production_paths)
     normalized_project_path = _normalize_project_path(project_path)
-    run_dir = Path(root).expanduser() / identifier
-    run_dir.mkdir(parents=True, exist_ok=False)
+    if not valid_rfc3339(timestamp):
+        raise ValueError("initialization timestamp must be RFC3339")
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "run_id": identifier,
@@ -197,6 +197,9 @@ def init_run(
         "required_interactions": normalized_interactions,
         "production_paths": normalized_production_paths,
     }
+    validate_run_manifest(manifest)
+    run_dir = Path(root).expanduser() / identifier
+    run_dir.mkdir(parents=True, exist_ok=False)
     write_json_atomic(run_dir / "run.json", manifest)
     return run_dir
 
@@ -248,6 +251,9 @@ def validate_run_manifest(manifest: object) -> None:
     for key in ("run_id", "slug", "created_at", "updated_at"):
         if not isinstance(manifest[key], str) or not manifest[key].strip():
             raise ValueError(f"invalid run.json: {key} must be a non-empty string")
+    for key in ("created_at", "updated_at"):
+        if not valid_rfc3339(manifest[key]):
+            raise ValueError(f"invalid run.json: {key} must be RFC3339")
     if manifest["state"] not in STATES:
         raise ValueError("invalid run.json: state is unsupported")
     if manifest["project_path"] is not None and not isinstance(
@@ -331,13 +337,9 @@ def validate_run_manifest(manifest: object) -> None:
         raise ValueError(
             "invalid run.json: budget_expansion_approved_at requires an expanded budget"
         )
-    if "integration_approved_at" in manifest and (
-        not isinstance(manifest["integration_approved_at"], str)
-        or not manifest["integration_approved_at"].strip()
-    ):
-        raise ValueError(
-            "invalid run.json: integration_approved_at must be a non-empty string"
-        )
+    for key in ("integration_approved_at", "last_revision_at"):
+        if key in manifest and not valid_rfc3339(manifest[key]):
+            raise ValueError(f"invalid run.json: {key} must be RFC3339")
 
 
 def validate_state_artifacts(run_dir: Path, manifest: dict) -> None:
@@ -443,6 +445,8 @@ def transition_run(
         raise ValueError(f"illegal transition: {current} -> {target}")
     _validate_target(run_dir, target)
     timestamp = now or utc_now()
+    if not valid_rfc3339(timestamp):
+        raise ValueError("transition timestamp must be RFC3339")
 
     if target == "integrated":
         if not integration_approved:
@@ -513,6 +517,7 @@ def transition_run(
 
     manifest["state"] = target
     manifest["updated_at"] = timestamp
+    validate_run_manifest(manifest)
     write_json_atomic(run_dir / "run.json", manifest)
     return manifest
 
@@ -543,9 +548,10 @@ def revise_run(
     if archive_path.exists():
         raise ValueError(f"revision archive already exists: {archive_path.name}")
     manifest_path = run_dir / "mockup-manifest.json"
-    manifest_path.replace(archive_path)
 
     timestamp = now or utc_now()
+    if not valid_rfc3339(timestamp):
+        raise ValueError("revision timestamp must be RFC3339")
     manifest["state"] = "directions_pending_approval"
     manifest["revision_count"] = revision_count
     manifest["last_revision_reason"] = reason.strip()
@@ -556,6 +562,8 @@ def revise_run(
     manifest["max_attempts_per_direction"] = DEFAULT_MAX_ATTEMPTS_PER_DIRECTION
     manifest.pop("budget_expansion_approved_at", None)
     manifest["updated_at"] = timestamp
+    validate_run_manifest(manifest)
+    manifest_path.replace(archive_path)
     try:
         write_json_atomic(run_dir / "run.json", manifest)
     except Exception:

@@ -4,14 +4,16 @@ import hashlib
 import ipaddress
 import json
 import re
+import shlex
 import struct
 import sys
 import unicodedata
 import zlib
 from datetime import datetime
+from html.parser import HTMLParser
 from itertools import combinations
 from pathlib import Path, PurePosixPath
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote_to_bytes, urlparse
 
 
 AXES = ("layout", "typography", "palette", "density", "imagery", "interaction")
@@ -301,7 +303,10 @@ def valid_preview_route(value) -> bool:
             or re.search(r"%(?![0-9A-Fa-f]{2})", current)
         ):
             return False
-        decoded = unquote(current)
+        try:
+            decoded = unquote_to_bytes(current).decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return False
         if decoded == current:
             return "%" not in current
         current = decoded
@@ -326,6 +331,212 @@ def preview_files_digest(root: Path, paths: list[str]) -> str | None:
         except OSError:
             return None
     return "sha256:" + digest.hexdigest()
+
+
+LOCAL_SCRIPT_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".css")
+
+
+def strip_js_comments(source: str) -> str:
+    result = []
+    index = 0
+    quote = None
+    while index < len(source):
+        current = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        if quote is not None:
+            result.append(current)
+            if current == "\\" and following:
+                result.append(following)
+                index += 2
+                continue
+            if current == quote:
+                quote = None
+            index += 1
+            continue
+        if current in {"'", '"', "`"}:
+            quote = current
+            result.append(current)
+            index += 1
+            continue
+        if current == "/" and following == "/":
+            result.extend("  ")
+            index += 2
+            while index < len(source) and source[index] not in "\r\n":
+                result.append(" ")
+                index += 1
+            continue
+        if current == "/" and following == "*":
+            result.extend("  ")
+            index += 2
+            while index < len(source):
+                if index + 1 < len(source) and source[index : index + 2] == "*/":
+                    result.extend("  ")
+                    index += 2
+                    break
+                result.append("\n" if source[index] == "\n" else " ")
+                index += 1
+            continue
+        result.append(current)
+        index += 1
+    return "".join(result)
+
+
+def mask_js_strings(source: str) -> str:
+    result = []
+    index = 0
+    quote = None
+    while index < len(source):
+        current = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        if quote is None:
+            if current in {"'", '"', "`"}:
+                quote = current
+                result.append(" ")
+            else:
+                result.append(current)
+            index += 1
+            continue
+        result.append("\n" if current == "\n" else " ")
+        if current == "\\" and following:
+            result.append("\n" if following == "\n" else " ")
+            index += 2
+            continue
+        if current == quote:
+            quote = None
+        index += 1
+    return "".join(result)
+
+
+STATIC_IMPORT_PATTERN = re.compile(
+    r"(?m)^\s*import\s+(?:[^\n;]*?\s+from\s+)?[\"']([^\"']+)[\"']"
+)
+EXPORT_FROM_PATTERN = re.compile(
+    r"(?m)^\s*export\s+[^\n;]*?\s+from\s+[\"']([^\"']+)[\"']"
+)
+DYNAMIC_IMPORT_PATTERN = re.compile(r"\bimport\s*\(\s*[\"']([^\"']+)[\"']\s*\)")
+REQUIRE_PATTERN = re.compile(r"\brequire\s*\(\s*[\"']([^\"']+)[\"']\s*\)")
+CSS_IMPORT_PATTERN = re.compile(
+    r"@import\s+(?:url\(\s*)?[\"']?([^\"')\s;]+)", re.IGNORECASE
+)
+CSS_URL_PATTERN = re.compile(r"url\(\s*[\"']?([^\"')]+)", re.IGNORECASE)
+
+
+def js_dependencies(source: str) -> list[str]:
+    clean = strip_js_comments(source)
+    values = []
+    for pattern in (
+        STATIC_IMPORT_PATTERN,
+        EXPORT_FROM_PATTERN,
+        DYNAMIC_IMPORT_PATTERN,
+        REQUIRE_PATTERN,
+    ):
+        values.extend(pattern.findall(clean))
+    return list(dict.fromkeys(values))
+
+
+class _ModuleScriptParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.sources = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() != "script":
+            return
+        values = {name.casefold(): value for name, value in attrs}
+        if values.get("type", "").casefold() == "module" and values.get("src"):
+            self.sources.append(values["src"])
+
+
+def html_module_sources(source: str) -> list[str]:
+    parser = _ModuleScriptParser()
+    try:
+        parser.feed(source)
+        parser.close()
+    except Exception:
+        return []
+    return parser.sources
+
+
+def local_dependencies(path: Path) -> list[str]:
+    suffix = path.suffix.casefold()
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return []
+    if suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+        return js_dependencies(source)
+    if suffix == ".css":
+        values = CSS_IMPORT_PATTERN.findall(source) + CSS_URL_PATTERN.findall(source)
+        return list(dict.fromkeys(values))
+    if suffix in {".html", ".htm"}:
+        return html_module_sources(source)
+    return []
+
+
+def _is_local_specifier(specifier: str) -> bool:
+    return specifier.startswith(("./", "../", "/")) and not specifier.startswith("//")
+
+
+def resolve_local_dependency(
+    root: Path, importer: Path, specifier: str, absolute_root: Path
+) -> tuple[str | None, str | None]:
+    if not _is_local_specifier(specifier):
+        return None, None
+    if any(marker in specifier for marker in ("?", "#", "\x00")) or "\\" in specifier:
+        return None, f"unsafe local dependency: {specifier}"
+    base = absolute_root / specifier.lstrip("/") if specifier.startswith("/") else importer.parent / specifier
+    candidates = [base]
+    if not base.suffix:
+        candidates.extend(Path(f"{base}{extension}") for extension in LOCAL_SCRIPT_EXTENSIONS)
+        candidates.extend(base / f"index{extension}" for extension in LOCAL_SCRIPT_EXTENSIONS)
+    root_resolved = root.resolve(strict=True)
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        try:
+            relative = resolved.relative_to(root_resolved).as_posix()
+        except ValueError:
+            return None, f"local dependency must be contained in preview root: {specifier}"
+        if resolved.is_file():
+            return relative, None
+    return None, f"missing local dependency: {specifier}"
+
+
+def dependency_closure_errors(
+    root: Path,
+    preview_files: list[str],
+    roots: list[str],
+    absolute_root: Path | None = None,
+) -> list[str]:
+    errors = []
+    listed = set(preview_files)
+    pending = list(dict.fromkeys(roots))
+    visited = set()
+    absolute_root = absolute_root or root
+    while pending:
+        relative = pending.pop()
+        if relative in visited:
+            continue
+        visited.add(relative)
+        if relative not in listed:
+            errors.append(f"unlisted local dependency: {relative}")
+            continue
+        path = resolved_scoped_path(root, relative)
+        if path is None or not path.is_file():
+            errors.append(f"preview dependency must be contained and existing: {relative}")
+            continue
+        for specifier in local_dependencies(path):
+            resolved, error = resolve_local_dependency(root, path, specifier, absolute_root)
+            if error:
+                errors.append(f"{relative}: {error}")
+            elif resolved is not None:
+                if resolved not in listed:
+                    errors.append(f"unlisted local dependency from {relative}: {resolved}")
+                else:
+                    pending.append(resolved)
+    return errors
 
 
 def _standalone_topology_errors(
@@ -359,11 +570,23 @@ def _standalone_topology_errors(
         errors.append("standalone package.json must be valid JSON object")
     else:
         scripts = package.get("scripts")
-        if not isinstance(scripts, dict) or any(
-            not isinstance(scripts.get(name), str) or not scripts[name].strip()
-            for name in ("dev", "build")
-        ):
-            errors.append("standalone package.json requires dev and build scripts")
+        valid_scripts = isinstance(scripts, dict)
+        if valid_scripts:
+            try:
+                dev_tokens = shlex.split(scripts.get("dev", ""))
+                build_tokens = shlex.split(scripts.get("build", ""))
+            except (TypeError, ValueError):
+                dev_tokens = build_tokens = []
+            valid_scripts = (
+                bool(dev_tokens)
+                and dev_tokens[0] == "vite"
+                and len(build_tokens) >= 2
+                and build_tokens[:2] == ["vite", "build"]
+            )
+        if not valid_scripts:
+            errors.append(
+                "standalone package.json scripts must execute vite and vite build"
+            )
         dependencies = package.get("dependencies")
         if not isinstance(dependencies, dict) or any(
             not isinstance(dependencies.get(name), str)
@@ -391,20 +614,47 @@ def _standalone_topology_errors(
     except (json.JSONDecodeError, OSError, UnicodeError):
         errors.append("standalone Vite React TS files must be readable and tsconfig.json valid")
         return errors
-    script_pattern = re.compile(
-        r"<script\b(?=[^>]*\btype=[\"']module[\"'])(?=[^>]*\bsrc=[\"']/src/main\.tsx[\"'])[^>]*>",
-        re.IGNORECASE,
-    )
-    if not script_pattern.search(index):
+    if "/src/main.tsx" not in html_module_sources(index):
         errors.append("standalone index.html must load /src/main.tsx as a module")
-    if "react-dom/client" not in main or "createRoot" not in main or "./App" not in main:
+    clean_main = strip_js_comments(main)
+    main_imports = set(STATIC_IMPORT_PATTERN.findall(clean_main))
+    executable_main = mask_js_strings(clean_main)
+    if (
+        "react" not in main_imports
+        or "react-dom/client" not in main_imports
+        or not any(value in main_imports for value in ("./App", "./App.tsx"))
+        or not re.search(
+            r"\bcreateRoot\s*\([^;{}]*\)\s*\.\s*render\s*\(", executable_main
+        )
+    ):
         errors.append("standalone src/main.tsx must mount the React App with createRoot")
-    if not app.strip():
-        errors.append("standalone src/App.tsx must be nonblank")
-    if "@vitejs/plugin-react" not in vite or "react(" not in vite:
-        errors.append("standalone vite.config.ts must configure @vitejs/plugin-react")
-    if not isinstance(tsconfig, dict):
-        errors.append("standalone tsconfig.json must be a JSON object")
+    executable_app = mask_js_strings(strip_js_comments(app))
+    if (
+        not re.search(r"\bexport\s+(?:default\b|(?:const|function|class)\s+\w+)", executable_app)
+        or not re.search(r"<[A-Za-z][A-Za-z0-9]*(?:\s|/?>)", executable_app)
+    ):
+        errors.append("standalone src/App.tsx must export and render a JSX component")
+    clean_vite = strip_js_comments(vite)
+    vite_imports = set(STATIC_IMPORT_PATTERN.findall(clean_vite))
+    executable_vite = mask_js_strings(clean_vite)
+    if (
+        "vite" not in vite_imports
+        or "@vitejs/plugin-react" not in vite_imports
+        or not re.search(r"\bexport\s+default\s+defineConfig\s*\(", executable_vite)
+        or not re.search(r"\bplugins\s*:\s*\[[^\]]*\breact\s*\(", executable_vite, re.S)
+    ):
+        errors.append(
+            "standalone vite.config.ts must import defineConfig/react and export configured plugins"
+        )
+    compiler_options = tsconfig.get("compilerOptions") if isinstance(tsconfig, dict) else None
+    if (
+        not isinstance(compiler_options, dict)
+        or not isinstance(compiler_options.get("jsx"), str)
+        or not compiler_options["jsx"].strip()
+        or not isinstance(compiler_options.get("module"), str)
+        or not compiler_options["module"].strip()
+    ):
+        errors.append("standalone tsconfig.json requires jsx and module compiler settings")
     return errors
 
 
@@ -959,49 +1209,80 @@ def validate_implementation(run_dir: Path) -> list[str]:
                     f"preview file {preview_name} overlaps production_path {production_name}"
                 )
 
-    if mode == "project" and isinstance(preview_route, str) and resolved_previews:
-        route_bytes = preview_route.encode("utf-8")
-        try:
-            route_sources = [
-                (name, path)
-                for name, path in resolved_previews
-                if route_bytes in path.read_bytes()
-            ]
-        except OSError:
-            route_sources = []
-        wiring_tokens = {route_bytes}
-        for name, _ in route_sources:
-            pure = PurePosixPath(name)
-            wiring_tokens.update(
-                {
-                    name.encode("utf-8"),
-                    pure.name.encode("utf-8"),
-                    pure.stem.encode("utf-8"),
-                }
-            )
-        route_is_wired = False
-        scanned = 0
-        for _, production in resolved_production:
-            candidates = [production] if production.is_file() else production.rglob("*")
-            for candidate in candidates:
-                if scanned >= 256:
-                    break
-                try:
-                    if not candidate.is_file() or candidate.stat().st_size > 2 * 1024 * 1024:
-                        continue
-                    scanned += 1
-                    value = candidate.read_bytes()
-                except OSError:
-                    continue
-                if route_sources and any(token in value for token in wiring_tokens):
-                    route_is_wired = True
-                    break
-            if route_is_wired or scanned >= 256:
-                break
-        if not route_sources or not route_is_wired:
-            errors.append(
-                "project preview_route must be recorded in preview files and wired from production source"
-            )
+    if mode == "project" and project_root is not None and preview_files is not None:
+        route_paths = {}
+        for field in ("route_registry_path", "route_consumer_path"):
+            value = implementation.get(field)
+            if not isinstance(value, str) or not valid_artifact_ref(value):
+                errors.append(f"project implementation {field} must be a safe project-relative path")
+            elif value not in preview_files:
+                errors.append(f"project implementation {field} must be included in preview_files")
+            elif value not in resolved_preview_map:
+                errors.append(f"project implementation {field} must be an existing contained file")
+            else:
+                route_paths[field] = value
+
+        component_path = None
+        registry_path = route_paths.get("route_registry_path")
+        consumer_path = route_paths.get("route_consumer_path")
+        if registry_path is not None and isinstance(preview_route, str):
+            try:
+                registry = json.loads(
+                    resolved_preview_map[registry_path].read_text(encoding="utf-8")
+                )
+            except (json.JSONDecodeError, OSError, UnicodeError):
+                registry = None
+            entry = registry.get(preview_route) if isinstance(registry, dict) else None
+            if not isinstance(entry, dict) or set(entry) != {"component_path", "shell_id"}:
+                errors.append(
+                    "project route registry must map preview_route to component_path and shell_id"
+                )
+            else:
+                component_path = entry.get("component_path")
+                shell_id = entry.get("shell_id")
+                if (
+                    not isinstance(component_path, str)
+                    or not valid_artifact_ref(component_path)
+                    or component_path not in preview_files
+                    or component_path not in resolved_preview_map
+                ):
+                    errors.append(
+                        "project route registry component_path must be an exact included existing preview file"
+                    )
+                    component_path = None
+                if not isinstance(shell_id, str) or not shell_id.strip():
+                    errors.append("project route registry shell_id must be nonblank")
+
+        if consumer_path is not None and registry_path is not None and component_path is not None:
+            try:
+                consumer_source = resolved_preview_map[consumer_path].read_text(
+                    encoding="utf-8"
+                )
+            except (OSError, UnicodeError):
+                consumer_source = ""
+            imported = set()
+            for specifier in STATIC_IMPORT_PATTERN.findall(
+                strip_js_comments(consumer_source)
+            ):
+                resolved, error = resolve_local_dependency(
+                    project_root,
+                    resolved_preview_map[consumer_path],
+                    specifier,
+                    project_root,
+                )
+                if error:
+                    errors.append(f"route consumer import error: {error}")
+                elif resolved is not None:
+                    imported.add(resolved)
+            if registry_path not in imported or component_path not in imported:
+                errors.append(
+                    "project route consumer must have real static imports of registry and component"
+                )
+
+        closure_roots = [value for value in (preview_path, consumer_path, component_path) if value]
+        errors.extend(
+            dependency_closure_errors(project_root, preview_files, closure_roots)
+        )
 
     if mode == "standalone" and preview_files is not None and len(
         resolved_previews
@@ -1011,6 +1292,31 @@ def validate_implementation(run_dir: Path) -> list[str]:
                 Path(run_dir), preview_files, resolved_preview_map
             )
         )
+        packages = [
+            path for path in preview_files if PurePosixPath(path).name == "package.json"
+        ]
+        if len(packages) == 1:
+            package_parent = PurePosixPath(packages[0]).parent
+            prefix = "" if str(package_parent) == "." else f"{package_parent}/"
+            standalone_roots = [
+                value
+                for value in (
+                    preview_path,
+                    f"{prefix}index.html",
+                    f"{prefix}vite.config.ts",
+                    f"{prefix}src/main.tsx",
+                    f"{prefix}src/App.tsx",
+                )
+                if value
+            ]
+            errors.extend(
+                dependency_closure_errors(
+                    Path(run_dir),
+                    preview_files,
+                    standalone_roots,
+                    Path(run_dir) / package_parent,
+                )
+            )
 
     verification = implementation.get("verification", {})
     if not isinstance(verification, dict):

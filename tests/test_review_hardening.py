@@ -9,7 +9,7 @@ import zlib
 from pathlib import Path
 
 from design_explorer_import import load_script_module
-from test_run_state import direction, evidence, reference
+from test_run_state import DIGEST, direction, evidence, reference
 
 
 run_state = load_script_module("run_state_review", "design-explorer/scripts/run_state.py")
@@ -175,6 +175,56 @@ class StateInvariantTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "approved.*current directions"):
             run_state.load_run(self.run)
+
+    def test_invalid_transition_timestamp_leaves_manifest_bytes_unchanged(self):
+        (self.run / "brief.md").write_text("# Brief", encoding="utf-8")
+        before = (self.run / "run.json").read_bytes()
+        with self.assertRaisesRegex(ValueError, "RFC3339"):
+            run_state.transition_run(self.run, "brief_ready", now="not-rfc3339")
+        self.assertEqual((self.run / "run.json").read_bytes(), before)
+        self.assertEqual(run_state.load_run(self.run)["state"], "initialized")
+
+    def test_invalid_initialization_timestamp_leaves_no_run_directory(self):
+        expected = self.root / "runs" / "invalid-now"
+        with self.assertRaisesRegex(ValueError, "RFC3339"):
+            run_state.init_run(
+                self.root / "runs",
+                "invalid",
+                run_id="invalid-now",
+                now="not-rfc3339",
+            )
+        self.assertFalse(expected.exists())
+
+    def test_invalid_revision_timestamp_does_not_archive_or_mutate(self):
+        self.advance_to_pending()
+        run_state.transition_run(
+            self.run, "directions_approved", approved_direction_ids=["d-0"]
+        )
+        self.write_json(
+            "mockup-manifest.json",
+            {
+                "mockups": [
+                    {
+                        "direction_id": "d-0",
+                        "status": "success",
+                        "viewport": "390x844",
+                        "prompt_digest": DIGEST,
+                        "output_ref": "mockups/d-0.png",
+                        "attempt_count": 1,
+                    }
+                ]
+            },
+        )
+        run_state.transition_run(self.run, "mockups_generated")
+        run_before = (self.run / "run.json").read_bytes()
+        mockups_before = (self.run / "mockup-manifest.json").read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "RFC3339"):
+            run_state.revise_run(self.run, "Retry", now="not-rfc3339")
+
+        self.assertEqual((self.run / "run.json").read_bytes(), run_before)
+        self.assertEqual((self.run / "mockup-manifest.json").read_bytes(), mockups_before)
+        self.assertFalse((self.run / "mockup-manifest.revision-1.json").exists())
 
 
 class PngValidationTests(unittest.TestCase):

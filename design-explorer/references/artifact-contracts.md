@@ -55,6 +55,8 @@ python3 scripts/run_state.py transition --run <run-dir> --to directions_approved
 
 Omit expansion flags for the default five-image/two-attempt limits. Every consuming transition invokes the relevant validator itself, including approval after review, selection after mockup generation, and integration after preview review. A validation failure leaves `run.json` unchanged; manual validator commands are useful diagnostics, not a substitute for the transition gate.
 
+Every caller-supplied `now` value must be RFC3339. Initialization and transitions validate the completed manifest before writing it; revision validates its timestamp and completed manifest before any archive or manifest write.
+
 ```bash
 python3 scripts/validate_run.py --run <run-dir> --phase mockups
 python3 scripts/run_state.py transition --run <run-dir> --to mockups_generated
@@ -174,9 +176,13 @@ The list cannot exceed `generation_budget`. It contains exactly one current entr
 
 Each viewport record has `content`, `overflow`, `accessibility`, and `interaction` set to `pass`; exact-key `required_content` and `required_interactions` maps with every value `pass`; a safe run-relative `screenshot_ref`; and `source_digest`. The digest is SHA-256 over canonical sorted preview file paths and bytes, with length framing, and must match current files. The screenshot is stored inside the run directory. Validation checks complete PNG chunk structure: signature, first 13-byte IHDR and its dimensions, bounded chunks/file, CRC for every chunk, at least one IDAT, exactly one terminal zero-length IEND, and no truncation or trailing bytes. It does not decode pixels.
 
-In project mode, `project_path` is an existing absolute directory. Preview files exist beneath it, every `production_paths` entry exists and cannot contain or equal a preview file, the exact `preview_route` appears in a recorded preview route/source file, and recorded production source consumes that wiring. A detached TSX file does not pass.
+`preview_route` normalization uses strict UTF-8 percent decoding at every bounded decoding pass; malformed byte sequences fail instead of being replaced.
 
-In standalone mode, production paths are empty and all files live beneath the run directory. `preview_files` includes valid `package.json` with `dev`/`build` scripts, `react`/`react-dom`, and `vite`/`typescript`/`@vitejs/plugin-react`; `index.html` loading `/src/main.tsx`; `vite.config.ts`; valid `tsconfig.json`; a React `createRoot` `src/main.tsx`; and nonblank `src/App.tsx`. Aggregate checks never substitute for per-viewport evidence. Tests exercise deterministic topology and offline route resolution, not browser pixel rendering; screenshot evidence remains a separate renderer responsibility.
+In project mode, `project_path` is an existing absolute directory. `implementation.json` also records safe included `route_registry_path` and `route_consumer_path`. The registry must map the exact `preview_route` to exactly `component_path` and a nonblank `shell_id`; that component is an included existing preview file. The consumer must have real static imports of both registry and component after comments are removed. Preview files exist beneath the project, every `production_paths` entry exists and cannot contain or equal a preview file, and a detached TSX file does not pass.
+
+Validation walks the recursive local dependency closure from preview, consumer, and component roots across literal JS/TS imports and exports plus CSS imports and URLs. Every resolved file must remain contained and appear in `preview_files`, so `source_digest` binds the full declared closure. Runtime-computed imports cannot be proven by this static contract; the implementer must include them explicitly and verify the runtime path.
+
+In standalone mode, production paths are empty and all files live beneath the run directory. `preview_files` includes valid `package.json` whose scripts execute `vite` and `vite build`, with nonblank `react`/`react-dom` and `vite`/`typescript`/`@vitejs/plugin-react` versions; `index.html` structurally loading `/src/main.tsx`; `vite.config.ts` importing `defineConfig` and the React plugin; `tsconfig.json` with JSX/module settings; `src/main.tsx` importing and mounting React App with `createRoot`; and an exported JSX `src/App.tsx`. Comments, quoted decoys, echo scripts, and inert placeholders do not satisfy this topology. Aggregate checks never substitute for per-viewport evidence. Tests use an in-process localhost HTTP server backed by the structured registry for route resolution, including a 404 probe. That proves deterministic topology and offline route resolution, not browser pixel rendering; screenshot evidence remains a separate renderer responsibility.
 
 Validate this file before `prototype_ready`. The isolated preview remains separate from production until the user explicitly approves integration.
 
