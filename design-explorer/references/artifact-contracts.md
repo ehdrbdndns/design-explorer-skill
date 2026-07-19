@@ -4,11 +4,13 @@ Use this contract when creating, resuming, validating, or transitioning a design
 
 ## Run directory and states
 
-The default run directory is `~/.codex/design-explorer/runs/<run-id>/`. Keep each exploration isolated in one run directory. `run.json` records the schema version, run ID, slug, timestamps, project path, current state, approved direction IDs, selected direction ID, and—after approved production integration—the integration approval timestamp.
+The default run directory is `~/.codex/design-explorer/runs/<run-id>/`. Keep each exploration isolated in one run directory. `run.json` records the schema version, run ID, slug, timestamps, project path, current state, approved direction IDs, selected direction ID, `revision_count`, the latest revision reason/time when present, and—after approved production integration—the integration approval timestamp.
 
-Follow this state sequence without skipping or reversing steps:
+Follow this primary state sequence without skipping steps:
 
 `initialized` → `brief_ready` → `research_complete` → `directions_pending_approval` → `directions_approved` → `mockups_generated` → `implementation_selected` → `prototype_ready` → `integrated`
+
+The only deliberate revision edge is `mockups_generated` → `directions_pending_approval`, through the `revise` operation documented below.
 
 Create or resume the run with these commands:
 
@@ -23,7 +25,7 @@ After writing `brief.md`, transition to `brief_ready`:
 python3 scripts/run_state.py transition --run <run-dir> --to brief_ready
 ```
 
-Validate every artifact set before the state transition that consumes it:
+Validate research and directions before their consuming transitions:
 
 ```bash
 python3 scripts/validate_run.py --run <run-dir> --phase research
@@ -31,18 +33,31 @@ python3 scripts/run_state.py transition --run <run-dir> --to research_complete
 python3 scripts/validate_run.py --run <run-dir> --phase directions
 python3 scripts/run_state.py transition --run <run-dir> --to directions_pending_approval
 python3 scripts/run_state.py transition --run <run-dir> --to directions_approved --approved-direction <id>
-python3 scripts/validate_run.py --run <run-dir> --phase mockups
-python3 scripts/validate_run.py --run <run-dir> --phase implementation
 ```
 
-Repeat `--approved-direction <id>` for every explicitly approved direction. Complete later transitions with recorded IDs and explicit production approval:
+Repeat `--approved-direction <id>` for every explicitly approved direction. After image output is recorded, execute the remaining steps in this order:
 
 ```bash
+python3 scripts/validate_run.py --run <run-dir> --phase mockups
 python3 scripts/run_state.py transition --run <run-dir> --to mockups_generated
 python3 scripts/run_state.py transition --run <run-dir> --to implementation_selected --selected-direction <id>
+```
+
+Build the isolated preview and write `implementation.json`, then continue:
+
+```bash
+python3 scripts/validate_run.py --run <run-dir> --phase implementation
 python3 scripts/run_state.py transition --run <run-dir> --to prototype_ready
 python3 scripts/run_state.py transition --run <run-dir> --to integrated --approve-integration
 ```
+
+When the user requests a bounded variation or combination instead of selecting, do not run the selection transition. From `mockups_generated`, run:
+
+```bash
+python3 scripts/run_state.py revise --run <run-dir> --reason "<user-request>"
+```
+
+`revise` requires a non-empty reason. It archives `mockup-manifest.json` as `mockup-manifest.revision-<n>.json`, increments `revision_count`, records `last_revision_reason` and `last_revision_at`, clears approved/selected IDs, and returns to `directions_pending_approval`. Append the derived direction, validate and present it, obtain explicit approval again, and then create a new manifest containing only newly approved IDs.
 
 ## Structured artifacts
 
@@ -90,12 +105,17 @@ Record the screen purpose, required content, target viewport, preservation const
 - `ux_problem`
 - `evidence_ids`, a non-empty list of IDs from `evidence.json`
 - `evidence_application`
+- `baseline_exceptions`, a list that is empty normally; each exception requires a non-empty `constraint` and `justification`
 - `axes`, containing non-empty `layout`, `typography`, `palette`, `density`, `imagery`, and `interaction`
 - `tradeoffs`
 - `implementation_difficulty`
 - `implementation_risks`
 
-Every pair must differ on at least three axes. `directions.json` is the machine-readable source of truth; `mood-directions.md` is its user-facing view and must retain direction/evidence IDs, difficulty, risks, and trade-offs.
+Every direction must link at least one `official` evidence item. Official accessibility and platform guidance is the common baseline; exceptions document constrained deviations, not permission to omit official evidence. Every pair must differ on at least three axes.
+
+A revised variation or combination is appended with a new first-class `id`, non-empty `derived_from_ids`, and non-empty `combined_properties` that maps varied/combined properties to their source direction. Never repurpose a primary direction ID.
+
+`directions.json` is the machine-readable source of truth. `mood-directions.md` is its user-facing view and must retain direction/evidence IDs, difficulty, risks, trade-offs, and every baseline exception. Approving a direction explicitly approves its disclosed exceptions.
 
 ### Mockup artifact
 

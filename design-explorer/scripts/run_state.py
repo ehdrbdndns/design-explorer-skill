@@ -75,6 +75,7 @@ def init_run(
         "project_path": project_path,
         "approved_direction_ids": [],
         "selected_direction_id": None,
+        "revision_count": 0,
     }
     write_json_atomic(run_dir / "run.json", manifest)
     return run_dir
@@ -139,6 +140,50 @@ def transition_run(
     return manifest
 
 
+def revise_run(
+    run_dir: Path,
+    reason: str,
+    now: str | None = None,
+) -> dict:
+    run_dir = Path(run_dir)
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("revision requires a non-empty reason")
+    manifest = load_run(run_dir)
+    current = manifest["state"]
+    if current != "mockups_generated":
+        raise ValueError(f"illegal revision from {current}")
+    _require_files(run_dir, "mockups_generated")
+
+    revision_count = manifest.get("revision_count", 0)
+    if (
+        not isinstance(revision_count, int)
+        or isinstance(revision_count, bool)
+        or revision_count < 0
+    ):
+        raise ValueError("run.json revision_count must be a non-negative integer")
+    revision_count += 1
+    archive_path = run_dir / f"mockup-manifest.revision-{revision_count}.json"
+    if archive_path.exists():
+        raise ValueError(f"revision archive already exists: {archive_path.name}")
+    manifest_path = run_dir / "mockup-manifest.json"
+    manifest_path.replace(archive_path)
+
+    timestamp = now or utc_now()
+    manifest["state"] = "directions_pending_approval"
+    manifest["revision_count"] = revision_count
+    manifest["last_revision_reason"] = reason.strip()
+    manifest["last_revision_at"] = timestamp
+    manifest["approved_direction_ids"] = []
+    manifest["selected_direction_id"] = None
+    manifest["updated_at"] = timestamp
+    try:
+        write_json_atomic(run_dir / "run.json", manifest)
+    except Exception:
+        archive_path.replace(manifest_path)
+        raise
+    return manifest
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -152,6 +197,9 @@ def main() -> int:
     transition_parser.add_argument("--approved-direction", action="append")
     transition_parser.add_argument("--selected-direction")
     transition_parser.add_argument("--approve-integration", action="store_true")
+    revise_parser = subparsers.add_parser("revise")
+    revise_parser.add_argument("--run", required=True)
+    revise_parser.add_argument("--reason", required=True)
     status_parser = subparsers.add_parser("status")
     status_parser.add_argument("--run", required=True)
     args = parser.parse_args()
@@ -167,6 +215,9 @@ def main() -> int:
             selected_direction_id=args.selected_direction,
             integration_approved=args.approve_integration,
         )
+        print(json.dumps(manifest, indent=2))
+    elif args.command == "revise":
+        manifest = revise_run(Path(args.run), args.reason)
         print(json.dumps(manifest, indent=2))
     else:
         print(json.dumps(load_run(Path(args.run)), indent=2))

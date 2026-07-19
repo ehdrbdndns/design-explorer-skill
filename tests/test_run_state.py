@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from design_explorer_import import load_script_module
 
@@ -40,6 +41,7 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(manifest["state"], "initialized")
         self.assertEqual(manifest["run_id"], "run-checkout")
         self.assertEqual(manifest["approved_direction_ids"], [])
+        self.assertEqual(manifest["revision_count"], 0)
 
     def test_public_interfaces_expose_promised_annotations(self):
         init_signature = inspect.signature(run_state.init_run)
@@ -71,6 +73,12 @@ class RunStateTests(unittest.TestCase):
             False,
         )
         self.assertEqual(transition_signature.return_annotation, dict)
+
+        revise_signature = inspect.signature(run_state.revise_run)
+        self.assertEqual(revise_signature.parameters["run_dir"].annotation, Path)
+        self.assertEqual(revise_signature.parameters["reason"].annotation, str)
+        self.assertEqual(revise_signature.parameters["now"].annotation, str | None)
+        self.assertEqual(revise_signature.return_annotation, dict)
 
     def test_init_rejects_absolute_run_id(self):
         absolute_run_id = str(self.root / "absolute-run")
@@ -151,6 +159,122 @@ class RunStateTests(unittest.TestCase):
         )
         self.assertEqual(manifest["state"], "integrated")
         self.assertEqual(manifest["integration_approved_at"], "2026-07-19T12:02:00Z")
+
+    def test_revision_archives_mockups_and_returns_to_pending_approval(self):
+        self.set_state("mockups_generated")
+        self.write(
+            "mockup-manifest.json",
+            {"mockups": [{"direction_id": "a", "status": "success"}]},
+        )
+        manifest = run_state.load_run(self.run_dir)
+        manifest["approved_direction_ids"] = ["a"]
+        manifest["selected_direction_id"] = "a"
+        self.write("run.json", manifest)
+
+        revised = run_state.revise_run(
+            self.run_dir,
+            "Combine the calm hierarchy with the dense summary.",
+            now="2026-07-19T12:03:00Z",
+        )
+
+        self.assertEqual(revised["state"], "directions_pending_approval")
+        self.assertEqual(revised["revision_count"], 1)
+        self.assertEqual(
+            revised["last_revision_reason"],
+            "Combine the calm hierarchy with the dense summary.",
+        )
+        self.assertEqual(revised["last_revision_at"], "2026-07-19T12:03:00Z")
+        self.assertEqual(revised["approved_direction_ids"], [])
+        self.assertIsNone(revised["selected_direction_id"])
+        self.assertFalse((self.run_dir / "mockup-manifest.json").exists())
+        self.assertTrue(
+            (self.run_dir / "mockup-manifest.revision-1.json").is_file()
+        )
+        self.assertEqual(
+            json.loads(
+                (self.run_dir / "mockup-manifest.revision-1.json").read_text()
+            ),
+            {"mockups": [{"direction_id": "a", "status": "success"}]},
+        )
+
+    def test_revision_rejects_empty_reason_and_illegal_state(self):
+        self.set_state("mockups_generated")
+        self.write("mockup-manifest.json", {"mockups": []})
+        with self.assertRaisesRegex(ValueError, "non-empty reason"):
+            run_state.revise_run(self.run_dir, "   ")
+
+        self.set_state("directions_approved")
+        with self.assertRaisesRegex(ValueError, "illegal revision"):
+            run_state.revise_run(self.run_dir, "Try a combined direction")
+
+    def test_revision_preserves_current_manifest_on_archive_collision(self):
+        self.set_state("mockups_generated")
+        current = {"mockups": [{"direction_id": "current"}]}
+        archived = {"mockups": [{"direction_id": "archived"}]}
+        self.write("mockup-manifest.json", current)
+        self.write("mockup-manifest.revision-1.json", archived)
+
+        with self.assertRaisesRegex(ValueError, "archive already exists"):
+            run_state.revise_run(self.run_dir, "Create a variation")
+
+        self.assertEqual(
+            json.loads((self.run_dir / "mockup-manifest.json").read_text()),
+            current,
+        )
+        self.assertEqual(
+            json.loads(
+                (self.run_dir / "mockup-manifest.revision-1.json").read_text()
+            ),
+            archived,
+        )
+        self.assertEqual(run_state.load_run(self.run_dir)["state"], "mockups_generated")
+
+    def test_revision_rolls_back_archive_when_run_write_fails(self):
+        self.set_state("mockups_generated")
+        current = {"mockups": [{"direction_id": "current"}]}
+        self.write("mockup-manifest.json", current)
+
+        with mock.patch.object(
+            run_state, "write_json_atomic", side_effect=OSError("disk full")
+        ):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                run_state.revise_run(self.run_dir, "Create a variation")
+
+        self.assertEqual(
+            json.loads((self.run_dir / "mockup-manifest.json").read_text()),
+            current,
+        )
+        self.assertFalse(
+            (self.run_dir / "mockup-manifest.revision-1.json").exists()
+        )
+        self.assertEqual(run_state.load_run(self.run_dir)["state"], "mockups_generated")
+
+    def test_cli_revises_mockups_with_an_audit_reason(self):
+        self.set_state("mockups_generated")
+        self.write("mockup-manifest.json", {"mockups": []})
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                run_state.__file__,
+                "revise",
+                "--run",
+                str(self.run_dir),
+                "--reason",
+                "Create one bounded variation.",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads(result.stdout)
+        self.assertEqual(manifest["state"], "directions_pending_approval")
+        self.assertEqual(manifest["revision_count"], 1)
+        self.assertEqual(
+            manifest["last_revision_reason"], "Create one bounded variation."
+        )
 
     def test_cli_accepts_explicit_integration_approval(self):
         self.set_state("prototype_ready")

@@ -53,6 +53,55 @@ class SkillContractTests(unittest.TestCase):
         for phrase in required:
             self.assertIn(phrase, text)
 
+    def test_skill_and_references_define_baselines_and_revision_loop(self):
+        skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        research = (SKILL_DIR / "references/research-evidence.md").read_text(
+            encoding="utf-8"
+        )
+        mockups = (SKILL_DIR / "references/mockups-implementation.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_DIR / "references/artifact-contracts.md").read_text(
+            encoding="utf-8"
+        )
+
+        for phrase in (
+            "official evidence",
+            "baseline_exceptions",
+            "revise",
+            "first-class direction ID",
+        ):
+            self.assertIn(phrase, skill)
+        self.assertIn("explicit approval of disclosed exceptions", research)
+        for phrase in (
+            "derived_from_ids",
+            "combined_properties",
+            "only the newly approved IDs",
+            "obtain explicit approval again",
+            "bounded variations the user authorized",
+        ):
+            self.assertIn(phrase, mockups)
+        self.assertIn("mockup-manifest.revision-", contracts)
+
+        ordered_commands = (
+            "--phase mockups",
+            "--to mockups_generated",
+            "--to implementation_selected",
+            "--phase implementation",
+            "--to prototype_ready",
+            "--to integrated --approve-integration",
+        )
+        positions = [contracts.index(command) for command in ordered_commands]
+        self.assertEqual(positions, sorted(positions))
+        self.assertLess(
+            contracts.index("--to implementation_selected"),
+            contracts.index("Build the isolated preview and write `implementation.json`"),
+        )
+        self.assertLess(
+            contracts.index("Build the isolated preview and write `implementation.json`"),
+            contracts.index("--phase implementation"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

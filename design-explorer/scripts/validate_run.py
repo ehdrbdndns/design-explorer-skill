@@ -139,6 +139,7 @@ def validate_directions(run_dir: Path) -> list[str]:
         errors.append("evidence.json must be a list")
         evidence = []
     evidence_ids = set()
+    evidence_types = {}
     for index, item in enumerate(evidence or []):
         if not isinstance(item, dict):
             errors.append(f"evidence[{index}] must be an object")
@@ -150,6 +151,7 @@ def validate_directions(run_dir: Path) -> list[str]:
             errors.append(f"duplicate evidence id: {identifier}")
         else:
             evidence_ids.add(identifier)
+            evidence_types[identifier] = item.get("source_type")
     if not isinstance(directions, list) or len(directions) < 5:
         errors.append("directions must contain at least five items")
         return errors
@@ -200,6 +202,31 @@ def validate_directions(run_dir: Path) -> list[str]:
             )
         elif set(links) - evidence_ids:
             errors.append(f"directions[{index}] has missing or unknown evidence_ids")
+        elif not any(evidence_types.get(link) == "official" for link in links):
+            errors.append(
+                f"directions[{index}] must link at least one official evidence item"
+            )
+        if "baseline_exceptions" not in item:
+            errors.append(f"directions[{index}] missing baseline_exceptions")
+        else:
+            exceptions = item["baseline_exceptions"]
+            if not isinstance(exceptions, list):
+                errors.append(
+                    f"directions[{index}] baseline_exceptions must be a list"
+                )
+            else:
+                for exception_index, exception in enumerate(exceptions):
+                    if not isinstance(exception, dict):
+                        errors.append(
+                            f"directions[{index}] baseline_exceptions[{exception_index}] must be an object"
+                        )
+                        continue
+                    for field in ("constraint", "justification"):
+                        value = exception.get(field)
+                        if not isinstance(value, str) or not value.strip():
+                            errors.append(
+                                f"directions[{index}] baseline_exceptions[{exception_index}] missing {field}"
+                            )
     valid_directions = [item for item in directions if isinstance(item, dict)]
     for left, right in combinations(valid_directions, 2):
         difference = sum(axis_value(left, axis) != axis_value(right, axis) for axis in AXES)

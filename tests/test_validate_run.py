@@ -21,14 +21,14 @@ def reference(identifier="ref-1"):
     }
 
 
-def evidence(identifier="ev-1"):
+def evidence(identifier="ev-1", source_type="official"):
     return {
         "id": identifier,
         "problem": "reduce checkout uncertainty",
         "title": "Checkout guidance",
         "publisher_or_author": "W3C Web Accessibility Initiative",
         "source_url": "https://www.w3.org/WAI/",
-        "source_type": "official",
+        "source_type": source_type,
         "summary": "Make status and error information perceivable near the relevant control.",
         "application": "Keep errors adjacent to their fields.",
         "limitations": "Confirm against the target platform guidance.",
@@ -52,11 +52,33 @@ def direction(identifier, **axes):
         "ux_problem": "reduce checkout uncertainty",
         "evidence_ids": ["ev-1"],
         "evidence_application": "Uses adjacent reassurance and error recovery.",
+        "baseline_exceptions": [],
         "axes": defaults,
         "tradeoffs": "Balances speed and reassurance.",
         "implementation_difficulty": "medium",
         "implementation_risks": "Needs careful responsive hierarchy.",
     }
+
+
+def distinct_directions():
+    return [
+        direction("editorial"),
+        direction("dense", layout="grid", density="dense", typography="serif"),
+        direction("visual", layout="split", palette="vivid", imagery="photo"),
+        direction(
+            "calm",
+            typography="rounded",
+            density="spacious",
+            interaction="guided",
+        ),
+        direction(
+            "dark",
+            layout="cards",
+            palette="dark",
+            imagery="illustration",
+            interaction="direct",
+        ),
+    ]
 
 
 class ValidateRunTests(unittest.TestCase):
@@ -241,15 +263,59 @@ class ValidateRunTests(unittest.TestCase):
 
     def test_distinct_evidence_linked_directions_pass(self):
         self.write("evidence.json", [evidence()])
-        directions = [
-            direction("editorial"),
-            direction("dense", layout="grid", density="dense", typography="serif"),
-            direction("visual", layout="split", palette="vivid", imagery="photo"),
-            direction("calm", typography="rounded", density="spacious", interaction="guided"),
-            direction("dark", layout="cards", palette="dark", imagery="illustration", interaction="direct"),
+        directions = distinct_directions()
+        directions[0]["baseline_exceptions"] = [
+            {
+                "constraint": "minimum pointer target size",
+                "justification": "The target platform owns this fixed native control.",
+            }
         ]
         self.write("directions.json", directions)
         self.assertEqual(validator.validate_phase(self.run, "directions"), [])
+
+    def test_every_direction_links_official_evidence(self):
+        self.write(
+            "evidence.json",
+            [evidence(), evidence("ev-research", source_type="research")],
+        )
+        directions = distinct_directions()
+        directions[0]["evidence_ids"] = ["ev-research"]
+        self.write("directions.json", directions)
+
+        errors = validator.validate_phase(self.run, "directions")
+
+        self.assertIn(
+            "directions[0] must link at least one official evidence item",
+            errors,
+        )
+
+    def test_directions_require_well_formed_baseline_exceptions(self):
+        self.write("evidence.json", [evidence()])
+        directions = distinct_directions()
+        directions[0].pop("baseline_exceptions")
+        directions[1]["baseline_exceptions"] = "none"
+        directions[2]["baseline_exceptions"] = [{}]
+        directions[3]["baseline_exceptions"] = [
+            {"constraint": "minimum contrast", "justification": "   "}
+        ]
+        self.write("directions.json", directions)
+
+        errors = validator.validate_phase(self.run, "directions")
+
+        self.assertIn("directions[0] missing baseline_exceptions", errors)
+        self.assertIn("directions[1] baseline_exceptions must be a list", errors)
+        self.assertIn(
+            "directions[2] baseline_exceptions[0] missing constraint",
+            errors,
+        )
+        self.assertIn(
+            "directions[2] baseline_exceptions[0] missing justification",
+            errors,
+        )
+        self.assertIn(
+            "directions[3] baseline_exceptions[0] missing justification",
+            errors,
+        )
 
     def test_mockups_cover_every_approved_direction(self):
         self.write("run.json", {"approved_direction_ids": ["a", "b"]})
