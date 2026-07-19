@@ -44,9 +44,23 @@ def write_json_atomic(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
-def init_run(root: Path, slug: str, project_path=None, now=None, run_id=None) -> Path:
+def init_run(
+    root: Path,
+    slug: str,
+    project_path: str | None = None,
+    now: str | None = None,
+    run_id: str | None = None,
+) -> Path:
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
         raise ValueError("slug must use lowercase letters, digits, and hyphens")
+    if run_id is not None and (
+        Path(run_id).is_absolute()
+        or run_id in {".", ".."}
+        or "/" in run_id
+        or "\\" in run_id
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", run_id)
+    ):
+        raise ValueError("run_id must be a safe path component")
     timestamp = now or utc_now()
     identifier = run_id or f"{timestamp[:10].replace('-', '')}-{slug}-{uuid.uuid4().hex[:8]}"
     run_dir = Path(root).expanduser() / identifier
@@ -79,9 +93,10 @@ def _require_files(run_dir: Path, target: str) -> None:
 def transition_run(
     run_dir: Path,
     target: str,
-    approved_direction_ids=None,
-    selected_direction_id=None,
-    now=None,
+    approved_direction_ids: list[str] | None = None,
+    selected_direction_id: str | None = None,
+    now: str | None = None,
+    integration_approved: bool = False,
 ) -> dict:
     run_dir = Path(run_dir)
     manifest = load_run(run_dir)
@@ -89,6 +104,12 @@ def transition_run(
     if NEXT_STATE.get(current) != target:
         raise ValueError(f"illegal transition: {current} -> {target}")
     _require_files(run_dir, target)
+    timestamp = now or utc_now()
+
+    if target == "integrated":
+        if not integration_approved:
+            raise ValueError("integrated requires explicit integration approval")
+        manifest["integration_approved_at"] = timestamp
 
     if target == "directions_approved":
         if not approved_direction_ids:
@@ -113,7 +134,7 @@ def transition_run(
         manifest["selected_direction_id"] = selected_direction_id
 
     manifest["state"] = target
-    manifest["updated_at"] = now or utc_now()
+    manifest["updated_at"] = timestamp
     write_json_atomic(run_dir / "run.json", manifest)
     return manifest
 
@@ -130,6 +151,7 @@ def main() -> int:
     transition_parser.add_argument("--to", required=True, choices=STATES[1:])
     transition_parser.add_argument("--approved-direction", action="append")
     transition_parser.add_argument("--selected-direction")
+    transition_parser.add_argument("--approve-integration", action="store_true")
     status_parser = subparsers.add_parser("status")
     status_parser.add_argument("--run", required=True)
     args = parser.parse_args()
@@ -143,6 +165,7 @@ def main() -> int:
             args.to,
             approved_direction_ids=args.approved_direction,
             selected_direction_id=args.selected_direction,
+            integration_approved=args.approve_integration,
         )
         print(json.dumps(manifest, indent=2))
     else:
