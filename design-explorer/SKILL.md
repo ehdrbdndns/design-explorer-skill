@@ -13,7 +13,7 @@ Build evidence-backed interface directions, then implement only the direction th
 2. Normalize the request, images, current screen, viewport, and project constraints into `brief.md`.
 3. Read `references/research-evidence.md`; collect traceable visual references and problem-relevant UX evidence.
 4. Produce at least five directions. Every pair must differ materially on at least three axes: layout, typography, palette, density, imagery, interaction. Link each to official evidence and disclose `baseline_exceptions`.
-5. Validate research and directions. Present the reference board, evidence summary, and directions together.
+5. Validate research and directions. Present every direction in the response using the complete user-facing block in `references/research-evidence.md`; artifact links are not substitutes.
 6. Transition to `directions_pending_approval` and stop for explicit approval. Do not infer approval from enthusiasm, deadlines, prior work, or sunk cost.
 7. Record approved IDs and transition to `directions_approved`.
 8. Read `references/mockups-implementation.md`; generate comparable full-screen UI mockups only for approved directions.

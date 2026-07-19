@@ -117,6 +117,24 @@ class SkillContractTests(unittest.TestCase):
         ):
             self.assertIn(phrase, contracts)
 
+    def test_user_facing_direction_review_requires_complete_blocks(self):
+        skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        research = (SKILL_DIR / "references/research-evidence.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("Present every direction in the response", skill)
+        for phrase in (
+            "direction id",
+            "ux problem",
+            "evidence IDs and direct links",
+            "evidence application",
+            "trade-offs",
+            "layout, typography, palette, density, imagery, and interaction",
+            "artifact links do not replace these user-facing direction blocks",
+        ):
+            self.assertIn(phrase.lower(), research.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
