@@ -4,7 +4,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -41,6 +40,9 @@ class PublicationGateTests(unittest.TestCase):
 
     def write_json(self, name, value):
         (self.run / name).write_text(json.dumps(value), encoding="utf-8")
+
+    def assert_generation_lock_released(self):
+        self.assertFalse(run_state._generation_lock_is_held(self.run))
 
     def write_research(self):
         self.write_json("references.json", [reference()])
@@ -192,24 +194,18 @@ class PublicationGateTests(unittest.TestCase):
         self.advance_to_approved()
         self.write_pending_manifest()
         self.assertFalse(run_state.image_generation_allowed(self.run, "unknown"))
-        lock = self.run / ".generation.lock"
-        lock.write_text(
-            json.dumps(
-                {
-                    "pid": os.getpid(),
-                    "created_at": "2026-07-20T00:00:00Z",
-                    "transaction_id": "a" * 32,
-                }
-            ),
-            encoding="utf-8",
+        owner = run_state._acquire_generation_lock(
+            self.run, "2026-07-20T00:00:00Z"
         )
         before_run = (self.run / "run.json").read_bytes()
         before_mockups = (self.run / "mockup-manifest.json").read_bytes()
-        with self.assertRaisesRegex(ValueError, "already in progress"):
-            run_state.authorize_generation(self.run, "d-0")
-        self.assertEqual((self.run / "run.json").read_bytes(), before_run)
-        self.assertEqual((self.run / "mockup-manifest.json").read_bytes(), before_mockups)
-        lock.unlink()
+        try:
+            with self.assertRaisesRegex(ValueError, "already in progress"):
+                run_state.authorize_generation(self.run, "d-0")
+            self.assertEqual((self.run / "run.json").read_bytes(), before_run)
+            self.assertEqual((self.run / "mockup-manifest.json").read_bytes(), before_mockups)
+        finally:
+            run_state._release_generation_lock(owner)
 
         bad = self.ledger([self.entry()], used=1)
         bad["mockups"][0]["attempt_count"] = 0
@@ -296,7 +292,7 @@ class PublicationGateTests(unittest.TestCase):
             ],
             1,
         )
-        self.assertFalse((self.run / ".generation.lock").exists())
+        self.assert_generation_lock_released()
         self.assertEqual(list(self.run.glob(".mockup-manifest.json.generation-*.tmp")), [])
 
     def test_generation_failure_injection_preserves_valid_single_ledger(self):
@@ -327,7 +323,7 @@ class PublicationGateTests(unittest.TestCase):
                             run_state.authorize_generation(self.run, "d-0")
                     self.assertEqual((self.run / "run.json").read_bytes(), before_run)
                     self.assertEqual((self.run / "mockup-manifest.json").read_bytes(), before_ledger)
-                    self.assertFalse((self.run / ".generation.lock").exists())
+                    self.assert_generation_lock_released()
                     self.assertEqual(
                         list(self.run.glob(".mockup-manifest.json.generation-*.tmp")), []
                     )
@@ -349,39 +345,117 @@ class PublicationGateTests(unittest.TestCase):
                 run_state.authorize_generation(self.run, "d-0")
         self.assertEqual((self.run / "run.json").read_bytes(), before_run)
         self.assertEqual((self.run / "mockup-manifest.json").read_bytes(), before_ledger)
-        self.assertFalse((self.run / ".generation.lock").exists())
+        self.assert_generation_lock_released()
         self.assertEqual(list(self.run.glob(".mockup-manifest.json.generation-*.tmp")), [])
 
-    def test_lock_write_retries_short_writes_and_release_preserves_replacement(self):
+    def test_generation_temp_completes_real_short_writes_and_rejects_corruption(self):
+        temporary = self.run / f".mockup-manifest.json.generation-{'a' * 32}.tmp"
+        payload = b'{"schema_version": 1, "mockups": []}\n'
+        real_write = os.write
+        writes = []
+
+        def short_write(descriptor, data):
+            writes.append(len(data))
+            return real_write(descriptor, data[:3])
+
+        with mock.patch.object(run_state.os, "write", side_effect=short_write):
+            run_state._write_generation_temp(temporary, payload)
+        self.assertEqual(temporary.read_bytes(), payload)
+        self.assertGreater(len(writes), 1)
+        temporary.unlink()
+
+        for invalid_result in (None, 0, -1):
+            with self.subTest(invalid_write_result=invalid_result):
+                with mock.patch.object(
+                    run_state.os, "write", return_value=invalid_result
+                ), mock.patch.object(run_state, "_fsync_generation_file") as fsync:
+                    with self.assertRaisesRegex(OSError, "made no progress"):
+                        run_state._write_generation_temp(temporary, payload)
+                    fsync.assert_not_called()
+                temporary.unlink()
+
+        self.advance_to_approved()
+        self.write_pending_manifest()
+        before_run = (self.run / "run.json").read_bytes()
+        before_ledger = (self.run / "mockup-manifest.json").read_bytes()
+
+        def corrupt_stage(path, data):
+            path.write_bytes(data[:-4] + b"xxxx")
+
+        with mock.patch.object(
+            run_state, "_write_generation_temp", side_effect=corrupt_stage
+        ):
+            with self.assertRaisesRegex(ValueError, "staged generation manifest"):
+                run_state.authorize_generation(self.run, "d-0")
+        self.assertEqual((self.run / "run.json").read_bytes(), before_run)
+        self.assertEqual((self.run / "mockup-manifest.json").read_bytes(), before_ledger)
+        self.assertEqual(list(self.run.glob(".mockup-manifest.json.generation-*.tmp")), [])
+
+    def test_lock_write_retries_short_writes_and_preserves_stable_inode(self):
         real_write = os.write
 
         def short_write(descriptor, data):
             return real_write(descriptor, data[:3])
 
         with mock.patch.object(run_state.os, "write", side_effect=short_write):
-            transaction_id = run_state._acquire_generation_lock(
+            owner = run_state._acquire_generation_lock(
                 self.run, "2026-07-20T00:01:00Z"
             )
         lock = self.run / ".generation.lock"
         payload = json.loads(lock.read_text(encoding="utf-8"))
-        self.assertEqual(payload["transaction_id"], transaction_id)
+        self.assertEqual(payload["transaction_id"], owner.transaction_id)
+        with self.assertRaisesRegex(ValueError, "already in progress"):
+            run_state._acquire_generation_lock(
+                self.run, "2026-07-20T00:02:00Z"
+            )
+        inode = lock.stat().st_ino
+        run_state._release_generation_lock(owner)
+        next_owner = run_state._acquire_generation_lock(
+            self.run, "2026-07-20T00:02:00Z"
+        )
+        self.assertEqual(lock.stat().st_ino, inode)
+        run_state._release_generation_lock(next_owner)
 
+    def test_lock_release_and_failed_acquire_never_remove_replacement_path(self):
+        lock_path = self.run / ".generation.lock"
         replacement = {
             "pid": os.getpid(),
-            "created_at": "2026-07-20T00:02:00Z",
-            "transaction_id": "f" * 32,
+            "created_at": "2026-07-20T00:03:00Z",
+            "transaction_id": "e" * 32,
         }
-        real_loads = json.loads
+        owner = run_state._acquire_generation_lock(
+            self.run, "2026-07-20T00:01:00Z"
+        )
+        real_unlock = run_state._unlock_generation_lock
 
-        def replace_after_parse(value):
-            parsed = real_loads(value)
-            lock.unlink()
-            lock.write_text(json.dumps(replacement), encoding="utf-8")
-            return parsed
+        def replace_at_last_unlock(current_owner):
+            lock_path.unlink()
+            lock_path.write_text(json.dumps(replacement), encoding="utf-8")
+            real_unlock(current_owner)
 
-        with mock.patch.object(run_state.json, "loads", side_effect=replace_after_parse):
-            run_state._release_generation_lock(self.run, transaction_id)
-        self.assertEqual(json.loads(lock.read_text(encoding="utf-8")), replacement)
+        with mock.patch.object(
+            run_state, "_unlock_generation_lock", side_effect=replace_at_last_unlock
+        ):
+            run_state._release_generation_lock(owner)
+        self.assertEqual(json.loads(lock_path.read_text(encoding="utf-8")), replacement)
+
+        lock_path.unlink()
+
+        def replace_then_interrupt(descriptor, payload):
+            lock_path.unlink()
+            lock_path.write_text(json.dumps(replacement), encoding="utf-8")
+            raise KeyboardInterrupt()
+
+        with mock.patch.object(
+            run_state,
+            "_write_generation_lock_payload",
+            side_effect=replace_then_interrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                run_state._acquire_generation_lock(
+                    self.run, "2026-07-20T00:02:00Z"
+                )
+        self.assertEqual(json.loads(lock_path.read_text(encoding="utf-8")), replacement)
 
     def test_interrupt_after_replace_leaves_valid_new_ledger_and_no_residue(self):
         self.advance_to_approved()
@@ -400,18 +474,16 @@ class PublicationGateTests(unittest.TestCase):
         ledger = json.loads((self.run / "mockup-manifest.json").read_text())
         self.assertEqual(validator.validate_mockup_manifest_for_generation(self.run), [])
         self.assertEqual(ledger["generation_attempts_used"], 1)
-        self.assertFalse((self.run / ".generation.lock").exists())
+        self.assert_generation_lock_released()
         self.assertEqual(list(self.run.glob(".mockup-manifest.json.generation-*.tmp")), [])
 
-    def test_dead_and_old_malformed_locks_recover_matching_temp_files(self):
+    def test_unheld_stale_and_malformed_lock_metadata_recover_safely(self):
         self.advance_to_approved()
         self.write_pending_manifest()
         lock = self.run / ".generation.lock"
         transaction_id = "b" * 32
         stale_temp = self.run / f".mockup-manifest.json.generation-{transaction_id}.tmp"
-        foreign_temp = self.run / f".mockup-manifest.json.generation-{'c' * 32}.tmp"
         stale_temp.write_text("partial", encoding="utf-8")
-        foreign_temp.write_text("foreign", encoding="utf-8")
         lock.write_text(
             json.dumps(
                 {
@@ -422,24 +494,67 @@ class PublicationGateTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        inode = lock.stat().st_ino
         run_state.authorize_generation(self.run, "d-0")
-        self.assertFalse(lock.exists())
         self.assertFalse(stale_temp.exists())
-        self.assertEqual(foreign_temp.read_text(encoding="utf-8"), "foreign")
+        self.assertEqual(lock.stat().st_ino, inode)
+        self.assert_generation_lock_released()
 
         ledger = json.loads((self.run / "mockup-manifest.json").read_text())
         ledger["mockups"][0]["status"] = "failed"
         self.write_json("mockup-manifest.json", ledger)
         lock.write_text("{malformed", encoding="utf-8")
-        recent_mtime = time.time()
-        os.utime(lock, (recent_mtime, recent_mtime))
-        with self.assertRaisesRegex(ValueError, "malformed.*recent"):
-            run_state.authorize_generation(self.run, "d-0")
-        old_mtime = time.time() - run_state.MALFORMED_LOCK_STALE_SECONDS - 1
-        os.utime(lock, (old_mtime, old_mtime))
+        orphan = self.run / f".mockup-manifest.json.generation-{'c' * 32}.tmp"
+        orphan.write_text("orphan", encoding="utf-8")
         run_state.authorize_generation(self.run, "d-0")
-        self.assertFalse(lock.exists())
-        self.assertEqual(foreign_temp.read_text(encoding="utf-8"), "foreign")
+        self.assertFalse(orphan.exists())
+        self.assertEqual(lock.stat().st_ino, inode)
+        self.assert_generation_lock_released()
+        self.assertEqual(
+            set(json.loads(lock.read_text(encoding="utf-8"))),
+            {"pid", "created_at", "transaction_id"},
+        )
+
+    def test_cross_process_flock_blocks_and_sigkill_releases_owner(self):
+        self.advance_to_approved()
+        self.write_pending_manifest()
+        lock = self.run / ".generation.lock"
+        child_code = """
+import fcntl, json, os, sys, time
+path = sys.argv[1]
+fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.ftruncate(fd, 0)
+os.write(fd, (json.dumps({"pid": os.getpid(), "created_at": "2026-07-20T00:00:00Z", "transaction_id": "d" * 32}) + "\\n").encode())
+os.fsync(fd)
+print("locked", flush=True)
+time.sleep(60)
+"""
+        child = subprocess.Popen(
+            [sys.executable, "-c", child_code, str(lock)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "locked")
+            before_run = (self.run / "run.json").read_bytes()
+            before_ledger = (self.run / "mockup-manifest.json").read_bytes()
+            self.assertFalse(run_state.image_generation_allowed(self.run, "d-0"))
+            with self.assertRaisesRegex(ValueError, "already in progress"):
+                run_state.authorize_generation(self.run, "d-0")
+            self.assertEqual((self.run / "run.json").read_bytes(), before_run)
+            self.assertEqual(
+                (self.run / "mockup-manifest.json").read_bytes(), before_ledger
+            )
+            inode = lock.stat().st_ino
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=5)
+        run_state.authorize_generation(self.run, "d-0")
+        self.assertEqual(lock.stat().st_ino, inode)
+        self.assert_generation_lock_released()
 
     def test_cli_requires_direction_and_authorizes_concisely(self):
         self.advance_to_approved()
@@ -510,8 +625,45 @@ class PublicationGateTests(unittest.TestCase):
         self.assertFalse(run_state.image_generation_allowed(self.run, "d-0"))
         with self.assertRaisesRegex(ValueError, "research validation failed"):
             run_state.authorize_generation(self.run, "d-0")
-        self.assertFalse((self.run / ".generation.lock").exists())
+        self.assert_generation_lock_released()
         self.assertEqual((self.run / "run.json").read_bytes(), before)
+
+    def test_legacy_dual_accounting_run_is_rejected_before_authorization(self):
+        self.advance_to_approved()
+        self.write_pending_manifest()
+        run_path = self.run / "run.json"
+        current = json.loads(run_path.read_text(encoding="utf-8"))
+        legacy_cases = (
+            {
+                "generation_attempts_used": 0,
+                "last_generation_authorized_at": None,
+                "last_generation_authorized_direction_id": None,
+            },
+            {"last_generation_direction_id": None},
+        )
+        for legacy_fields in legacy_cases:
+            with self.subTest(legacy_fields=tuple(legacy_fields)):
+                run_path.write_text(
+                    json.dumps({**current, **legacy_fields}), encoding="utf-8"
+                )
+                before = run_path.read_bytes()
+                self.assertTrue(
+                    any(
+                        "legacy generation accounting" in error
+                        for error in validator.validate_mockup_manifest_for_generation(
+                            self.run
+                        )
+                    )
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "legacy generation accounting.*migrate"
+                ):
+                    run_state.load_run(self.run)
+                with self.assertRaisesRegex(
+                    ValueError, "legacy generation accounting.*migrate"
+                ):
+                    run_state.authorize_generation(self.run, "d-0")
+                self.assertEqual(run_path.read_bytes(), before)
 
     def test_cumulative_load_rejects_reference_and_markdown_tampering(self):
         for mutation in ("references", "design-markdown", "board-markdown"):

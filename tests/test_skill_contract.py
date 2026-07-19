@@ -214,9 +214,14 @@ class SkillContractTests(unittest.TestCase):
             "run.json is unchanged",
             "one atomic replace",
             "pid, created_at, and transaction_id",
-            "never steal a live lock",
-            "malformed lock",
-            "same-host pid trust boundary",
+            "stable lock inode",
+            "posix flock",
+            "lock file is never unlinked or replaced",
+            "kernel releases the flock",
+            "staged json is parsed and matched before replace",
+            "short writes",
+            "legacy generation accounting keys are forbidden",
+            "migrate generation accounting to mockup-manifest.json",
             "absence, creation, and archival of the manifest",
         ):
             self.assertIn(phrase, combined)

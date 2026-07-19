@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 import argparse
 import errno
+import fcntl
 import hashlib
 import importlib.util
 import json
 import os
 import re
+import stat
 import sys
-import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,12 +30,19 @@ NEXT_STATE = dict(zip(STATES, STATES[1:]))
 SCHEMA_VERSION = 2
 DEFAULT_GENERATION_BUDGET = 5
 DEFAULT_MAX_ATTEMPTS_PER_DIRECTION = 2
-MALFORMED_LOCK_STALE_SECONDS = 30
 GENERATION_TEMP_PATTERN = re.compile(
     r"\.mockup-manifest\.json\.generation-([0-9a-f]{32})\.tmp"
 )
 RFC3339_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
+)
+LEGACY_GENERATION_ACCOUNTING_KEYS = frozenset(
+    {
+        "generation_attempts_used",
+        "last_generation_authorized_at",
+        "last_generation_direction_id",
+        "last_generation_authorized_direction_id",
+    }
 )
 VIEWPORT_PATTERN = re.compile(r"[1-9]\d{0,4}x[1-9]\d{0,4}")
 MAX_VIEWPORT_DIMENSION = 10_000
@@ -230,6 +239,15 @@ def validate_run_manifest(manifest: object) -> None:
     if version != SCHEMA_VERSION:
         raise ValueError(
             f"unsupported run schema {version!r}; migrate or initialize a schema v{SCHEMA_VERSION} run"
+        )
+    legacy_generation_keys = sorted(
+        LEGACY_GENERATION_ACCOUNTING_KEYS.intersection(manifest)
+    )
+    if legacy_generation_keys:
+        raise ValueError(
+            "invalid run.json: legacy generation accounting keys are forbidden; "
+            "migrate generation accounting to mockup-manifest.json: "
+            + ", ".join(legacy_generation_keys)
         )
     required = (
         "run_id",
@@ -661,7 +679,7 @@ def _generation_preflight(run_dir: Path, direction_id: str) -> tuple[dict, dict,
 def image_generation_allowed(run_dir: Path, direction_id: str) -> bool:
     try:
         run_dir = Path(run_dir)
-        if (run_dir / ".generation.lock").exists():
+        if _generation_lock_is_held(run_dir):
             return False
         _generation_preflight(run_dir, direction_id)
         return True
@@ -677,11 +695,39 @@ def _fsync_generation_file(descriptor: int) -> None:
     os.fsync(descriptor)
 
 
+def _write_all(descriptor: int, data: bytes) -> None:
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if (
+            not isinstance(written, int)
+            or isinstance(written, bool)
+            or written <= 0
+            or written > len(remaining)
+        ):
+            raise OSError("generation file write made no progress")
+        remaining = remaining[written:]
+
+
 def _write_generation_temp(path: Path, data: bytes) -> None:
-    with path.open("xb") as stream:
-        stream.write(data)
-        stream.flush()
-        _fsync_generation_file(stream.fileno())
+    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        _write_all(descriptor, data)
+        _fsync_generation_file(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _validate_staged_generation_manifest(
+    path: Path, expected_data: bytes, expected_value: dict
+) -> None:
+    try:
+        staged_data = path.read_bytes()
+        staged_value = json.loads(staged_data)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError(f"staged generation manifest is invalid: {error}") from None
+    if staged_data != expected_data or staged_value != expected_value:
+        raise ValueError("staged generation manifest does not match reservation")
 
 
 def _fsync_run_directory(run_dir: Path) -> None:
@@ -707,6 +753,7 @@ def _write_mockup_manifest_atomic(
     data = (json.dumps(value, indent=2) + "\n").encode("utf-8")
     try:
         _write_generation_temp(temporary, data)
+        _validate_staged_generation_manifest(temporary, data, value)
         _replace_path(temporary, destination)
         _fsync_run_directory(run_dir)
     finally:
@@ -725,79 +772,83 @@ def _generation_temp_paths(run_dir: Path, transaction_id: str | None) -> list[Pa
     return paths
 
 
-def _valid_lock_payload(value: object) -> bool:
-    return (
-        isinstance(value, dict)
-        and isinstance(value.get("pid"), int)
-        and not isinstance(value.get("pid"), bool)
-        and value["pid"] > 0
-        and valid_rfc3339(value.get("created_at"))
-        and isinstance(value.get("transaction_id"), str)
-        and re.fullmatch(r"[0-9a-f]{32}", value["transaction_id"]) is not None
-    )
+@dataclass(frozen=True)
+class _GenerationLock:
+    descriptor: int
+    transaction_id: str
+    path: Path
 
 
-def _process_is_live(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
+def _unlock_generation_lock(owner: _GenerationLock) -> None:
+    fcntl.flock(owner.descriptor, fcntl.LOCK_UN)
 
 
-def _recover_generation_lock(run_dir: Path, lock_path: Path) -> None:
+def _write_generation_lock_payload(descriptor: int, payload: bytes) -> None:
+    os.ftruncate(descriptor, 0)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    _write_all(descriptor, payload)
+    os.fsync(descriptor)
+
+
+def _generation_lock_is_held(run_dir: Path) -> bool:
+    lock_path = run_dir / ".generation.lock"
     try:
-        original = lock_path.read_bytes()
-        stat = lock_path.stat()
-    except OSError:
-        raise ValueError("generation authorization lock changed during recovery") from None
-    try:
-        payload = json.loads(original)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        payload = None
-    transaction_id = None
-    if _valid_lock_payload(payload):
-        if _process_is_live(payload["pid"]):
-            raise ValueError("generation authorization is already in progress")
-        transaction_id = payload["transaction_id"]
-    elif time.time() - stat.st_mtime < MALFORMED_LOCK_STALE_SECONDS:
-        raise ValueError("generation authorization lock is malformed but recent")
-    try:
-        current_stat = lock_path.stat()
-        if (
-            (current_stat.st_dev, current_stat.st_ino) != (stat.st_dev, stat.st_ino)
-            or lock_path.read_bytes() != original
-        ):
-            raise ValueError("generation authorization lock changed during recovery")
-        lock_path.unlink()
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
     except FileNotFoundError:
-        raise ValueError("generation authorization lock changed during recovery") from None
-    if transaction_id is not None:
-        for temporary in _generation_temp_paths(run_dir, transaction_id):
+        return False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                return True
+            raise
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def _acquire_generation_lock(run_dir: Path, timestamp: str) -> _GenerationLock:
+    lock_path = run_dir / ".generation.lock"
+    descriptor = os.open(
+        lock_path,
+        os.O_CREAT
+        | os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                raise ValueError(
+                    "generation authorization is already in progress"
+                ) from None
+            raise
+        descriptor_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise ValueError("generation authorization lock must be a regular file")
+        path_stat = lock_path.stat()
+        if (descriptor_stat.st_dev, descriptor_stat.st_ino) != (
+            path_stat.st_dev,
+            path_stat.st_ino,
+        ):
+            raise ValueError("generation authorization lock path was replaced")
+        transaction_id = uuid.uuid4().hex
+        owner = _GenerationLock(descriptor, transaction_id, lock_path)
+        for temporary in _generation_temp_paths(run_dir, None):
             try:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
-
-
-def _acquire_generation_lock(run_dir: Path, timestamp: str) -> str:
-    lock_path = run_dir / ".generation.lock"
-    for attempt in range(2):
-        transaction_id = uuid.uuid4().hex
-        try:
-            descriptor = os.open(
-                lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-            )
-        except FileExistsError:
-            if attempt:
-                raise ValueError("generation authorization is already in progress") from None
-            _recover_generation_lock(run_dir, lock_path)
-            continue
-        stat = os.fstat(descriptor)
         payload = (
             json.dumps(
                 {
@@ -808,48 +859,22 @@ def _acquire_generation_lock(run_dir: Path, timestamp: str) -> str:
             )
             + "\n"
         ).encode("utf-8")
+        _write_generation_lock_payload(descriptor, payload)
+        _fsync_run_directory(run_dir)
+        return owner
+    except BaseException:
         try:
-            remaining = memoryview(payload)
-            while remaining:
-                written = os.write(descriptor, remaining)
-                if written <= 0:
-                    raise OSError("generation authorization lock write made no progress")
-                remaining = remaining[written:]
-            os.fsync(descriptor)
-            _fsync_run_directory(run_dir)
-        except BaseException:
-            try:
-                current = lock_path.stat()
-                if (current.st_dev, current.st_ino) == (stat.st_dev, stat.st_ino):
-                    lock_path.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
-        return transaction_id
-    raise ValueError("unable to acquire generation authorization lock")
+        raise
 
 
-def _release_generation_lock(run_dir: Path, transaction_id: str) -> None:
-    lock_path = run_dir / ".generation.lock"
+def _release_generation_lock(owner: _GenerationLock) -> None:
     try:
-        original = lock_path.read_bytes()
-        stat = lock_path.stat()
-        payload = json.loads(original)
-    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError, OSError):
-        return
-    if isinstance(payload, dict) and payload.get("transaction_id") == transaction_id:
-        try:
-            current = lock_path.stat()
-            if (
-                (current.st_dev, current.st_ino) != (stat.st_dev, stat.st_ino)
-                or lock_path.read_bytes() != original
-            ):
-                return
-            lock_path.unlink()
-        except (FileNotFoundError, OSError):
-            pass
+        _unlock_generation_lock(owner)
+    finally:
+        os.close(owner.descriptor)
 
 
 def authorize_generation(
@@ -859,7 +884,7 @@ def authorize_generation(
     timestamp = now or utc_now()
     if not valid_rfc3339(timestamp):
         raise ValueError("generation authorization timestamp must be RFC3339")
-    transaction_id = _acquire_generation_lock(run_dir, timestamp)
+    owner = _acquire_generation_lock(run_dir, timestamp)
     try:
         _manifest, mockup_manifest, entry = _generation_preflight(
             run_dir, direction_id
@@ -871,7 +896,9 @@ def authorize_generation(
         mockup_manifest["generation_attempts_used"] += 1
         mockup_manifest["last_generation_authorized_at"] = timestamp
         mockup_manifest["last_generation_direction_id"] = direction_id
-        _write_mockup_manifest_atomic(run_dir, mockup_manifest, transaction_id)
+        _write_mockup_manifest_atomic(
+            run_dir, mockup_manifest, owner.transaction_id
+        )
         return {
             "direction_id": direction_id,
             "attempt_count": entry["attempt_count"],
@@ -879,7 +906,7 @@ def authorize_generation(
             "authorized_at": timestamp,
         }
     finally:
-        _release_generation_lock(run_dir, transaction_id)
+        _release_generation_lock(owner)
 
 
 def main() -> int:

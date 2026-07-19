@@ -4,7 +4,7 @@ Use this contract when creating, resuming, validating, or transitioning a design
 
 ## Run directory and states
 
-The default run directory is `~/.codex/design-explorer/runs/<run-id>/`. Keep each exploration isolated in one run directory. New manifests use schema version 2. `run.json` records identity/state fields plus normalized, unique `target_viewports`, `required_content`, `required_interactions`, and safe project-relative `production_paths`. `project_path` is expanded and normalized to an absolute path at initialization. It also records approved/selected direction IDs, `revision_count`, generation limits, approval timestamps, and revision audit fields. Unsupported schemas must be migrated or reinitialized; do not edit a version number to simulate migration.
+The default run directory is `~/.codex/design-explorer/runs/<run-id>/`. Keep each exploration isolated in one run directory. New manifests use schema version 2. `run.json` records identity/state fields plus normalized, unique `target_viewports`, `required_content`, `required_interactions`, and safe project-relative `production_paths`. `project_path` is expanded and normalized to an absolute path at initialization. It also records approved/selected direction IDs, `revision_count`, generation limits, approval timestamps, and revision audit fields. Unsupported schemas must be migrated or reinitialized; do not edit a version number to simulate migration. Legacy generation accounting keys are forbidden. Migrate generation accounting to mockup-manifest.json instead of retaining a second authority in `run.json`.
 
 Follow this primary state sequence without skipping steps:
 

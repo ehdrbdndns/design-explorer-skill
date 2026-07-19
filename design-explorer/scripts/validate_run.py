@@ -19,6 +19,12 @@ from urllib.parse import unquote_to_bytes, urlparse
 
 AXES = ("layout", "typography", "palette", "density", "imagery", "interaction")
 ALLOWED_MOCKUP_STATUSES = {"pending", "success", "failed"}
+LEGACY_GENERATION_ACCOUNTING_KEYS = {
+    "generation_attempts_used",
+    "last_generation_authorized_at",
+    "last_generation_direction_id",
+    "last_generation_authorized_direction_id",
+}
 SECRET_KEYS = {
     "apikey",
     "token",
@@ -1329,6 +1335,12 @@ def _mockup_manifest_errors(
         return errors
     errors.extend(find_secret_errors(run, "run"))
     errors.extend(find_secret_errors(manifest, "mockup-manifest"))
+    legacy_generation_keys = sorted(LEGACY_GENERATION_ACCOUNTING_KEYS.intersection(run))
+    if legacy_generation_keys:
+        errors.append(
+            "run.json legacy generation accounting keys are forbidden; migrate generation "
+            "accounting to mockup-manifest.json: " + ", ".join(legacy_generation_keys)
+        )
     approved = approved_direction_ids(run, errors)
     budget = positive_integer_field(run, "generation_budget", errors)
     max_attempts = positive_integer_field(run, "max_attempts_per_direction", errors)
