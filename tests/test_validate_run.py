@@ -1,4 +1,7 @@
+import copy
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -90,6 +93,38 @@ def derived_direction(identifier, source_ids, **axes):
     return item
 
 
+def run_manifest(**overrides):
+    value = {
+        "schema_version": 2,
+        "run_id": "run-checkout",
+        "slug": "checkout",
+        "state": "directions_approved",
+        "created_at": "2026-07-19T12:00:00Z",
+        "updated_at": "2026-07-19T12:00:00Z",
+        "project_path": None,
+        "approved_direction_ids": ["a"],
+        "selected_direction_id": None,
+        "revision_count": 0,
+        "generation_budget": 5,
+        "max_attempts_per_direction": 2,
+    }
+    value.update(overrides)
+    return value
+
+
+def mockup(direction_id="a", **overrides):
+    value = {
+        "direction_id": direction_id,
+        "status": "success",
+        "viewport": "390x844",
+        "prompt_digest": "sha256:abc",
+        "output_ref": "mockups/a.png",
+        "attempt_count": 1,
+    }
+    value.update(overrides)
+    return value
+
+
 class ValidateRunTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -109,6 +144,29 @@ class ValidateRunTests(unittest.TestCase):
         errors = validator.validate_phase(self.run, "research")
         self.assertTrue(any("source_url" in error for error in errors))
 
+    def test_validator_cli_json_failure_is_concise_stderr(self):
+        (self.run / "references.json").write_text("{bad json", encoding="utf-8")
+        self.write("evidence.json", [evidence()])
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                validator.__file__,
+                "--run",
+                str(self.run),
+                "--phase",
+                "research",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("invalid references.json", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.stdout, "")
+
     def test_http_urls_reject_whitespace_invalid_hosts_and_invalid_ports(self):
         invalid_urls = (
             "https://example.com/a path",
@@ -124,6 +182,27 @@ class ValidateRunTests(unittest.TestCase):
                 self.assertFalse(validator.valid_url(value))
 
         self.assertTrue(validator.valid_url("https://example.com:443/path"))
+
+    def test_http_urls_reject_credentials_and_non_public_hosts(self):
+        invalid_urls = (
+            "https://user:password@example.com/path",
+            "http://localhost/path",
+            "http://intranet/path",
+            "https://service.local/path",
+            "https://127.0.0.1/path",
+            "https://10.0.0.1/path",
+            "https://169.254.1.1/path",
+            "https://224.0.0.1/path",
+            "https://0.0.0.0/path",
+            "https://192.0.2.1/path",
+            "https://[::1]/path",
+        )
+
+        for value in invalid_urls:
+            with self.subTest(value=value):
+                self.assertFalse(validator.valid_url(value))
+
+        self.assertTrue(validator.valid_url("https://www.w3.org/WAI/"))
 
     def test_research_rejects_duplicate_ids_per_source_collection(self):
         self.write("references.json", [reference(), reference()])
@@ -456,11 +535,56 @@ class ValidateRunTests(unittest.TestCase):
         derived = derived_direction(
             "combined",
             ["editorial", "visual"],
-            layout="combined-layout",
+            layout="stacked",
             typography="combined-type",
-            palette="combined-palette",
+            palette="vivid",
             density="combined-density",
-            imagery="combined-imagery",
+            imagery="photo",
+            interaction="combined-interaction",
+        )
+        derived["combined_properties"] = {
+            "layout": "editorial",
+            "palette": "visual",
+            "imagery": "visual",
+        }
+        directions.append(derived)
+        self.write("directions.json", directions)
+
+        self.assertEqual(validator.validate_phase(self.run, "directions"), [])
+
+    def test_derived_axes_must_equal_named_prior_sources_and_use_every_source(self):
+        self.write("evidence.json", [evidence()])
+        directions = distinct_directions()
+        derived = derived_direction(
+            "combined",
+            ["editorial", "visual"],
+            layout="not-from-editorial",
+            typography="combined-type",
+            palette="vivid",
+            density="combined-density",
+            imagery="photo",
+            interaction="combined-interaction",
+        )
+        derived["combined_properties"] = {"layout": "editorial"}
+        directions.append(derived)
+        self.write("directions.json", directions)
+
+        errors = validator.validate_phase(self.run, "directions")
+
+        self.assertTrue(any("layout must match source editorial" in error for error in errors), errors)
+        self.assertTrue(any("source must contribute at least one axis: visual" in error for error in errors), errors)
+
+    def test_derived_provenance_normalizes_case_and_whitespace(self):
+        self.write("evidence.json", [evidence()])
+        directions = distinct_directions()
+        derived = derived_direction(
+            "combined",
+            ["editorial", "visual"],
+            layout=" STACKED ",
+            typography="combined-type",
+            palette="VIVID",
+            density="combined-density",
+            imagery="PHOTO ",
             interaction="combined-interaction",
         )
         derived["combined_properties"] = {
@@ -474,7 +598,7 @@ class ValidateRunTests(unittest.TestCase):
         self.assertEqual(validator.validate_phase(self.run, "directions"), [])
 
     def test_mockups_cover_every_approved_direction(self):
-        self.write("run.json", {"approved_direction_ids": ["a", "b"]})
+        self.write("run.json", run_manifest(approved_direction_ids=["a", "b"]))
         self.write(
             "mockup-manifest.json",
             {
@@ -485,6 +609,7 @@ class ValidateRunTests(unittest.TestCase):
                         "viewport": "390x844",
                         "prompt_digest": "sha256:abc",
                         "output_ref": "mockups/a.png",
+                        "attempt_count": 1,
                     }
                 ]
             },
@@ -493,7 +618,7 @@ class ValidateRunTests(unittest.TestCase):
         self.assertEqual(errors, ["missing successful mockups for: b"])
 
     def test_mockups_require_at_least_one_approved_direction(self):
-        self.write("run.json", {"approved_direction_ids": []})
+        self.write("run.json", run_manifest(approved_direction_ids=[]))
         self.write("mockup-manifest.json", {"mockups": []})
 
         errors = validator.validate_phase(self.run, "mockups")
@@ -504,7 +629,7 @@ class ValidateRunTests(unittest.TestCase):
         )
 
     def test_mockups_reject_invalid_or_duplicate_approved_direction_ids(self):
-        self.write("run.json", {"approved_direction_ids": ["a", " ", "a", 42]})
+        self.write("run.json", run_manifest(approved_direction_ids=["a", " ", "a", 42]))
         self.write("mockup-manifest.json", {"mockups": []})
 
         errors = validator.validate_phase(self.run, "mockups")
@@ -519,20 +644,21 @@ class ValidateRunTests(unittest.TestCase):
         )
 
     def test_mockups_reject_unapproved_directions_and_invalid_success_fields(self):
-        self.write("run.json", {"approved_direction_ids": ["a"]})
+        self.write("run.json", run_manifest(approved_direction_ids=["a"]))
         self.write(
             "mockup-manifest.json",
             {
                 "mockups": [
-                    {"direction_id": "b", "status": "failed"},
+                    {"direction_id": "b", "status": "failed", "attempt_count": 1},
                     {
                         "direction_id": "a",
                         "status": "success",
                         "viewport": 390,
                         "prompt_digest": " ",
                         "output_ref": None,
+                        "attempt_count": 1,
                     },
-                    {"direction_id": 42, "status": "failed"},
+                    {"direction_id": 42, "status": "failed", "attempt_count": 1},
                 ]
             },
         )
@@ -546,10 +672,133 @@ class ValidateRunTests(unittest.TestCase):
         self.assertIn("mockups[2] direction_id must be a non-empty string", errors)
         self.assertIn("missing successful mockups for: a", errors)
 
+    def test_mockup_manifest_enforces_budget_uniqueness_status_and_attempts(self):
+        cases = (
+            (
+                run_manifest(generation_budget=5),
+                {"mockups": [mockup("a") for _ in range(100)]},
+                "exceeds generation_budget",
+            ),
+            (
+                run_manifest(approved_direction_ids=["a", "b"]),
+                {"mockups": [mockup("a"), mockup("a"), mockup("b")]},
+                "duplicate current direction_id: a",
+            ),
+            (
+                run_manifest(),
+                {"mockups": [mockup(status="complete")]},
+                "status must be pending, success, or failed",
+            ),
+            (
+                run_manifest(),
+                {"mockups": [mockup(attempt_count=999)]},
+                "attempt_count exceeds max_attempts_per_direction",
+            ),
+        )
+        for run, manifest, expected in cases:
+            with self.subTest(expected=expected):
+                self.write("run.json", run)
+                self.write("mockup-manifest.json", manifest)
+                errors = validator.validate_phase(self.run, "mockups")
+                self.assertTrue(any(expected in error for error in errors), errors)
+
+    def test_mockups_pass_with_explicitly_expanded_budget(self):
+        approved = [f"d-{index}" for index in range(8)]
+        self.write(
+            "run.json",
+            run_manifest(
+                approved_direction_ids=approved,
+                generation_budget=8,
+                max_attempts_per_direction=3,
+                budget_expansion_approved_at="2026-07-19T12:01:00Z",
+            ),
+        )
+        self.write(
+            "mockup-manifest.json",
+            {"mockups": [mockup(identifier, attempt_count=3) for identifier in approved]},
+        )
+
+        self.assertEqual(validator.validate_phase(self.run, "mockups"), [])
+
+    def test_artifact_paths_and_provider_refs_reject_escaping_or_credentials(self):
+        bad_reference = reference()
+        bad_reference["capture_path"] = "../cookies/session.png"
+        self.write("references.json", [bad_reference])
+        self.write("evidence.json", [evidence()])
+        errors = validator.validate_phase(self.run, "research")
+        self.assertTrue(any("capture_path" in error for error in errors), errors)
+
+        self.write("run.json", run_manifest())
+        for value in (
+            "/tmp/a.png",
+            "../a.png",
+            "mockups\\a.png",
+            "https://user:secret@example.com/a.png",
+            "provider:user@secret",
+        ):
+            with self.subTest(value=value):
+                self.write("mockup-manifest.json", {"mockups": [mockup(output_ref=value)]})
+                errors = validator.validate_phase(self.run, "mockups")
+                self.assertTrue(any("output_ref" in error for error in errors), errors)
+
+        self.write(
+            "mockup-manifest.json",
+            {"mockups": [mockup(output_ref="openai:artifact_abc-123")]},
+        )
+        self.assertEqual(validator.validate_phase(self.run, "mockups"), [])
+
+    def test_failed_mockup_rejects_an_unsafe_optional_output_ref(self):
+        self.write("run.json", run_manifest())
+        self.write(
+            "mockup-manifest.json",
+            {
+                "mockups": [
+                    mockup(
+                        status="failed",
+                        output_ref="../private/result.png",
+                    )
+                ]
+            },
+        )
+
+        errors = validator.validate_phase(self.run, "mockups")
+
+        self.assertTrue(any("output_ref" in error for error in errors), errors)
+
+    def test_json_artifacts_recursively_reject_secret_keys_and_high_confidence_values(self):
+        artifacts = (
+            ("research", "references.json", [dict(reference(), api_key="hidden")], "evidence.json", [evidence()]),
+            ("directions", "directions.json", [dict(item) for item in distinct_directions()], "evidence.json", [evidence()]),
+            ("mockups", "mockup-manifest.json", {"mockups": [mockup(prompt_digest="Bearer abcdefghijklmnop")]}, "run.json", run_manifest()),
+            ("implementation", "implementation.json", {
+                "selected_direction_id": "a",
+                "mode": "project",
+                "preview_path": "src/preview.tsx",
+                "verification": {"rendered_viewports": ["390x844"], "checks": {"content": "pass", "overflow": "pass", "accessibility": "pass"}},
+                "metadata": {"pairing_token": "hidden"},
+            }, "run.json", run_manifest(state="implementation_selected", selected_direction_id="a")),
+        )
+        for phase, first_name, first_value, second_name, second_value in artifacts:
+            with self.subTest(phase=phase):
+                value = copy.deepcopy(first_value)
+                if phase == "directions":
+                    value[0]["concept"] = "sk-abcdefghijklmnop"
+                self.write(first_name, value)
+                self.write(second_name, second_value)
+                errors = validator.validate_phase(self.run, phase)
+                self.assertTrue(any("secret-like" in error for error in errors), errors)
+
+    def test_normal_prose_about_passwords_is_not_a_secret(self):
+        item = evidence()
+        item["summary"] = "Passwords should remain private and error text should be clear."
+        self.write("references.json", [reference()])
+        self.write("evidence.json", [item])
+        self.assertEqual(validator.validate_phase(self.run, "research"), [])
+
     def test_implementation_matches_selection_and_records_render_checks(self):
         self.write(
             "run.json",
-            {"selected_direction_id": "a", "approved_direction_ids": ["a", "b"]},
+            run_manifest(state="implementation_selected", selected_direction_id="a", approved_direction_ids=["a", "b"]),
         )
         self.write(
             "implementation.json",
@@ -593,7 +842,7 @@ class ValidateRunTests(unittest.TestCase):
         }
         self.write(
             "run.json",
-            {"selected_direction_id": "a", "approved_direction_ids": ["a"]},
+            run_manifest(state="implementation_selected", selected_direction_id="a", approved_direction_ids=["a"]),
         )
         self.write(
             "implementation.json",
@@ -614,7 +863,7 @@ class ValidateRunTests(unittest.TestCase):
 
         self.write(
             "run.json",
-            {"selected_direction_id": "b", "approved_direction_ids": ["a"]},
+            run_manifest(state="implementation_selected", selected_direction_id="b", approved_direction_ids=["a"]),
         )
         self.write(
             "implementation.json",
@@ -633,7 +882,7 @@ class ValidateRunTests(unittest.TestCase):
     def test_implementation_non_dict_verification_returns_an_error(self):
         self.write(
             "run.json",
-            {"selected_direction_id": "a", "approved_direction_ids": ["a"]},
+            run_manifest(state="implementation_selected", selected_direction_id="a", approved_direction_ids=["a"]),
         )
         self.write(
             "implementation.json",
@@ -652,7 +901,7 @@ class ValidateRunTests(unittest.TestCase):
     def test_implementation_non_dict_checks_returns_an_error(self):
         self.write(
             "run.json",
-            {"selected_direction_id": "a", "approved_direction_ids": ["a"]},
+            run_manifest(state="implementation_selected", selected_direction_id="a", approved_direction_ids=["a"]),
         )
         self.write(
             "implementation.json",
@@ -674,7 +923,7 @@ class ValidateRunTests(unittest.TestCase):
     def test_implementation_rendered_viewports_are_non_empty_strings(self):
         self.write(
             "run.json",
-            {"selected_direction_id": "a", "approved_direction_ids": ["a"]},
+            run_manifest(state="implementation_selected", selected_direction_id="a", approved_direction_ids=["a"]),
         )
         self.write(
             "implementation.json",

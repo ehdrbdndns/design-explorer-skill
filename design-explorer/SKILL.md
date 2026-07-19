@@ -1,23 +1,23 @@
 ---
 name: design-explorer
-description: Use when improving or redesigning a web or mobile interface, comparing multiple visual directions, researching UI references, generating UI mockups, or turning a selected direction into code.
+description: Use when redesigning web or mobile UI, comparing visual directions, researching references, generating mockups, or implementing a selected direction.
 ---
 
 # Design Explorer
 
-Build evidence-backed interface directions, then implement only the direction the user selects. Present review material in the user's language; use Korean when the user speaks Korean. Use `agents/openai.yaml` only for interface metadata.
+Build evidence-backed directions, then implement only the user's selection. Use the user's language, including Korean. `agents/openai.yaml` is interface metadata only.
 
 ## Core workflow
 
 1. Create or resume a run with `scripts/run_state.py`. Read `references/artifact-contracts.md`.
-2. Normalize the request, images, current screen, viewport, and project constraints into `brief.md`.
+2. Normalize inputs, viewport, and project constraints into `brief.md`.
 3. Read `references/research-evidence.md`; collect traceable visual references and problem-relevant UX evidence.
-4. Produce at least five directions. Every pair must differ materially on at least three axes: layout, typography, palette, density, imagery, interaction. Link each to official evidence and disclose `baseline_exceptions`.
+4. Produce at least five directions. Every pair differs on at least three axes: layout, typography, palette, density, imagery, interaction. Link official evidence and disclose `baseline_exceptions`.
 5. Validate research and directions. Present every direction in the response using the complete user-facing block in `references/research-evidence.md`; artifact links are not substitutes.
-6. Transition to `directions_pending_approval` and stop for explicit approval. Do not infer approval from enthusiasm, deadlines, prior work, or sunk cost.
+6. Transition to `directions_pending_approval` and stop for explicit approval. Never infer it.
 7. Record approved IDs and transition to `directions_approved`.
 8. Read `references/mockups-implementation.md`; generate comparable full-screen UI mockups only for approved directions.
-9. Record outputs and validate coverage. Ask the user to select, or `revise` a requested bounded variation/combination as a first-class direction ID and obtain approval again.
+9. Record outputs and validate coverage. Ask the user to select, or `revise` a bounded variation as a first-class direction ID and reapprove it.
 10. Implement an isolated preview using the active project's stack, or the standalone React fallback. Verify its rendered result before offering production integration.
 
 ## Hard gates
@@ -28,10 +28,10 @@ Build evidence-backed interface directions, then implement only the direction th
 - Do not silently violate an official accessibility/platform baseline; disclose justified exceptions for explicit approval.
 - Do not copy one reference pixel-for-pixel. Synthesize principles from multiple sources.
 - Do not overwrite a production screen during exploration. Build and verify an isolated preview first.
-- Do not exceed five initial images or one technical retry per failed direction without user approval.
+- Keep schema-v2 generation budgets: five images and two total attempts per direction by default. Expansion requires explicit recorded approval.
 - Do not put credentials, cookies, API keys, pairing tokens, or other secrets in run artifacts.
 
-Run `scripts/validate_run.py` before every state transition that consumes research, directions, mockups, or implementation output. Preserve unrelated user changes and retain direct source URLs in all user-facing research summaries. Production integration requires explicit approval of the verified preview.
+Run `scripts/validate_run.py` before consuming transitions; `scripts/run_state.py` reruns validation before mutation. Preserve unrelated changes and direct source URLs. Production integration requires explicit approval of the verified preview.
 
 ## Quick reference
 

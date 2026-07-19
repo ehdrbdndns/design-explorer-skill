@@ -4,7 +4,7 @@ Use this contract when creating, resuming, validating, or transitioning a design
 
 ## Run directory and states
 
-The default run directory is `~/.codex/design-explorer/runs/<run-id>/`. Keep each exploration isolated in one run directory. `run.json` records the schema version, run ID, slug, timestamps, project path, current state, approved direction IDs, selected direction ID, `revision_count`, the latest revision reason/time when present, and—after approved production integration—the integration approval timestamp.
+The default run directory is `~/.codex/design-explorer/runs/<run-id>/`. Keep each exploration isolated in one run directory. New manifests use schema version 2. `run.json` records the run ID, slug, timestamps, project path, current state, approved/selected direction IDs, `revision_count`, `generation_budget` (default 5), `max_attempts_per_direction` (default 2), approval timestamps, and revision audit fields. Unsupported schemas must be migrated or reinitialized; do not edit a version number to simulate migration.
 
 Follow this primary state sequence without skipping steps:
 
@@ -37,6 +37,16 @@ python3 scripts/run_state.py transition --run <run-dir> --to directions_approved
 
 Repeat `--approved-direction <id>` for every explicitly approved direction. After image output is recorded, execute the remaining steps in this order:
 
+The approval count cannot exceed `generation_budget`. A user-approved expansion is explicit and auditable:
+
+```bash
+python3 scripts/run_state.py transition --run <run-dir> --to directions_approved \
+  --approved-direction <id> --generation-budget <n> \
+  --max-attempts-per-direction <n> --approve-budget-expansion
+```
+
+Omit expansion flags for the default five-image/two-attempt limits. Every consuming transition invokes the relevant validator itself, including approval after review, selection after mockup generation, and integration after preview review. A validation failure leaves `run.json` unchanged; manual validator commands are useful diagnostics, not a substitute for the transition gate.
+
 ```bash
 python3 scripts/validate_run.py --run <run-dir> --phase mockups
 python3 scripts/run_state.py transition --run <run-dir> --to mockups_generated
@@ -64,7 +74,7 @@ When the user requests a bounded variation or combination instead of selecting, 
 python3 scripts/run_state.py revise --run <run-dir> --reason "<user-request>"
 ```
 
-`revise` requires a non-empty reason. It archives `mockup-manifest.json` as `mockup-manifest.revision-<n>.json`, increments `revision_count`, records `last_revision_reason` and `last_revision_at`, clears approved/selected IDs, and returns to `directions_pending_approval`. Append the derived direction, validate and present it, obtain explicit approval again, and then create a new manifest containing only newly approved IDs.
+`revise` requires a non-empty reason. It archives `mockup-manifest.json` as `mockup-manifest.revision-<n>.json`, increments `revision_count`, records `last_revision_reason` and `last_revision_at`, clears approved/selected IDs, resets the generation/attempt budgets to defaults, clears the expansion timestamp, and returns to `directions_pending_approval`. Append the derived direction, validate and present it, obtain explicit approval again, and then create a new manifest containing only newly approved IDs.
 
 ## Structured artifacts
 
@@ -84,7 +94,7 @@ Record the screen purpose, required content, target viewport, preservation const
 - `relevance`
 - `observations`, containing non-empty `layout`, `typography`, `palette`, `density`, `imagery`, and `interaction`
 
-`capture_path` is optional. Store only a sanitized local capture, never session data or credentials.
+`capture_path` is optional and must be a safe relative artifact path with no absolute path, traversal, backslash escape, URL, or credentials. Store only a sanitized local capture, never session data or credentials. Source URLs must be public HTTP(S): no URL userinfo, localhost, `.local`, or literal non-public IP hosts.
 
 `evidence.json` is a JSON array. Every evidence item requires:
 
@@ -123,7 +133,7 @@ Every direction must link at least one `official` evidence item. Official access
 
 - A `primary` direction omits `derived_from_ids` and `combined_properties`.
 - A `derived` direction is appended after its sources. It requires a non-empty, unique `derived_from_ids` list of non-empty strings referring only to previously declared direction IDs. This ordering makes self-reference, forward-reference, dangling-reference, and cycles invalid.
-- A `derived` direction also requires a non-empty `combined_properties` object. Keys are limited to the six design axes (`layout`, `typography`, `palette`, `density`, `imagery`, `interaction`); every value is one of that direction's `derived_from_ids`.
+- A `derived` direction also requires a non-empty `combined_properties` object. Keys are limited to the six design axes (`layout`, `typography`, `palette`, `density`, `imagery`, `interaction`); every value is one of that direction's prior `derived_from_ids`. After trimming and case-folding, the derived axis value must equal that named source's same axis value. Every source ID must contribute at least one mapped axis.
 
 Never repurpose a primary direction ID. Append every revised variation or combination as a new first-class `derived` direction after its sources.
 
@@ -138,8 +148,9 @@ Never repurpose a primary direction ID. Append every revised variation or combin
 - `viewport`
 - `prompt_digest`
 - `output_ref`
+- positive integer `attempt_count`
 
-Every approved direction needs one successful entry before `mockups_generated`. Pending or failed entries retain the direction ID, status, viewport, prompt digest, attempt count, and failure detail when available.
+The list cannot exceed `generation_budget`. It contains exactly one current entry per approved direction, no unapproved or duplicate IDs, and only `pending`, `success`, or `failed` status. Every attempt count is at most the authorized `max_attempts_per_direction`. Every approved direction needs one successful entry before `mockups_generated`. `output_ref`, when present, is a safe relative path or conservative provider artifact hint without userinfo or secrets. Pending or failed entries retain the direction ID, status, viewport, prompt digest, attempt count, and failure detail when available.
 
 ### Implementation artifact
 
@@ -154,4 +165,4 @@ Validate this file before `prototype_ready`. The isolated preview remains separa
 
 ## Confidentiality
 
-Credentials, cookies, API keys, and pairing tokens never belong in run artifacts. Do not copy browser storage, authorization headers, environment secrets, or raw sensitive screenshots into the run directory. Redact or omit sensitive material and record only the safe design observation needed for the exploration.
+Credentials, cookies, API keys, and pairing tokens never belong in run artifacts. Validation recursively rejects secret-like JSON keys and high-confidence credential values in research, direction, mockup, and implementation artifacts. Normal prose discussing password UX is allowed. Do not copy browser storage, authorization headers, environment secrets, or raw sensitive screenshots into the run directory. Redact or omit sensitive material and record only the safe design observation needed for the exploration.
