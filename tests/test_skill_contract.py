@@ -170,9 +170,23 @@ class SkillContractTests(unittest.TestCase):
             "--production-path src/App.tsx",
         ):
             self.assertIn(flag, contracts)
-        self.assertIn("can-generate --run <run-dir>", contracts)
-        self.assertIn("can-generate --run <run-dir>", mockups)
-        self.assertIn("immediately before every image provider call", mockups)
+        command = "can-generate --run <run-dir> --direction <id>"
+        authorize = "authorize-generation --run <run-dir> --direction <id>"
+        self.assertIn(command, contracts)
+        self.assertIn(command, mockups)
+        self.assertIn(authorize, contracts)
+        self.assertIn(authorize, mockups)
+        for phrase in (
+            "attempt_count: 0",
+            "prompt_ref",
+            "one shared target viewport",
+            "output_kind",
+            "provider:<lowercase-provider>:<safe-artifact-id>",
+            "provider artifact existence is the host's responsibility",
+            "do not call the provider without a successful reservation",
+            "cumulatively",
+        ):
+            self.assertIn(phrase.lower(), (skill + contracts + mockups).lower())
         self.assertIn("screenshot_ref", mockups)
         self.assertIn("viewport_checks", mockups)
         self.assertIn("stored inside the run directory", mockups)

@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import sys
 import uuid
@@ -43,20 +44,16 @@ REQUIRED_FILES = {
     "prototype_ready": ("implementation.json",),
     "integrated": ("implementation.json",),
 }
-VALIDATION_PHASES = {
-    "research_complete": "research",
-    "directions_pending_approval": "directions",
-    "directions_approved": "directions",
-    "mockups_generated": "mockups",
-    "implementation_selected": "mockups",
-    "prototype_ready": "implementation",
-    "integrated": "implementation",
-}
-NONBLANK_FILES = {
-    "brief_ready": ("brief.md",),
-    "research_complete": ("design-evidence.md", "reference-board.md"),
-    "directions_pending_approval": ("mood-directions.md",),
-    "directions_approved": ("mood-directions.md",),
+STATE_VALIDATION_PHASES = {
+    "initialized": (),
+    "brief_ready": (),
+    "research_complete": ("research",),
+    "directions_pending_approval": ("research", "directions"),
+    "directions_approved": ("research", "directions"),
+    "mockups_generated": ("research", "directions", "mockups"),
+    "implementation_selected": ("research", "directions", "mockups"),
+    "prototype_ready": ("research", "directions", "mockups", "implementation"),
+    "integrated": ("research", "directions", "mockups", "implementation"),
 }
 _VALIDATOR = None
 
@@ -196,6 +193,9 @@ def init_run(
         "required_content": normalized_content,
         "required_interactions": normalized_interactions,
         "production_paths": normalized_production_paths,
+        "generation_attempts_used": 0,
+        "last_generation_authorized_at": None,
+        "last_generation_authorized_direction_id": None,
     }
     validate_run_manifest(manifest)
     run_dir = Path(root).expanduser() / identifier
@@ -244,6 +244,9 @@ def validate_run_manifest(manifest: object) -> None:
         "required_content",
         "required_interactions",
         "production_paths",
+        "generation_attempts_used",
+        "last_generation_authorized_at",
+        "last_generation_authorized_direction_id",
     )
     for key in required:
         if key not in manifest:
@@ -290,6 +293,53 @@ def validate_run_manifest(manifest: object) -> None:
     for key in ("generation_budget", "max_attempts_per_direction"):
         if not _positive_integer(manifest[key]):
             raise ValueError(f"invalid run.json: {key} must be a positive integer")
+    attempts_used = manifest["generation_attempts_used"]
+    if (
+        not isinstance(attempts_used, int)
+        or isinstance(attempts_used, bool)
+        or attempts_used < 0
+    ):
+        raise ValueError(
+            "invalid run.json: generation_attempts_used must be a non-negative integer"
+        )
+    authorized_at = manifest["last_generation_authorized_at"]
+    authorized_direction = manifest["last_generation_authorized_direction_id"]
+    if (authorized_at is None) != (authorized_direction is None):
+        raise ValueError(
+            "invalid run.json: generation authorization audit fields must both be null or populated"
+        )
+    if authorized_at is not None:
+        if not valid_rfc3339(authorized_at):
+            raise ValueError(
+                "invalid run.json: last_generation_authorized_at must be RFC3339"
+            )
+        if not isinstance(authorized_direction, str) or not authorized_direction.strip():
+            raise ValueError(
+                "invalid run.json: last_generation_authorized_direction_id must be nonblank"
+            )
+    if (attempts_used == 0) != (authorized_at is None):
+        raise ValueError(
+            "invalid run.json: generation attempt use and audit fields must agree"
+        )
+    if attempts_used and manifest["state"] in {
+        "initialized",
+        "brief_ready",
+        "research_complete",
+        "directions_pending_approval",
+    }:
+        raise ValueError(
+            "invalid run.json: generation attempts require approved directions"
+        )
+    if attempts_used:
+        if authorized_direction not in approved:
+            raise ValueError(
+                "invalid run.json: last generation authorization must name an approved direction"
+            )
+        authorization_ceiling = len(approved) * manifest["max_attempts_per_direction"]
+        if attempts_used > authorization_ceiling:
+            raise ValueError(
+                "invalid run.json: generation attempts exceed authorization ceiling"
+            )
     normalized_viewports = _normalize_viewports(manifest["target_viewports"])
     if normalized_viewports != manifest["target_viewports"]:
         raise ValueError("invalid run.json: target_viewports must be normalized and unique")
@@ -343,6 +393,15 @@ def validate_run_manifest(manifest: object) -> None:
 
 
 def validate_state_artifacts(run_dir: Path, manifest: dict) -> None:
+    state = manifest["state"]
+    if state == "brief_ready":
+        _validate_brief(run_dir, manifest)
+    phases = STATE_VALIDATION_PHASES[state]
+    for phase in phases:
+        _validate_phases(run_dir, (phase,))
+        if phase == "directions":
+            _validate_approved_directions(run_dir, manifest)
+def _validate_approved_directions(run_dir: Path, manifest: dict) -> None:
     if STATES.index(manifest["state"]) < STATES.index("directions_approved"):
         return
     approved = manifest["approved_direction_ids"]
@@ -388,43 +447,68 @@ def _validator_module():
     return module
 
 
-def _validate_target(run_dir: Path, target: str) -> None:
-    _require_files(run_dir, target)
-    if target == "brief_ready":
-        manifest = load_run(run_dir)
-        if not manifest["target_viewports"]:
-            raise ValueError("brief validation failed: target_viewports must not be empty")
-        if not manifest["required_content"]:
-            raise ValueError("brief validation failed: required_content must not be empty")
-        if not manifest["required_interactions"]:
-            brief = (run_dir / "brief.md").read_text(encoding="utf-8")
-            if not re.search(
-                r"(?im)^interactive requirements\s*:\s*none\s*$", brief
-            ):
-                raise ValueError(
-                    "brief validation failed: empty required_interactions requires "
-                    "explicit interactive requirements: none"
-                )
-    for name in NONBLANK_FILES.get(target, ()):
-        try:
-            value = (run_dir / name).read_text(encoding="utf-8")
-        except OSError as error:
-            raise ValueError(f"{target} validation failed: {error}") from None
-        if not value.strip():
-            phase = "brief" if target == "brief_ready" else target
-            raise ValueError(f"{phase} validation failed: {name} must be nonblank")
-        secret_errors = _validator_module().find_secret_errors(value, name)
-        if secret_errors:
-            phase = "brief" if target == "brief_ready" else target
-            raise ValueError(f"{phase} validation failed: {secret_errors[0]}")
-    phase = VALIDATION_PHASES.get(target)
-    if phase is not None:
+def _validate_brief(run_dir: Path, manifest: dict) -> None:
+    _require_files(run_dir, "brief_ready")
+    if not manifest["target_viewports"]:
+        raise ValueError("brief validation failed: target_viewports must not be empty")
+    if not manifest["required_content"]:
+        raise ValueError("brief validation failed: required_content must not be empty")
+    try:
+        brief = (run_dir / "brief.md").read_text(encoding="utf-8")
+    except OSError as error:
+        raise ValueError(f"brief validation failed: {error}") from None
+    if not brief.strip():
+        raise ValueError("brief validation failed: brief.md must be nonblank")
+    secret_errors = _validator_module().find_secret_errors(brief, "brief.md")
+    if secret_errors:
+        raise ValueError(f"brief validation failed: {secret_errors[0]}")
+    if not manifest["required_interactions"] and not re.search(
+        r"(?im)^interactive requirements\s*:\s*none\s*$", brief
+    ):
+        raise ValueError(
+            "brief validation failed: empty required_interactions requires "
+            "explicit interactive requirements: none"
+        )
+
+
+def _validate_phases(run_dir: Path, phases: tuple[str, ...]) -> None:
+    phase_files = {
+        "research": REQUIRED_FILES["research_complete"],
+        "directions": REQUIRED_FILES["directions_pending_approval"],
+        "mockups": REQUIRED_FILES["mockups_generated"],
+        "implementation": REQUIRED_FILES["prototype_ready"],
+    }
+    phase_nonblank = {
+        "research": ("design-evidence.md", "reference-board.md"),
+        "directions": ("mood-directions.md",),
+    }
+    for phase in phases:
+        missing = [name for name in phase_files[phase] if not (run_dir / name).is_file()]
+        if missing:
+            raise ValueError(f"{phase} validation failed: missing {', '.join(missing)}")
+        for name in phase_nonblank.get(phase, ()):
+            try:
+                value = (run_dir / name).read_text(encoding="utf-8")
+            except OSError as error:
+                raise ValueError(f"{phase} validation failed: {error}") from None
+            if not value.strip():
+                raise ValueError(f"{phase} validation failed: {name} must be nonblank")
+            secret_errors = _validator_module().find_secret_errors(value, name)
+            if secret_errors:
+                raise ValueError(f"{phase} validation failed: {secret_errors[0]}")
         errors = _validator_module().validate_phase(run_dir, phase)
         if errors:
             summary = "; ".join(errors[:5])
             if len(errors) > 5:
                 summary += f"; plus {len(errors) - 5} more"
             raise ValueError(f"{phase} validation failed: {summary}")
+
+
+def _validate_target(run_dir: Path, target: str, manifest: dict) -> None:
+    if target == "brief_ready":
+        _validate_brief(run_dir, manifest)
+    else:
+        _validate_phases(run_dir, STATE_VALIDATION_PHASES[target])
 
 
 def transition_run(
@@ -443,7 +527,7 @@ def transition_run(
     current = manifest["state"]
     if NEXT_STATE.get(current) != target:
         raise ValueError(f"illegal transition: {current} -> {target}")
-    _validate_target(run_dir, target)
+    _validate_target(run_dir, target, manifest)
     timestamp = now or utc_now()
     if not valid_rfc3339(timestamp):
         raise ValueError("transition timestamp must be RFC3339")
@@ -505,6 +589,9 @@ def transition_run(
         manifest["approved_direction_ids"] = list(approved_direction_ids)
         manifest["generation_budget"] = effective_budget
         manifest["max_attempts_per_direction"] = effective_attempts
+        manifest["generation_attempts_used"] = 0
+        manifest["last_generation_authorized_at"] = None
+        manifest["last_generation_authorized_direction_id"] = None
         if expanded:
             manifest["budget_expansion_approved_at"] = timestamp
         else:
@@ -534,7 +621,7 @@ def revise_run(
     current = manifest["state"]
     if current != "mockups_generated":
         raise ValueError(f"illegal revision from {current}")
-    _validate_target(run_dir, "mockups_generated")
+    _validate_target(run_dir, "mockups_generated", manifest)
 
     revision_count = manifest.get("revision_count", 0)
     if (
@@ -560,11 +647,17 @@ def revise_run(
     manifest["selected_direction_id"] = None
     manifest["generation_budget"] = DEFAULT_GENERATION_BUDGET
     manifest["max_attempts_per_direction"] = DEFAULT_MAX_ATTEMPTS_PER_DIRECTION
+    manifest["generation_attempts_used"] = 0
+    manifest["last_generation_authorized_at"] = None
+    manifest["last_generation_authorized_direction_id"] = None
     manifest.pop("budget_expansion_approved_at", None)
     manifest["updated_at"] = timestamp
     validate_run_manifest(manifest)
     manifest_path.replace(archive_path)
     try:
+        _validate_phases(
+            run_dir, STATE_VALIDATION_PHASES["directions_pending_approval"]
+        )
         write_json_atomic(run_dir / "run.json", manifest)
     except Exception:
         archive_path.replace(manifest_path)
@@ -572,16 +665,146 @@ def revise_run(
     return manifest
 
 
-def image_generation_allowed(run_dir: Path) -> bool:
+def _read_mockup_manifest(run_dir: Path) -> dict:
+    try:
+        value = json.loads((run_dir / "mockup-manifest.json").read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise ValueError(f"invalid mockup-manifest.json: {error}") from None
+    if not isinstance(value, dict) or not isinstance(value.get("mockups"), list):
+        raise ValueError("invalid mockup-manifest.json: mockups must be a list")
+    return value
+
+
+def _generation_preflight(run_dir: Path, direction_id: str) -> tuple[dict, dict, dict]:
+    if not isinstance(direction_id, str) or not direction_id.strip():
+        raise ValueError("generation requires a non-empty direction_id")
+    manifest = load_run(run_dir)
+    if manifest["state"] != "directions_approved":
+        raise ValueError("generation requires state directions_approved")
+    if direction_id not in manifest["approved_direction_ids"]:
+        raise ValueError("generation direction must be explicitly approved")
+    errors = _validator_module().validate_mockup_manifest_for_generation(run_dir)
+    if errors:
+        raise ValueError(f"generation manifest validation failed: {'; '.join(errors[:5])}")
+    mockup_manifest = _read_mockup_manifest(run_dir)
+    entry = next(
+        item
+        for item in mockup_manifest["mockups"]
+        if item.get("direction_id") == direction_id
+    )
+    status = entry["status"]
+    attempt_count = entry["attempt_count"]
+    if status == "success":
+        raise ValueError("generation is already successful for this direction")
+    if status == "pending" and attempt_count != 0:
+        raise ValueError("generation already has an active reserved attempt")
+    if status == "failed" and attempt_count >= manifest["max_attempts_per_direction"]:
+        raise ValueError("generation attempt limit exhausted for this direction")
+    if status not in {"pending", "failed"}:
+        raise ValueError("generation status is not reservable")
+    total_ceiling = (
+        len(manifest["approved_direction_ids"])
+        * manifest["max_attempts_per_direction"]
+    )
+    if manifest["generation_attempts_used"] >= total_ceiling:
+        raise ValueError("generation total attempt authorization ceiling exhausted")
+    return manifest, mockup_manifest, entry
+
+
+def image_generation_allowed(run_dir: Path, direction_id: str) -> bool:
     try:
         run_dir = Path(run_dir)
-        manifest = load_run(run_dir)
-        if manifest["state"] != "directions_approved":
+        if (run_dir / ".generation.lock").exists():
             return False
-        _validate_target(run_dir, "directions_approved")
+        _generation_preflight(run_dir, direction_id)
         return True
     except (ValueError, json.JSONDecodeError, OSError, TypeError):
         return False
+
+
+def _replace_path(source: Path, destination: Path) -> None:
+    os.replace(source, destination)
+
+
+def _write_two_json_atomic(
+    first_path: Path,
+    first_value: dict,
+    second_path: Path,
+    second_value: dict,
+) -> None:
+    original_first = first_path.read_bytes()
+    original_second = second_path.read_bytes()
+    suffix = f".tmp-{uuid.uuid4().hex}"
+    first_temp = first_path.with_name(first_path.name + suffix)
+    second_temp = second_path.with_name(second_path.name + suffix)
+    first_temp.write_text(json.dumps(first_value, indent=2) + "\n", encoding="utf-8")
+    second_temp.write_text(json.dumps(second_value, indent=2) + "\n", encoding="utf-8")
+    first_replaced = False
+    second_replaced = False
+    try:
+        _replace_path(first_temp, first_path)
+        first_replaced = True
+        _replace_path(second_temp, second_path)
+        second_replaced = True
+    except Exception:
+        restore_suffix = f".rollback-{uuid.uuid4().hex}"
+        if first_replaced:
+            restore_first = first_path.with_name(first_path.name + restore_suffix)
+            restore_first.write_bytes(original_first)
+            _replace_path(restore_first, first_path)
+        if second_replaced:
+            restore_second = second_path.with_name(second_path.name + restore_suffix)
+            restore_second.write_bytes(original_second)
+            _replace_path(restore_second, second_path)
+        raise
+    finally:
+        for temporary in (first_temp, second_temp):
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def authorize_generation(
+    run_dir: Path, direction_id: str, now: str | None = None
+) -> dict:
+    run_dir = Path(run_dir)
+    lock_path = run_dir / ".generation.lock"
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise ValueError("generation authorization is already in progress") from None
+    try:
+        os.close(descriptor)
+        manifest, mockup_manifest, entry = _generation_preflight(
+            run_dir, direction_id
+        )
+        timestamp = now or utc_now()
+        if not valid_rfc3339(timestamp):
+            raise ValueError("generation authorization timestamp must be RFC3339")
+        entry["attempt_count"] += 1
+        entry["status"] = "pending"
+        for key in ("failure", "output_kind", "output_ref"):
+            entry.pop(key, None)
+        manifest["generation_attempts_used"] += 1
+        manifest["last_generation_authorized_at"] = timestamp
+        manifest["last_generation_authorized_direction_id"] = direction_id
+        manifest["updated_at"] = timestamp
+        validate_run_manifest(manifest)
+        run_path = run_dir / "run.json"
+        mockup_path = run_dir / "mockup-manifest.json"
+        _write_two_json_atomic(run_path, manifest, mockup_path, mockup_manifest)
+        return {
+            "direction_id": direction_id,
+            "attempt_count": entry["attempt_count"],
+            "generation_attempts_used": manifest["generation_attempts_used"],
+            "authorized_at": timestamp,
+        }
+    finally:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def main() -> int:
@@ -611,6 +834,10 @@ def main() -> int:
     status_parser.add_argument("--run", required=True)
     generation_parser = subparsers.add_parser("can-generate")
     generation_parser.add_argument("--run", required=True)
+    generation_parser.add_argument("--direction")
+    authorization_parser = subparsers.add_parser("authorize-generation")
+    authorization_parser.add_argument("--run", required=True)
+    authorization_parser.add_argument("--direction")
     args = parser.parse_args()
 
     try:
@@ -641,9 +868,12 @@ def main() -> int:
             manifest = revise_run(Path(args.run), args.reason)
             print(json.dumps(manifest, indent=2))
         elif args.command == "can-generate":
-            allowed = image_generation_allowed(Path(args.run))
+            allowed = image_generation_allowed(Path(args.run), args.direction)
             print("true" if allowed else "false")
             return 0 if allowed else 1
+        elif args.command == "authorize-generation":
+            reservation = authorize_generation(Path(args.run), args.direction)
+            print(json.dumps(reservation, indent=2))
         else:
             print(json.dumps(load_run(Path(args.run)), indent=2))
     except (ValueError, json.JSONDecodeError, OSError) as error:

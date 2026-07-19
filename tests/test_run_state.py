@@ -1,4 +1,5 @@
 import inspect
+import hashlib
 import json
 import subprocess
 import sys
@@ -15,9 +16,6 @@ run_state = load_script_module("run_state", "design-explorer/scripts/run_state.p
 
 
 AXES = ("layout", "typography", "palette", "density", "imagery", "interaction")
-DIGEST = "sha256:" + "a" * 64
-
-
 def reference():
     return {
         "id": "ref-1",
@@ -202,23 +200,45 @@ class RunStateTests(unittest.TestCase):
         return values
 
     def _mockup(self, identifier):
+        prompt = self.run_dir / "prompts" / f"{identifier}.txt"
+        prompt.parent.mkdir(exist_ok=True)
+        prompt.write_text(f"prompt for {identifier}\n", encoding="utf-8")
+        output = self.run_dir / "mockups" / f"{identifier}.png"
+        write_png(output, 390, 844)
         return {
             "direction_id": identifier,
             "status": "success",
             "viewport": "390x844",
-            "prompt_digest": DIGEST,
+            "prompt_ref": prompt.relative_to(self.run_dir).as_posix(),
+            "prompt_digest": "sha256:" + hashlib.sha256(prompt.read_bytes()).hexdigest(),
+            "output_kind": "local",
             "output_ref": f"mockups/{identifier}.png",
             "attempt_count": 1,
         }
 
-    def write_mockups(self, identifiers, attempt_count=1):
+    def write_mockups(self, identifiers, attempt_count=1, status="success"):
         values = [self._mockup(identifier) for identifier in identifiers]
         for value in values:
             value["attempt_count"] = attempt_count
+            value["status"] = status
+            if status != "success":
+                value.pop("output_kind", None)
+                value.pop("output_ref", None)
         self.write(
             "mockup-manifest.json",
             {"mockups": values},
         )
+        manifest = json.loads((self.run_dir / "run.json").read_text())
+        manifest["generation_attempts_used"] = sum(
+            value["attempt_count"] for value in values
+        )
+        if manifest["generation_attempts_used"]:
+            manifest["last_generation_authorized_at"] = "2026-07-19T12:00:00Z"
+            manifest["last_generation_authorized_direction_id"] = identifiers[-1]
+        else:
+            manifest["last_generation_authorized_at"] = None
+            manifest["last_generation_authorized_direction_id"] = None
+        self.write("run.json", manifest)
 
     def advance_to_pending(self, direction_count=5):
         self.write_brief()
@@ -249,6 +269,9 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(manifest["generation_budget"], 5)
         self.assertEqual(manifest["max_attempts_per_direction"], 2)
+        self.assertEqual(manifest["generation_attempts_used"], 0)
+        self.assertIsNone(manifest["last_generation_authorized_at"])
+        self.assertIsNone(manifest["last_generation_authorized_direction_id"])
         self.assertEqual(manifest["target_viewports"], ["390x844"])
         self.assertEqual(manifest["required_content"], ["Order summary"])
         self.assertEqual(manifest["required_interactions"], ["Edit order"])
@@ -335,7 +358,7 @@ class RunStateTests(unittest.TestCase):
                 self.write("run.json", tampered)
                 with self.assertRaisesRegex(ValueError, key):
                     run_state.load_run(self.run_dir)
-                self.assertFalse(run_state.image_generation_allowed(self.run_dir))
+                self.assertFalse(run_state.image_generation_allowed(self.run_dir, "d-0"))
 
     def test_brief_gate_requires_machine_readable_targets(self):
         run_dir = run_state.init_run(
@@ -370,24 +393,25 @@ class RunStateTests(unittest.TestCase):
         )
 
     def test_generation_authorization_fails_closed_and_tracks_exact_state(self):
-        self.assertFalse(run_state.image_generation_allowed(self.run_dir))
+        self.assertFalse(run_state.image_generation_allowed(self.run_dir, "d-0"))
         self.advance_to_pending()
-        self.assertFalse(run_state.image_generation_allowed(self.run_dir))
+        self.assertFalse(run_state.image_generation_allowed(self.run_dir, "d-0"))
         run_state.transition_run(
             self.run_dir, "directions_approved", approved_direction_ids=["d-0"]
         )
-        self.assertTrue(run_state.image_generation_allowed(self.run_dir))
+        self.write_mockups(["d-0"], attempt_count=0, status="pending")
+        self.assertTrue(run_state.image_generation_allowed(self.run_dir, "d-0"))
         self.write_mockups(["d-0"])
         run_state.transition_run(self.run_dir, "mockups_generated")
-        self.assertFalse(run_state.image_generation_allowed(self.run_dir))
+        self.assertFalse(run_state.image_generation_allowed(self.run_dir, "d-0"))
 
         (self.run_dir / "run.json").write_text("{tampered", encoding="utf-8")
-        self.assertFalse(run_state.image_generation_allowed(self.run_dir))
+        self.assertFalse(run_state.image_generation_allowed(self.run_dir, "d-0"))
 
     def test_can_generate_cli_returns_boolean_and_status_without_traceback(self):
         for expected, returncode in (("false", 1),):
             result = subprocess.run(
-                [sys.executable, run_state.__file__, "can-generate", "--run", str(self.run_dir)],
+                [sys.executable, run_state.__file__, "can-generate", "--run", str(self.run_dir), "--direction", "d-0"],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -400,8 +424,9 @@ class RunStateTests(unittest.TestCase):
         run_state.transition_run(
             self.run_dir, "directions_approved", approved_direction_ids=["d-0"]
         )
+        self.write_mockups(["d-0"], attempt_count=0, status="pending")
         result = subprocess.run(
-            [sys.executable, run_state.__file__, "can-generate", "--run", str(self.run_dir)],
+            [sys.executable, run_state.__file__, "can-generate", "--run", str(self.run_dir), "--direction", "d-0"],
             capture_output=True,
             text=True,
             check=False,
@@ -411,7 +436,7 @@ class RunStateTests(unittest.TestCase):
 
         (self.run_dir / "run.json").write_text("{tampered", encoding="utf-8")
         result = subprocess.run(
-            [sys.executable, run_state.__file__, "can-generate", "--run", str(self.run_dir)],
+            [sys.executable, run_state.__file__, "can-generate", "--run", str(self.run_dir), "--direction", "d-0"],
             capture_output=True,
             text=True,
             check=False,
@@ -478,7 +503,13 @@ class RunStateTests(unittest.TestCase):
 
         generation_signature = inspect.signature(run_state.image_generation_allowed)
         self.assertEqual(generation_signature.parameters["run_dir"].annotation, Path)
+        self.assertEqual(generation_signature.parameters["direction_id"].annotation, str)
         self.assertEqual(generation_signature.return_annotation, bool)
+        authorization_signature = inspect.signature(run_state.authorize_generation)
+        self.assertEqual(authorization_signature.parameters["run_dir"].annotation, Path)
+        self.assertEqual(authorization_signature.parameters["direction_id"].annotation, str)
+        self.assertEqual(authorization_signature.parameters["now"].annotation, str | None)
+        self.assertEqual(authorization_signature.return_annotation, dict)
 
     def test_init_rejects_absolute_run_id(self):
         absolute_run_id = str(self.root / "absolute-run")
@@ -526,7 +557,8 @@ class RunStateTests(unittest.TestCase):
 
     def test_integration_requires_explicit_approval_and_records_it(self):
         self.set_state("prototype_ready")
-        manifest = run_state.load_run(self.run_dir)
+        self.write_mockups(["d-0"])
+        manifest = json.loads((self.run_dir / "run.json").read_text())
         manifest["approved_direction_ids"] = ["d-0"]
         manifest["selected_direction_id"] = "d-0"
         self.write("run.json", manifest)
@@ -546,6 +578,9 @@ class RunStateTests(unittest.TestCase):
     def test_revision_archives_mockups_and_returns_to_pending_approval(self):
         self.set_state("mockups_generated")
         self.write_mockups(["d-0"])
+        archived_expected = json.loads(
+            (self.run_dir / "mockup-manifest.json").read_text()
+        )
         manifest = run_state.load_run(self.run_dir)
         manifest["approved_direction_ids"] = ["d-0"]
         manifest["selected_direction_id"] = "d-0"
@@ -571,6 +606,9 @@ class RunStateTests(unittest.TestCase):
         self.assertIsNone(revised["selected_direction_id"])
         self.assertEqual(revised["generation_budget"], 5)
         self.assertEqual(revised["max_attempts_per_direction"], 2)
+        self.assertEqual(revised["generation_attempts_used"], 0)
+        self.assertIsNone(revised["last_generation_authorized_at"])
+        self.assertIsNone(revised["last_generation_authorized_direction_id"])
         self.assertNotIn("budget_expansion_approved_at", revised)
         self.assertFalse((self.run_dir / "mockup-manifest.json").exists())
         self.assertTrue(
@@ -580,18 +618,7 @@ class RunStateTests(unittest.TestCase):
             json.loads(
                 (self.run_dir / "mockup-manifest.revision-1.json").read_text()
             ),
-            {
-                "mockups": [
-                    {
-                        "direction_id": "d-0",
-                        "status": "success",
-                        "viewport": "390x844",
-                        "prompt_digest": DIGEST,
-                        "output_ref": "mockups/d-0.png",
-                        "attempt_count": 1,
-                    }
-                ]
-            },
+            archived_expected,
         )
 
     def test_revision_rejects_empty_reason_and_illegal_state(self):
@@ -606,9 +633,9 @@ class RunStateTests(unittest.TestCase):
 
     def test_revision_preserves_current_manifest_on_archive_collision(self):
         self.set_state("mockups_generated")
-        current = {"mockups": [self._mockup("d-0")]}
+        self.write_mockups(["d-0"])
+        current = json.loads((self.run_dir / "mockup-manifest.json").read_text())
         archived = {"mockups": [{"direction_id": "archived"}]}
-        self.write("mockup-manifest.json", current)
         self.write("mockup-manifest.revision-1.json", archived)
         manifest = run_state.load_run(self.run_dir)
         manifest["approved_direction_ids"] = ["d-0"]
@@ -627,12 +654,15 @@ class RunStateTests(unittest.TestCase):
             ),
             archived,
         )
-        self.assertEqual(run_state.load_run(self.run_dir)["state"], "mockups_generated")
+        self.assertEqual(
+            json.loads((self.run_dir / "run.json").read_text())["state"],
+            "mockups_generated",
+        )
 
     def test_revision_rolls_back_archive_when_run_write_fails(self):
         self.set_state("mockups_generated")
-        current = {"mockups": [self._mockup("d-0")]}
-        self.write("mockup-manifest.json", current)
+        self.write_mockups(["d-0"])
+        current = json.loads((self.run_dir / "mockup-manifest.json").read_text())
         manifest = run_state.load_run(self.run_dir)
         manifest["approved_direction_ids"] = ["d-0"]
         self.write("run.json", manifest)
@@ -650,7 +680,36 @@ class RunStateTests(unittest.TestCase):
         self.assertFalse(
             (self.run_dir / "mockup-manifest.revision-1.json").exists()
         )
-        self.assertEqual(run_state.load_run(self.run_dir)["state"], "mockups_generated")
+        self.assertEqual(
+            json.loads((self.run_dir / "run.json").read_text())["state"],
+            "mockups_generated",
+        )
+
+    def test_revision_revalidates_pending_prerequisites_after_archive(self):
+        self.set_state("mockups_generated")
+        self.write_mockups(["d-0"])
+        before_run = (self.run_dir / "run.json").read_bytes()
+        before_mockups = (self.run_dir / "mockup-manifest.json").read_bytes()
+        real_validate = run_state._validate_phases
+
+        def fail_after_archive(run_dir, phases):
+            if not (Path(run_dir) / "mockup-manifest.json").exists():
+                raise ValueError("post-archive prerequisite failure")
+            return real_validate(run_dir, phases)
+
+        with mock.patch.object(
+            run_state, "_validate_phases", side_effect=fail_after_archive
+        ):
+            with self.assertRaisesRegex(ValueError, "post-archive"):
+                run_state.revise_run(self.run_dir, "Create a variation")
+
+        self.assertEqual((self.run_dir / "run.json").read_bytes(), before_run)
+        self.assertEqual(
+            (self.run_dir / "mockup-manifest.json").read_bytes(), before_mockups
+        )
+        self.assertFalse(
+            (self.run_dir / "mockup-manifest.revision-1.json").exists()
+        )
 
     def test_load_rejects_unsupported_or_malformed_manifest_schema(self):
         manifest = json.loads((self.run_dir / "run.json").read_text())
@@ -731,8 +790,17 @@ class RunStateTests(unittest.TestCase):
                 manifest["brief_locked_at"] = "2026-07-19T12:00:00Z"
                 manifest["state"] = "mockups_generated"
                 manifest["approved_direction_ids"] = ["d-0"]
+                (run_dir / "references.json").write_text(
+                    json.dumps([reference()]), encoding="utf-8"
+                )
                 (run_dir / "evidence.json").write_text(
                     json.dumps([evidence()]), encoding="utf-8"
+                )
+                (run_dir / "design-evidence.md").write_text(
+                    "# Evidence", encoding="utf-8"
+                )
+                (run_dir / "reference-board.md").write_text(
+                    "# Board", encoding="utf-8"
                 )
                 (run_dir / "directions.json").write_text(
                     json.dumps([direction(f"d-{item}", item) for item in range(5)]),
@@ -812,7 +880,10 @@ class RunStateTests(unittest.TestCase):
             run_state.transition_run(
                 self.run_dir, "implementation_selected", selected_direction_id="d-0"
             )
-        self.assertEqual(run_state.load_run(self.run_dir)["state"], "mockups_generated")
+        self.assertEqual(
+            json.loads((self.run_dir / "run.json").read_text())["state"],
+            "mockups_generated",
+        )
 
         self.write_mockups(["d-0"])
         run_state.transition_run(
@@ -830,7 +901,7 @@ class RunStateTests(unittest.TestCase):
             run_state.transition_run(
                 self.run_dir, "integrated", integration_approved=True
             )
-        manifest = run_state.load_run(self.run_dir)
+        manifest = json.loads((self.run_dir / "run.json").read_text())
         self.assertEqual(manifest["state"], "prototype_ready")
         self.assertNotIn("integration_approved_at", manifest)
 
@@ -882,6 +953,9 @@ class RunStateTests(unittest.TestCase):
 
         self.assertEqual(approved["generation_budget"], 5)
         self.assertEqual(approved["max_attempts_per_direction"], 2)
+        self.assertEqual(approved["generation_attempts_used"], 0)
+        self.assertIsNone(approved["last_generation_authorized_at"])
+        self.assertIsNone(approved["last_generation_authorized_direction_id"])
         self.assertNotIn("budget_expansion_approved_at", approved)
         reloaded = run_state.load_run(self.run_dir)
         self.assertEqual(reloaded, approved)
@@ -918,6 +992,65 @@ class RunStateTests(unittest.TestCase):
         )
         self.assertEqual(integrated["state"], "integrated")
         self.assertEqual(integrated["integration_approved_at"], "2026-07-19T12:05:00Z")
+
+    def test_evidence_tamper_fails_closed_at_every_later_state(self):
+        def assert_tamper_denied(transition=None):
+            original = json.loads((self.run_dir / "evidence.json").read_text())
+            tampered = json.loads(json.dumps(original))
+            tampered[0]["source_url"] = "not-a-url"
+            tampered[0]["publisher_or_author"] = " "
+            self.write("evidence.json", tampered)
+            before = (self.run_dir / "run.json").read_bytes()
+            with self.assertRaisesRegex(ValueError, "research validation failed"):
+                run_state.load_run(self.run_dir)
+            self.assertFalse(run_state.image_generation_allowed(self.run_dir, "d-0"))
+            with self.assertRaisesRegex(ValueError, "research validation failed"):
+                run_state.authorize_generation(self.run_dir, "d-0")
+            if transition is not None:
+                with self.assertRaisesRegex(ValueError, "research validation failed"):
+                    transition()
+            self.assertEqual((self.run_dir / "run.json").read_bytes(), before)
+            self.write("evidence.json", original)
+
+        self.advance_to_pending()
+        assert_tamper_denied(
+            lambda: run_state.transition_run(
+                self.run_dir,
+                "directions_approved",
+                approved_direction_ids=["d-0"],
+            )
+        )
+        run_state.transition_run(
+            self.run_dir, "directions_approved", approved_direction_ids=["d-0"]
+        )
+        self.write_mockups(["d-0"], attempt_count=0, status="pending")
+        assert_tamper_denied()
+        self.write_mockups(["d-0"])
+        run_state.transition_run(self.run_dir, "mockups_generated")
+        assert_tamper_denied(
+            lambda: run_state.transition_run(
+                self.run_dir,
+                "implementation_selected",
+                selected_direction_id="d-0",
+            )
+        )
+        run_state.transition_run(
+            self.run_dir, "implementation_selected", selected_direction_id="d-0"
+        )
+        self.write("implementation.json", self.implementation())
+        assert_tamper_denied(
+            lambda: run_state.transition_run(self.run_dir, "prototype_ready")
+        )
+        run_state.transition_run(self.run_dir, "prototype_ready")
+        assert_tamper_denied(
+            lambda: run_state.transition_run(
+                self.run_dir, "integrated", integration_approved=True
+            )
+        )
+        run_state.transition_run(
+            self.run_dir, "integrated", integration_approved=True
+        )
+        assert_tamper_denied()
 
     def test_cli_expected_failures_are_concise_without_tracebacks(self):
         unsupported = json.loads((self.run_dir / "run.json").read_text())
@@ -977,7 +1110,8 @@ class RunStateTests(unittest.TestCase):
 
     def test_cli_accepts_explicit_integration_approval(self):
         self.set_state("prototype_ready")
-        manifest = run_state.load_run(self.run_dir)
+        self.write_mockups(["d-0"])
+        manifest = json.loads((self.run_dir / "run.json").read_text())
         manifest["approved_direction_ids"] = ["d-0"]
         manifest["selected_direction_id"] = "d-0"
         self.write("run.json", manifest)

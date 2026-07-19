@@ -16,13 +16,13 @@ Build evidence-backed directions, then implement selection in user's language, i
 5. Validate research and directions. Present every direction in the response using the complete user-facing block in `references/research-evidence.md`; artifact links are not substitutes.
 6. Transition to `directions_pending_approval` and stop for explicit approval. Never infer it.
 7. Record approved IDs and transition to `directions_approved`.
-8. Read `references/mockups-implementation.md`; run `can-generate` immediately before each provider call and generate comparable full-screen UI mockups only when it returns true.
+8. Read `references/mockups-implementation.md`; prepare prompts/pending entries, then run direction-specific `can-generate` and `authorize-generation` immediately before each provider call.
 9. Record outputs and validate coverage. Ask the user to select, or `revise` a bounded variation as a first-class direction ID and reapprove it.
 10. Implement a structured-registry project preview or standalone fallback. Validate runtime-bound wiring and render-asset closure. Bind exact-size PNG evidence to current source bytes before integration.
 
 ## Hard gates
 
-- Do not call image generation unless `scripts/run_state.py can-generate --run <run-dir>` exits 0 immediately before the call.
+- Do not call image generation without successful direction-specific `can-generate` and atomic `authorize-generation` immediately before the call.
 - Treat locked brief constraints, approved IDs, preview wiring, and `source_digest` as machine gates; never repair them by hand.
 - Do not present color-only variations as distinct directions; the validator enforces three axes.
 - Do not fabricate citations or hide conflicting evidence. Separate sources from inference.
@@ -32,7 +32,7 @@ Build evidence-backed directions, then implement selection in user's language, i
 - Keep schema-v2 generation budgets: five images and two total attempts per direction by default. Expansion requires explicit recorded approval.
 - Do not put credentials, cookies, API keys, pairing tokens, or other secrets in run artifacts.
 
-Run `scripts/validate_run.py` before consuming transitions; `scripts/run_state.py` reruns validation before mutation. Preserve unrelated changes and direct source URLs. Production integration requires explicit approval of the verified preview.
+Every load and transition cumulatively validates prerequisite phases; use `scripts/validate_run.py` for diagnostics. Preserve unrelated changes and direct URLs. Integration requires explicit approval.
 
 ## Quick reference
 

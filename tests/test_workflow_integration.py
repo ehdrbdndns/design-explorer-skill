@@ -10,7 +10,7 @@ from urllib.request import urlopen
 
 from design_explorer_import import load_script_module
 from test_preview_evidence import preview_digest, write_png
-from test_run_state import DIGEST, direction, evidence, reference
+from test_run_state import direction, evidence, reference
 
 
 run_state = load_script_module("run_state_integration", "design-explorer/scripts/run_state.py")
@@ -46,17 +46,18 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.reload_at(run_dir, "research_complete")
         run_state.transition_run(run_dir, "directions_pending_approval")
         self.reload_at(run_dir, "directions_pending_approval")
-        self.assertFalse(run_state.image_generation_allowed(run_dir))
+        self.assertFalse(run_state.image_generation_allowed(run_dir, "d-0"))
         run_state.transition_run(
             run_dir, "directions_approved", approved_direction_ids=["d-0"]
         )
         self.reload_at(run_dir, "directions_approved")
-        self.assertTrue(run_state.image_generation_allowed(run_dir))
+        self.assertFalse(run_state.image_generation_allowed(run_dir, "d-0"))
 
     def generate_once(self, run_dir: Path, calls: list[str]) -> None:
-        self.assertTrue(run_state.image_generation_allowed(run_dir))
-        calls.append("d-0")
-        write_png(run_dir / "mockups" / "d-0.png", 390, 844)
+        prompt = run_dir / "prompts" / "d-0.txt"
+        prompt.parent.mkdir(exist_ok=True)
+        prompt.write_text("full-screen checkout prompt\n", encoding="utf-8")
+        prompt_digest = "sha256:" + hashlib.sha256(prompt.read_bytes()).hexdigest()
         self.write_json(
             run_dir,
             "mockup-manifest.json",
@@ -64,15 +65,28 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 "mockups": [
                     {
                         "direction_id": "d-0",
-                        "status": "success",
+                        "status": "pending",
                         "viewport": "390x844",
-                        "prompt_digest": DIGEST,
-                        "output_ref": "mockups/d-0.png",
-                        "attempt_count": 1,
+                        "prompt_ref": "prompts/d-0.txt",
+                        "prompt_digest": prompt_digest,
+                        "attempt_count": 0,
                     }
                 ]
             },
         )
+        self.assertTrue(run_state.image_generation_allowed(run_dir, "d-0"))
+        run_state.authorize_generation(run_dir, "d-0")
+        calls.append("d-0")
+        write_png(run_dir / "mockups" / "d-0.png", 390, 844)
+        manifest = json.loads((run_dir / "mockup-manifest.json").read_text())
+        manifest["mockups"][0].update(
+            {
+                "status": "success",
+                "output_kind": "local",
+                "output_ref": "mockups/d-0.png",
+            }
+        )
+        self.write_json(run_dir, "mockup-manifest.json", manifest)
 
     def implementation(
         self, source_root: Path, preview_path: str, preview_files: list[str]
@@ -175,7 +189,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
             )
             self.reload_at(run_dir, "initialized")
             provider_calls = []
-            self.assertFalse(run_state.image_generation_allowed(run_dir))
+            self.assertFalse(run_state.image_generation_allowed(run_dir, "d-0"))
             self.assertEqual(provider_calls, [])
 
             self.advance_to_approved(run_dir)
@@ -187,7 +201,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
             )
             run_state.transition_run(run_dir, "mockups_generated")
             self.reload_at(run_dir, "mockups_generated")
-            self.assertFalse(run_state.image_generation_allowed(run_dir))
+            self.assertFalse(run_state.image_generation_allowed(run_dir, "d-0"))
             run_state.transition_run(
                 run_dir, "implementation_selected", selected_direction_id="d-0"
             )

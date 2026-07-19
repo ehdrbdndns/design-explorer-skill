@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import subprocess
 import sys
@@ -11,7 +12,8 @@ from test_preview_evidence import preview_digest, write_png
 
 
 validator = load_script_module("validate_run", "design-explorer/scripts/validate_run.py")
-DIGEST = "sha256:" + "a" * 64
+PROMPT_BYTES = b"mockup prompt\n"
+DIGEST = "sha256:" + hashlib.sha256(PROMPT_BYTES).hexdigest()
 
 
 def reference(identifier="ref-1"):
@@ -113,6 +115,9 @@ def run_manifest(**overrides):
         "required_content": ["Order summary"],
         "required_interactions": ["Edit order"],
         "production_paths": [],
+        "generation_attempts_used": 1,
+        "last_generation_authorized_at": "2026-07-19T12:00:00Z",
+        "last_generation_authorized_direction_id": "a",
     }
     value.update(overrides)
     return value
@@ -123,8 +128,10 @@ def mockup(direction_id="a", **overrides):
         "direction_id": direction_id,
         "status": "success",
         "viewport": "390x844",
+        "prompt_ref": f"prompts/{direction_id}.txt",
         "prompt_digest": DIGEST,
-        "output_ref": "mockups/a.png",
+        "output_kind": "provider",
+        "output_ref": f"provider:openai:{direction_id}",
         "attempt_count": 1,
     }
     value.update(overrides)
@@ -135,6 +142,9 @@ class ValidateRunTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.run = Path(self.temp.name)
+        (self.run / "prompts").mkdir()
+        for identifier in ("a", "b", *(f"d-{index}" for index in range(8))):
+            (self.run / "prompts" / f"{identifier}.txt").write_bytes(PROMPT_BYTES)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -625,20 +635,12 @@ class ValidateRunTests(unittest.TestCase):
         self.write(
             "mockup-manifest.json",
             {
-                "mockups": [
-                    {
-                        "direction_id": "a",
-                        "status": "success",
-                        "viewport": "390x844",
-                        "prompt_digest": DIGEST,
-                        "output_ref": "mockups/a.png",
-                        "attempt_count": 1,
-                    }
-                ]
+                "mockups": [mockup("a")]
             },
         )
         errors = validator.validate_phase(self.run, "mockups")
-        self.assertEqual(errors, ["missing successful mockups for: b"])
+        self.assertIn("missing current mockup entries for: b", errors)
+        self.assertIn("missing successful mockups for: b", errors)
 
     def test_mockups_require_at_least_one_approved_direction(self):
         self.write("run.json", run_manifest(approved_direction_ids=[]))
@@ -693,7 +695,7 @@ class ValidateRunTests(unittest.TestCase):
         self.assertIn(
             "mockups[1] prompt_digest must be sha256 plus 64 lowercase hex", errors
         )
-        self.assertIn("mockups[1] missing output_ref", errors)
+        self.assertIn("mockups[1] success requires output_ref", errors)
         self.assertIn("mockups[2] direction_id must be a non-empty string", errors)
         self.assertIn("missing successful mockups for: a", errors)
 
@@ -735,6 +737,7 @@ class ValidateRunTests(unittest.TestCase):
                 approved_direction_ids=approved,
                 generation_budget=8,
                 max_attempts_per_direction=3,
+                generation_attempts_used=24,
                 budget_expansion_approved_at="2026-07-19T12:01:00Z",
             ),
         )
@@ -836,7 +839,7 @@ class ValidateRunTests(unittest.TestCase):
 
         self.write(
             "mockup-manifest.json",
-            {"mockups": [mockup(output_ref="openai:artifact_abc-123")]},
+            {"mockups": [mockup(output_ref="provider:openai:artifact_abc-123")]},
         )
         self.assertEqual(validator.validate_phase(self.run, "mockups"), [])
 

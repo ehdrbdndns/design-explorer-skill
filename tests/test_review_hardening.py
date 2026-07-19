@@ -9,7 +9,8 @@ import zlib
 from pathlib import Path
 
 from design_explorer_import import load_script_module
-from test_run_state import DIGEST, direction, evidence, reference
+from test_preview_evidence import write_png
+from test_run_state import direction, evidence, reference
 
 
 run_state = load_script_module("run_state_review", "design-explorer/scripts/run_state.py")
@@ -151,9 +152,9 @@ class StateInvariantTests(unittest.TestCase):
                 self.write_json("run.json", tampered)
                 with self.assertRaisesRegex(ValueError, expected):
                     run_state.load_run(self.run)
-                self.assertFalse(run_state.image_generation_allowed(self.run))
+                self.assertFalse(run_state.image_generation_allowed(self.run, "d-0"))
                 result = subprocess.run(
-                    [sys.executable, run_state.__file__, "can-generate", "--run", str(self.run)],
+                    [sys.executable, run_state.__file__, "can-generate", "--run", str(self.run), "--direction", "d-0"],
                     capture_output=True,
                     text=True,
                     check=False,
@@ -200,6 +201,10 @@ class StateInvariantTests(unittest.TestCase):
         run_state.transition_run(
             self.run, "directions_approved", approved_direction_ids=["d-0"]
         )
+        prompt = self.run / "prompts" / "d-0.txt"
+        prompt.parent.mkdir()
+        prompt.write_text("prompt\n", encoding="utf-8")
+        write_png(self.run / "mockups" / "d-0.png", 390, 844)
         self.write_json(
             "mockup-manifest.json",
             {
@@ -208,13 +213,20 @@ class StateInvariantTests(unittest.TestCase):
                         "direction_id": "d-0",
                         "status": "success",
                         "viewport": "390x844",
-                        "prompt_digest": DIGEST,
+                        "prompt_ref": "prompts/d-0.txt",
+                        "prompt_digest": "sha256:" + hashlib.sha256(prompt.read_bytes()).hexdigest(),
+                        "output_kind": "local",
                         "output_ref": "mockups/d-0.png",
                         "attempt_count": 1,
                     }
                 ]
             },
         )
+        run_manifest = json.loads((self.run / "run.json").read_text())
+        run_manifest["generation_attempts_used"] = 1
+        run_manifest["last_generation_authorized_at"] = "2026-07-20T10:01:00Z"
+        run_manifest["last_generation_authorized_direction_id"] = "d-0"
+        self.write_json("run.json", run_manifest)
         run_state.transition_run(self.run, "mockups_generated")
         run_before = (self.run / "run.json").read_bytes()
         mockups_before = (self.run / "mockup-manifest.json").read_bytes()

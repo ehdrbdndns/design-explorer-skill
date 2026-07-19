@@ -53,6 +53,10 @@ MAX_VIEWPORT_DIMENSION = 10_000
 MAX_PNG_CHUNK_BYTES = 32 * 1024 * 1024
 MAX_PNG_FILE_BYTES = 64 * 1024 * 1024
 PROMPT_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+PROVIDER_OUTPUT_PATTERN = re.compile(
+    r"provider:(?P<provider>[a-z0-9][a-z0-9-]*):"
+    r"(?P<artifact>[A-Za-z0-9][A-Za-z0-9._-]*)"
+)
 BLOCKED_HOST_SUFFIXES = (
     "localhost",
     "local",
@@ -1298,7 +1302,20 @@ def validate_budget_approval(
         )
 
 
-def validate_mockups(run_dir: Path) -> list[str]:
+def _valid_provider_output_ref(value) -> bool:
+    return (
+        isinstance(value, str)
+        and PROVIDER_OUTPUT_PATTERN.fullmatch(value) is not None
+        and not find_secret_errors(value, "provider-output")
+    )
+
+
+def _mockup_manifest_errors(
+    run_dir: Path,
+    *,
+    require_success: bool,
+    allow_initial_pending: bool,
+) -> list[str]:
     errors = []
     run = read_json(run_dir, "run.json", errors)
     manifest = read_json(run_dir, "mockup-manifest.json", errors)
@@ -1316,6 +1333,17 @@ def validate_mockups(run_dir: Path) -> list[str]:
     budget = positive_integer_field(run, "generation_budget", errors)
     max_attempts = positive_integer_field(run, "max_attempts_per_direction", errors)
     validate_budget_approval(run, budget, max_attempts, errors)
+    target_viewports = normalized_string_list(
+        run.get("target_viewports"), "run.json target_viewports", errors
+    )
+    attempts_used = run.get("generation_attempts_used")
+    if (
+        not isinstance(attempts_used, int)
+        or isinstance(attempts_used, bool)
+        or attempts_used < 0
+    ):
+        errors.append("run.json generation_attempts_used must be a non-negative integer")
+        attempts_used = None
     mockups = manifest["mockups"]
     if budget is not None and len(mockups) > budget:
         errors.append(
@@ -1323,6 +1351,8 @@ def validate_mockups(run_dir: Path) -> list[str]:
         )
     successful = set()
     seen_direction_ids = set()
+    seen_viewports = set()
+    attempt_total = 0
     for index, item in enumerate(mockups):
         if not isinstance(item, dict):
             errors.append(f"mockups[{index}] must be an object")
@@ -1350,26 +1380,36 @@ def validate_mockups(run_dir: Path) -> list[str]:
                 f"mockups[{index}] status must be pending, success, or failed"
             )
         attempt_count = item.get("attempt_count")
-        if (
-            not isinstance(attempt_count, int)
-            or isinstance(attempt_count, bool)
-            or attempt_count <= 0
-        ):
-            errors.append(f"mockups[{index}] attempt_count must be a positive integer")
+        valid_attempt = isinstance(attempt_count, int) and not isinstance(
+            attempt_count, bool
+        )
+        pending_zero = status == "pending" and attempt_count == 0 and allow_initial_pending
+        if not valid_attempt or (attempt_count <= 0 and not pending_zero):
+            errors.append(
+                f"mockups[{index}] attempt_count must be positive, or zero for initial pending authorization"
+            )
         elif max_attempts is not None and attempt_count > max_attempts:
             errors.append(
                 f"mockups[{index}] attempt_count exceeds max_attempts_per_direction"
             )
-        output_ref = item.get("output_ref")
-        output_ref_is_valid = True
-        if output_ref is not None and not valid_artifact_ref(
-            output_ref, allow_provider_hint=True
-        ):
-            errors.append(f"mockups[{index}] output_ref must be a safe artifact reference")
-            output_ref_is_valid = False
+        if valid_attempt and attempt_count >= 0:
+            attempt_total += attempt_count
         viewport = item.get("viewport")
-        if not isinstance(viewport, str) or not VIEWPORT_PATTERN.fullmatch(viewport):
+        normalized = normalized_viewport(viewport)
+        if normalized is None:
             errors.append(f"mockups[{index}] viewport must use WIDTHxHEIGHT")
+        else:
+            seen_viewports.add(normalized)
+            if target_viewports is not None and normalized not in target_viewports:
+                errors.append(
+                    f"mockups[{index}] viewport must be one of locked target_viewports"
+                )
+        prompt_ref = item.get("prompt_ref")
+        prompt_path = resolved_scoped_path(run_dir, prompt_ref)
+        if prompt_path is None or not prompt_path.is_file():
+            errors.append(
+                f"mockups[{index}] prompt_ref must be a safe run-relative existing file"
+            )
         prompt_digest = item.get("prompt_digest")
         if not isinstance(prompt_digest, str) or not PROMPT_DIGEST_PATTERN.fullmatch(
             prompt_digest
@@ -1377,25 +1417,103 @@ def validate_mockups(run_dir: Path) -> list[str]:
             errors.append(
                 f"mockups[{index}] prompt_digest must be sha256 plus 64 lowercase hex"
             )
+        elif prompt_path is not None and prompt_path.is_file():
+            actual = "sha256:" + hashlib.sha256(prompt_path.read_bytes()).hexdigest()
+            if prompt_digest != actual:
+                errors.append(
+                    f"mockups[{index}] prompt_digest must match exact prompt bytes"
+                )
+        output_kind = item.get("output_kind")
+        output_ref = item.get("output_ref")
+        output_valid = True
+        if output_kind is None and output_ref is None and status in {"pending", "failed"}:
+            pass
+        elif output_kind == "local":
+            output_path = resolved_scoped_path(run_dir, output_ref)
+            if output_path is None or not output_path.is_file():
+                errors.append(
+                    f"mockups[{index}] local output_ref must be a safe run-relative existing file"
+                )
+                output_valid = False
+            else:
+                dimensions = png_dimensions(output_path)
+                if dimensions is None:
+                    errors.append(f"mockups[{index}] local output must be a complete PNG")
+                    output_valid = False
+                elif normalized is not None and dimensions != tuple(
+                    int(part) for part in normalized.split("x")
+                ):
+                    errors.append(
+                        f"mockups[{index}] local output dimensions "
+                        f"{dimensions[0]}x{dimensions[1]} must match {normalized}"
+                    )
+                    output_valid = False
+        elif output_kind == "provider":
+            if not _valid_provider_output_ref(output_ref):
+                errors.append(
+                    f"mockups[{index}] provider output_ref must use "
+                    "provider:<lowercase-provider>:<safe-artifact-id>"
+                )
+                output_valid = False
+        else:
+            errors.append(
+                f"mockups[{index}] output_kind must be local or provider when output_ref is present"
+            )
+            output_valid = False
         if status == "success":
             fields_are_valid = True
-            if not isinstance(output_ref, str) or not output_ref.strip():
-                errors.append(f"mockups[{index}] missing output_ref")
+            if output_kind not in {"local", "provider"}:
+                errors.append(f"mockups[{index}] success requires output_kind")
                 fields_are_valid = False
-            if not isinstance(viewport, str) or not VIEWPORT_PATTERN.fullmatch(viewport):
+            if not isinstance(output_ref, str) or not output_ref.strip():
+                errors.append(f"mockups[{index}] success requires output_ref")
+                fields_are_valid = False
+            if normalized is None:
                 fields_are_valid = False
             if not isinstance(prompt_digest, str) or not PROMPT_DIGEST_PATTERN.fullmatch(
                 prompt_digest
             ):
                 fields_are_valid = False
-            if not output_ref_is_valid:
+            if prompt_path is None or not prompt_path.is_file() or not output_valid:
                 fields_are_valid = False
             if direction_is_approved and fields_are_valid:
                 successful.add(direction_id)
-    missing = approved - successful if approved is not None else set()
-    if missing:
-        errors.append(f"missing successful mockups for: {', '.join(sorted(missing))}")
+    if len(seen_viewports) > 1:
+        errors.append("mockups must share exactly one viewport across directions")
+    if approved is not None:
+        missing_entries = approved - seen_direction_ids
+        extra_entries = seen_direction_ids - approved
+        if missing_entries:
+            errors.append(
+                f"missing current mockup entries for: {', '.join(sorted(missing_entries))}"
+            )
+        if extra_entries:
+            errors.append(
+                f"unapproved current mockup entries for: {', '.join(sorted(extra_entries))}"
+            )
+        if len(mockups) != len(approved):
+            errors.append("mockup manifest must contain exactly one entry per approved direction")
+    if attempts_used is not None and attempt_total != attempts_used:
+        errors.append(
+            "mockup attempt_count total must equal run.json generation_attempts_used"
+        )
+    if require_success:
+        missing = approved - successful if approved is not None else set()
+        if missing:
+            errors.append(f"missing successful mockups for: {', '.join(sorted(missing))}")
     return errors
+
+
+def validate_mockup_manifest_for_generation(run_dir: Path) -> list[str]:
+    return _mockup_manifest_errors(
+        Path(run_dir), require_success=False, allow_initial_pending=True
+    )
+
+
+def validate_mockups(run_dir: Path) -> list[str]:
+    return _mockup_manifest_errors(
+        Path(run_dir), require_success=True, allow_initial_pending=False
+    )
 
 
 def validate_implementation(run_dir: Path) -> list[str]:
