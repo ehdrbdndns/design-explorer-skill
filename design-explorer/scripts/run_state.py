@@ -27,6 +27,8 @@ DEFAULT_MAX_ATTEMPTS_PER_DIRECTION = 2
 RFC3339_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
 )
+VIEWPORT_PATTERN = re.compile(r"[1-9]\d{0,4}x[1-9]\d{0,4}")
+MAX_VIEWPORT_DIMENSION = 10_000
 REQUIRED_FILES = {
     "brief_ready": ("brief.md",),
     "research_complete": (
@@ -78,12 +80,57 @@ def write_json_atomic(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
+def _normalize_strings(values: list[str] | None, label: str) -> list[str]:
+    if values is not None and not isinstance(values, list):
+        raise ValueError(f"{label} must be a list")
+    normalized = []
+    for value in values or []:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} items must be nonblank strings")
+        item = value.strip()
+        if item not in normalized:
+            normalized.append(item)
+    return normalized
+
+
+def _normalize_viewports(values: list[str] | None) -> list[str]:
+    viewports = _normalize_strings(values, "target_viewports")
+    for viewport in viewports:
+        if not VIEWPORT_PATTERN.fullmatch(viewport):
+            raise ValueError("viewport must use WIDTHxHEIGHT with positive integers")
+        width, height = (int(part) for part in viewport.split("x"))
+        if width > MAX_VIEWPORT_DIMENSION or height > MAX_VIEWPORT_DIMENSION:
+            raise ValueError("viewport dimensions must not exceed 10000")
+    return viewports
+
+
+def _normalize_production_paths(values: list[str] | None) -> list[str]:
+    paths = _normalize_strings(values, "production_paths")
+    for value in paths:
+        path = Path(value)
+        if (
+            path.is_absolute()
+            or "\\" in value
+            or "\x00" in value
+            or ":" in value
+            or "@" in value
+            or value.startswith("~")
+            or any(part in {"", ".", ".."} for part in value.split("/"))
+        ):
+            raise ValueError("production_path must be a safe project-relative path")
+    return paths
+
+
 def init_run(
     root: Path,
     slug: str,
     project_path: str | None = None,
     now: str | None = None,
     run_id: str | None = None,
+    target_viewports: list[str] | None = None,
+    required_content: list[str] | None = None,
+    required_interactions: list[str] | None = None,
+    production_paths: list[str] | None = None,
 ) -> Path:
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
         raise ValueError("slug must use lowercase letters, digits, and hyphens")
@@ -97,6 +144,12 @@ def init_run(
         raise ValueError("run_id must be a safe path component")
     timestamp = now or utc_now()
     identifier = run_id or f"{timestamp[:10].replace('-', '')}-{slug}-{uuid.uuid4().hex[:8]}"
+    normalized_viewports = _normalize_viewports(target_viewports)
+    normalized_content = _normalize_strings(required_content, "required_content")
+    normalized_interactions = _normalize_strings(
+        required_interactions, "required_interactions"
+    )
+    normalized_production_paths = _normalize_production_paths(production_paths)
     run_dir = Path(root).expanduser() / identifier
     run_dir.mkdir(parents=True, exist_ok=False)
     manifest = {
@@ -112,6 +165,10 @@ def init_run(
         "revision_count": 0,
         "generation_budget": DEFAULT_GENERATION_BUDGET,
         "max_attempts_per_direction": DEFAULT_MAX_ATTEMPTS_PER_DIRECTION,
+        "target_viewports": normalized_viewports,
+        "required_content": normalized_content,
+        "required_interactions": normalized_interactions,
+        "production_paths": normalized_production_paths,
     }
     write_json_atomic(run_dir / "run.json", manifest)
     return run_dir
@@ -152,6 +209,10 @@ def validate_run_manifest(manifest: object) -> None:
         "revision_count",
         "generation_budget",
         "max_attempts_per_direction",
+        "target_viewports",
+        "required_content",
+        "required_interactions",
+        "production_paths",
     )
     for key in required:
         if key not in manifest:
@@ -191,6 +252,21 @@ def validate_run_manifest(manifest: object) -> None:
     for key in ("generation_budget", "max_attempts_per_direction"):
         if not _positive_integer(manifest[key]):
             raise ValueError(f"invalid run.json: {key} must be a positive integer")
+    normalized_viewports = _normalize_viewports(manifest["target_viewports"])
+    if normalized_viewports != manifest["target_viewports"]:
+        raise ValueError("invalid run.json: target_viewports must be normalized and unique")
+    for key in ("required_content", "required_interactions"):
+        normalized = _normalize_strings(manifest[key], key)
+        if normalized != manifest[key]:
+            raise ValueError(f"invalid run.json: {key} must be normalized and unique")
+    normalized_paths = _normalize_production_paths(manifest["production_paths"])
+    if normalized_paths != manifest["production_paths"]:
+        raise ValueError("invalid run.json: production_paths must be normalized and unique")
+    if manifest["state"] != "initialized":
+        if not manifest["target_viewports"]:
+            raise ValueError("invalid run.json: target_viewports must not be empty after initialization")
+        if not manifest["required_content"]:
+            raise ValueError("invalid run.json: required_content must not be empty after initialization")
     expanded = (
         manifest["generation_budget"] > DEFAULT_GENERATION_BUDGET
         or manifest["max_attempts_per_direction"]
@@ -236,6 +312,21 @@ def _validator_module():
 
 def _validate_target(run_dir: Path, target: str) -> None:
     _require_files(run_dir, target)
+    if target == "brief_ready":
+        manifest = load_run(run_dir)
+        if not manifest["target_viewports"]:
+            raise ValueError("brief validation failed: target_viewports must not be empty")
+        if not manifest["required_content"]:
+            raise ValueError("brief validation failed: required_content must not be empty")
+        if not manifest["required_interactions"]:
+            brief = (run_dir / "brief.md").read_text(encoding="utf-8")
+            if not re.search(
+                r"(?im)^interactive requirements\s*:\s*none\s*$", brief
+            ):
+                raise ValueError(
+                    "brief validation failed: empty required_interactions requires "
+                    "explicit interactive requirements: none"
+                )
     for name in NONBLANK_FILES.get(target, ()):
         try:
             value = (run_dir / name).read_text(encoding="utf-8")
@@ -391,6 +482,18 @@ def revise_run(
     return manifest
 
 
+def image_generation_allowed(run_dir: Path) -> bool:
+    try:
+        run_dir = Path(run_dir)
+        manifest = load_run(run_dir)
+        if manifest["state"] != "directions_approved":
+            return False
+        _validate_target(run_dir, "directions_approved")
+        return True
+    except (ValueError, json.JSONDecodeError, OSError, TypeError):
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -398,6 +501,10 @@ def main() -> int:
     init_parser.add_argument("--root", default="~/.codex/design-explorer/runs")
     init_parser.add_argument("--slug", required=True)
     init_parser.add_argument("--project-path")
+    init_parser.add_argument("--viewport", action="append")
+    init_parser.add_argument("--required-content", action="append")
+    init_parser.add_argument("--required-interaction", action="append")
+    init_parser.add_argument("--production-path", action="append")
     transition_parser = subparsers.add_parser("transition")
     transition_parser.add_argument("--run", required=True)
     transition_parser.add_argument("--to", required=True, choices=STATES[1:])
@@ -412,11 +519,21 @@ def main() -> int:
     revise_parser.add_argument("--reason", required=True)
     status_parser = subparsers.add_parser("status")
     status_parser.add_argument("--run", required=True)
+    generation_parser = subparsers.add_parser("can-generate")
+    generation_parser.add_argument("--run", required=True)
     args = parser.parse_args()
 
     try:
         if args.command == "init":
-            run_dir = init_run(Path(args.root), args.slug, args.project_path)
+            run_dir = init_run(
+                Path(args.root),
+                args.slug,
+                args.project_path,
+                target_viewports=args.viewport,
+                required_content=args.required_content,
+                required_interactions=args.required_interaction,
+                production_paths=args.production_path,
+            )
             print(run_dir)
         elif args.command == "transition":
             manifest = transition_run(
@@ -433,6 +550,10 @@ def main() -> int:
         elif args.command == "revise":
             manifest = revise_run(Path(args.run), args.reason)
             print(json.dumps(manifest, indent=2))
+        elif args.command == "can-generate":
+            allowed = image_generation_allowed(Path(args.run))
+            print("true" if allowed else "false")
+            return 0 if allowed else 1
         else:
             print(json.dumps(load_run(Path(args.run)), indent=2))
     except (ValueError, json.JSONDecodeError, OSError) as error:

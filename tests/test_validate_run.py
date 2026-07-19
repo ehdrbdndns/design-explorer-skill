@@ -108,6 +108,10 @@ def run_manifest(**overrides):
         "revision_count": 0,
         "generation_budget": 5,
         "max_attempts_per_direction": 2,
+        "target_viewports": ["390x844"],
+        "required_content": ["Order summary"],
+        "required_interactions": ["Edit order"],
+        "production_paths": [],
     }
     value.update(overrides)
     return value
@@ -988,8 +992,13 @@ class ValidateRunTests(unittest.TestCase):
             "implementation.json",
             {
                 "selected_direction_id": "a",
-                "mode": "project",
-                "preview_path": "src/previews/Checkout.tsx",
+                "mode": "standalone",
+                "preview_path": "standalone/src/main.tsx",
+                "preview_files": [
+                    "standalone/package.json",
+                    "standalone/src/main.tsx",
+                ],
+                "preview_route": "/preview",
                 "verification": {
                     "rendered_viewports": ["390x844"],
                     "checks": {
@@ -997,8 +1006,29 @@ class ValidateRunTests(unittest.TestCase):
                         "overflow": "pass",
                         "accessibility": "pass",
                     },
+                    "viewport_checks": {
+                        "390x844": {
+                            "screenshot_ref": "evidence/390x844.png",
+                            "content": "pass",
+                            "overflow": "pass",
+                            "accessibility": "pass",
+                            "interaction": "pass",
+                            "required_content": {"Order summary": "pass"},
+                            "required_interactions": {"Edit order": "pass"},
+                        }
+                    },
                 },
             },
+        )
+        standalone = self.run / "standalone" / "src"
+        standalone.mkdir(parents=True)
+        (self.run / "standalone" / "package.json").write_text("{}", encoding="utf-8")
+        (standalone / "main.tsx").write_text("entry", encoding="utf-8")
+        evidence_dir = self.run / "evidence"
+        evidence_dir.mkdir()
+        (evidence_dir / "390x844.png").write_bytes(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+            b"\x00\x00\x01\x86\x00\x00\x03\x4c"
         )
         self.assertEqual(validator.validate_phase(self.run, "implementation"), [])
 
@@ -1115,10 +1145,7 @@ class ValidateRunTests(unittest.TestCase):
 
         errors = validator.validate_phase(self.run, "implementation")
 
-        self.assertIn(
-            "implementation rendered_viewports must be a non-empty list of non-empty strings",
-            errors,
-        )
+        self.assertTrue(any("implementation rendered_viewports" in error for error in errors))
 
 
 if __name__ == "__main__":

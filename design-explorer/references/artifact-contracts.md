@@ -4,7 +4,7 @@ Use this contract when creating, resuming, validating, or transitioning a design
 
 ## Run directory and states
 
-The default run directory is `~/.codex/design-explorer/runs/<run-id>/`. Keep each exploration isolated in one run directory. New manifests use schema version 2. `run.json` records the run ID, slug, timestamps, project path, current state, approved/selected direction IDs, `revision_count`, `generation_budget` (default 5), `max_attempts_per_direction` (default 2), approval timestamps, and revision audit fields. Unsupported schemas must be migrated or reinitialized; do not edit a version number to simulate migration.
+The default run directory is `~/.codex/design-explorer/runs/<run-id>/`. Keep each exploration isolated in one run directory. New manifests use schema version 2. `run.json` records identity/state fields plus normalized, unique `target_viewports`, `required_content`, `required_interactions`, and safe project-relative `production_paths`. It also records approved/selected direction IDs, `revision_count`, `generation_budget` (default 5), `max_attempts_per_direction` (default 2), approval timestamps, and revision audit fields. Unsupported schemas must be migrated or reinitialized; do not edit a version number to simulate migration.
 
 Follow this primary state sequence without skipping steps:
 
@@ -15,9 +15,14 @@ The only deliberate revision edge is `mockups_generated` → `directions_pending
 Create or resume the run with these commands:
 
 ```bash
-python3 scripts/run_state.py init --slug <lowercase-hyphen-slug> --project-path <absolute-path>
+python3 scripts/run_state.py init --slug checkout --project-path /abs/project \
+  --viewport 390x844 --viewport 1440x900 \
+  --required-content "Order summary" --required-content "Total" \
+  --required-interaction "Edit order" --production-path src/App.tsx
 python3 scripts/run_state.py status --run <run-dir>
 ```
+
+Repeat each flag as needed. Viewports use positive `WIDTHxHEIGHT` dimensions no greater than 10000. `brief_ready` requires at least one viewport and content item. UI runs should record every required interaction; a truly static brief may leave the list empty only when `brief.md` contains the exact line `Interactive requirements: none`.
 
 After writing `brief.md`, transition to `brief_ready`:
 
@@ -33,9 +38,10 @@ python3 scripts/run_state.py transition --run <run-dir> --to research_complete
 python3 scripts/validate_run.py --run <run-dir> --phase directions
 python3 scripts/run_state.py transition --run <run-dir> --to directions_pending_approval
 python3 scripts/run_state.py transition --run <run-dir> --to directions_approved --approved-direction <id>
+python3 scripts/run_state.py can-generate --run <run-dir>
 ```
 
-Repeat `--approved-direction <id>` for every explicitly approved direction. After image output is recorded, execute the remaining steps in this order:
+Repeat `--approved-direction <id>` for every explicitly approved direction. Run `can-generate --run <run-dir>` immediately before every provider call; exit 0/`true` is authorization, while any invalid, tampered, or wrong-state run fails closed with exit 1/`false`. After image output is recorded, execute the remaining steps in this order:
 
 The approval count cannot exceed `generation_budget`. A user-approved expansion is explicit and auditable. Whenever either limit exceeds its default, `budget_expansion_approved_at` is required and must be a valid RFC3339 timestamp; the field is forbidden when neither limit is expanded:
 
@@ -80,7 +86,7 @@ python3 scripts/run_state.py revise --run <run-dir> --reason "<user-request>"
 
 ### `brief.md`
 
-Record the screen purpose, required content, target viewport, preservation constraints, supplied inputs, implementation context, and any sensitive-data handling decision.
+Record the screen purpose, required content/interactions, target viewports, preservation constraints, supplied inputs, implementation context, and any sensitive-data handling decision. Keep these aligned with the corresponding `run.json` lists.
 
 ### Research artifacts
 
@@ -158,8 +164,15 @@ The list cannot exceed `generation_budget`. It contains exactly one current entr
 
 - `selected_direction_id`, matching the selected approved direction in `run.json`
 - `mode`: `project` or `standalone`
-- `preview_path`
-- `verification`, containing a non-empty `rendered_viewports` list and `checks` whose `content`, `overflow`, and `accessibility` values are all `pass`
+- `preview_path`, included in non-empty `preview_files`; all are safe relative existing files
+- `preview_route`, a normalized absolute URL path without traversal, query, or fragment
+- `verification.rendered_viewports`, unique and exactly equal to `run.json.target_viewports`
+- aggregate `verification.checks` whose `content`, `overflow`, and `accessibility` values are all `pass`
+- `verification.viewport_checks`, keyed exactly by every target viewport
+
+Each viewport record has `content`, `overflow`, `accessibility`, and `interaction` set to `pass`; exact-key `required_content` and `required_interactions` maps with every value `pass`; and a safe run-relative `screenshot_ref`. The screenshot is stored inside the run directory and must be a PNG whose IHDR dimensions exactly match its viewport.
+
+In project mode, `project_path` is an existing absolute directory. Preview files exist beneath it, while every `production_paths` entry exists and cannot contain or equal a preview file. In standalone mode, production paths are empty; preview files live beneath the run directory and include `package.json` plus `src/main.*` or `src/index.*` entry source. Aggregate checks never substitute for per-viewport evidence.
 
 Validate this file before `prototype_ready`. The isolated preview remains separate from production until the user explicitly approves integration.
 

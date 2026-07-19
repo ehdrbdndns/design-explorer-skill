@@ -151,6 +151,37 @@ class SkillContractTests(unittest.TestCase):
         ):
             self.assertIn(phrase, mockups)
 
+    def test_evidence_gate_commands_and_machine_readable_contract_are_documented(self):
+        skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_DIR / "references/artifact-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        mockups = (SKILL_DIR / "references/mockups-implementation.md").read_text(
+            encoding="utf-8"
+        )
+        research = (SKILL_DIR / "references/research-evidence.md").read_text(
+            encoding="utf-8"
+        )
+
+        for flag in (
+            "--viewport 390x844",
+            '--required-content "Order summary"',
+            '--required-interaction "Edit order"',
+            "--production-path src/App.tsx",
+        ):
+            self.assertIn(flag, contracts)
+        self.assertIn("can-generate --run <run-dir>", contracts)
+        self.assertIn("can-generate --run <run-dir>", mockups)
+        self.assertIn("immediately before every image provider call", mockups)
+        self.assertIn("screenshot_ref", mockups)
+        self.assertIn("viewport_checks", mockups)
+        self.assertIn("stored inside the run directory", mockups)
+        self.assertIn("preview_files", contracts)
+        self.assertIn("preview_route", contracts)
+        self.assertIn("production_paths", contracts)
+        self.assertIn("Interactive requirements: none", research)
+        self.assertIn("can-generate", skill)
+
 
 if __name__ == "__main__":
     unittest.main()

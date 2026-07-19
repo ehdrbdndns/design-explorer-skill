@@ -1,6 +1,7 @@
 import inspect
 import json
 import subprocess
+import struct
 import sys
 import tempfile
 import unittest
@@ -71,13 +72,26 @@ def implementation(identifier="d-0"):
     return {
         "selected_direction_id": identifier,
         "mode": "project",
-        "preview_path": "src/previews/Checkout.tsx",
+        "preview_path": "previews/Checkout.tsx",
+        "preview_files": ["previews/Checkout.tsx"],
+        "preview_route": "/design-explorer/checkout",
         "verification": {
             "rendered_viewports": ["390x844"],
             "checks": {
                 "content": "pass",
                 "overflow": "pass",
                 "accessibility": "pass",
+            },
+            "viewport_checks": {
+                "390x844": {
+                    "screenshot_ref": "evidence/390x844.png",
+                    "content": "pass",
+                    "overflow": "pass",
+                    "accessibility": "pass",
+                    "interaction": "pass",
+                    "required_content": {"Order summary": "pass"},
+                    "required_interactions": {"Edit order": "pass"},
+                }
             },
         },
     }
@@ -87,8 +101,29 @@ class RunStateTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        self.project_dir = self.root / "project"
+        (self.project_dir / "src").mkdir(parents=True)
+        (self.project_dir / "src" / "App.tsx").write_text("production", encoding="utf-8")
+        (self.project_dir / "previews").mkdir()
+        (self.project_dir / "previews" / "Checkout.tsx").write_text(
+            "preview", encoding="utf-8"
+        )
         self.run_dir = run_state.init_run(
-            self.root, "checkout", now="2026-07-19T12:00:00Z", run_id="run-checkout"
+            self.root,
+            "checkout",
+            project_path=str(self.project_dir),
+            now="2026-07-19T12:00:00Z",
+            run_id="run-checkout",
+            target_viewports=["390x844"],
+            required_content=["Order summary"],
+            required_interactions=["Edit order"],
+            production_paths=["src/App.tsx"],
+        )
+        screenshot = self.run_dir / "evidence" / "390x844.png"
+        screenshot.parent.mkdir()
+        screenshot.write_bytes(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+            + struct.pack(">II", 390, 844)
         )
 
     def tearDown(self):
@@ -169,12 +204,189 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(manifest["generation_budget"], 5)
         self.assertEqual(manifest["max_attempts_per_direction"], 2)
+        self.assertEqual(manifest["target_viewports"], ["390x844"])
+        self.assertEqual(manifest["required_content"], ["Order summary"])
+        self.assertEqual(manifest["required_interactions"], ["Edit order"])
+        self.assertEqual(manifest["production_paths"], ["src/App.tsx"])
+
+    def test_init_normalizes_and_deduplicates_evidence_requirements(self):
+        run_dir = run_state.init_run(
+            self.root,
+            "profile",
+            run_id="run-profile",
+            target_viewports=[" 390x844 ", "390x844", "1440x900"],
+            required_content=[" Profile name ", "Profile name", "Avatar"],
+            required_interactions=[" Save ", "Save"],
+            production_paths=[" src/App.tsx ", "src/App.tsx"],
+        )
+
+        manifest = run_state.load_run(run_dir)
+        self.assertEqual(manifest["target_viewports"], ["390x844", "1440x900"])
+        self.assertEqual(manifest["required_content"], ["Profile name", "Avatar"])
+        self.assertEqual(manifest["required_interactions"], ["Save"])
+        self.assertEqual(manifest["production_paths"], ["src/App.tsx"])
+
+    def test_init_rejects_invalid_viewports_and_unsafe_production_paths(self):
+        for viewport in ("banana", "0x844", "390X844", "10001x844"):
+            with self.subTest(viewport=viewport), self.assertRaisesRegex(
+                ValueError, "viewport"
+            ):
+                run_state.init_run(
+                    self.root,
+                    "invalid",
+                    run_id=f"invalid-{viewport.replace('/', '-')}",
+                    target_viewports=[viewport],
+                )
+        for production_path in (
+            "../App.tsx",
+            "/tmp/App.tsx",
+            "src\\App.tsx",
+            "src/App:secret.tsx",
+            "~/App.tsx",
+        ):
+            with self.subTest(production_path=production_path), self.assertRaisesRegex(
+                ValueError, "production_path"
+            ):
+                run_state.init_run(
+                    self.root,
+                    "invalid-path",
+                    run_id="invalid-path-" + str(abs(hash(production_path))),
+                    production_paths=[production_path],
+                )
+
+    def test_invalid_init_does_not_leave_a_partial_run_directory(self):
+        expected = self.root / "partial-run"
+        with self.assertRaisesRegex(ValueError, "viewport"):
+            run_state.init_run(
+                self.root,
+                "partial",
+                run_id="partial-run",
+                target_viewports=["banana"],
+            )
+        self.assertFalse(expected.exists())
+
+    def test_load_rejects_malformed_requirement_collections_as_value_errors(self):
+        base = run_state.load_run(self.run_dir)
+        for key in (
+            "target_viewports",
+            "required_content",
+            "required_interactions",
+            "production_paths",
+        ):
+            with self.subTest(key=key):
+                manifest = dict(base)
+                manifest[key] = 42
+                self.write("run.json", manifest)
+                with self.assertRaisesRegex(ValueError, key):
+                    run_state.load_run(self.run_dir)
+
+    def test_post_brief_manifest_cannot_drop_viewports_or_content(self):
+        manifest = run_state.load_run(self.run_dir)
+        manifest["state"] = "directions_approved"
+        for key in ("target_viewports", "required_content"):
+            with self.subTest(key=key):
+                tampered = dict(manifest)
+                tampered[key] = []
+                self.write("run.json", tampered)
+                with self.assertRaisesRegex(ValueError, key):
+                    run_state.load_run(self.run_dir)
+                self.assertFalse(run_state.image_generation_allowed(self.run_dir))
+
+    def test_brief_gate_requires_machine_readable_targets(self):
+        run_dir = run_state.init_run(
+            self.root, "empty", run_id="run-empty"
+        )
+        (run_dir / "brief.md").write_text("# Brief", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "target_viewports"):
+            run_state.transition_run(run_dir, "brief_ready")
+
+        manifest = run_state.load_run(run_dir)
+        manifest["target_viewports"] = ["390x844"]
+        (run_dir / "run.json").write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "required_content"):
+            run_state.transition_run(run_dir, "brief_ready")
+
+    def test_empty_interactions_require_explicit_none_in_brief(self):
+        run_dir = run_state.init_run(
+            self.root,
+            "static",
+            run_id="run-static",
+            target_viewports=["390x844"],
+            required_content=["Headline"],
+        )
+        (run_dir / "brief.md").write_text("# Static brief", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "interactive requirements"):
+            run_state.transition_run(run_dir, "brief_ready")
+        (run_dir / "brief.md").write_text(
+            "# Static brief\n\nInteractive requirements: none", encoding="utf-8"
+        )
+        self.assertEqual(
+            run_state.transition_run(run_dir, "brief_ready")["state"], "brief_ready"
+        )
+
+    def test_generation_authorization_fails_closed_and_tracks_exact_state(self):
+        self.assertFalse(run_state.image_generation_allowed(self.run_dir))
+        self.advance_to_pending()
+        self.assertFalse(run_state.image_generation_allowed(self.run_dir))
+        run_state.transition_run(
+            self.run_dir, "directions_approved", approved_direction_ids=["d-0"]
+        )
+        self.assertTrue(run_state.image_generation_allowed(self.run_dir))
+        self.write_mockups(["d-0"])
+        run_state.transition_run(self.run_dir, "mockups_generated")
+        self.assertFalse(run_state.image_generation_allowed(self.run_dir))
+
+        (self.run_dir / "run.json").write_text("{tampered", encoding="utf-8")
+        self.assertFalse(run_state.image_generation_allowed(self.run_dir))
+
+    def test_can_generate_cli_returns_boolean_and_status_without_traceback(self):
+        for expected, returncode in (("false", 1),):
+            result = subprocess.run(
+                [sys.executable, run_state.__file__, "can-generate", "--run", str(self.run_dir)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, returncode)
+            self.assertEqual(result.stdout.strip(), expected)
+            self.assertNotIn("Traceback", result.stderr)
+
+        self.advance_to_pending()
+        run_state.transition_run(
+            self.run_dir, "directions_approved", approved_direction_ids=["d-0"]
+        )
+        result = subprocess.run(
+            [sys.executable, run_state.__file__, "can-generate", "--run", str(self.run_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "true")
+
+        (self.run_dir / "run.json").write_text("{tampered", encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, run_state.__file__, "can-generate", "--run", str(self.run_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout.strip(), "false")
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_public_interfaces_expose_promised_annotations(self):
         init_signature = inspect.signature(run_state.init_run)
         self.assertEqual(init_signature.parameters["project_path"].annotation, str | None)
         self.assertEqual(init_signature.parameters["now"].annotation, str | None)
         self.assertEqual(init_signature.parameters["run_id"].annotation, str | None)
+        for name in (
+            "target_viewports",
+            "required_content",
+            "required_interactions",
+            "production_paths",
+        ):
+            self.assertEqual(init_signature.parameters[name].annotation, list[str] | None)
         self.assertEqual(init_signature.return_annotation, Path)
 
         load_signature = inspect.signature(run_state.load_run)
@@ -218,6 +430,10 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(revise_signature.parameters["reason"].annotation, str)
         self.assertEqual(revise_signature.parameters["now"].annotation, str | None)
         self.assertEqual(revise_signature.return_annotation, dict)
+
+        generation_signature = inspect.signature(run_state.image_generation_allowed)
+        self.assertEqual(generation_signature.parameters["run_dir"].annotation, Path)
+        self.assertEqual(generation_signature.return_annotation, bool)
 
     def test_init_rejects_absolute_run_id(self):
         absolute_run_id = str(self.root / "absolute-run")
@@ -457,6 +673,9 @@ class RunStateTests(unittest.TestCase):
                     "revision",
                     now="2026-07-19T12:00:00Z",
                     run_id=f"revision-{index}",
+                    target_viewports=["390x844"],
+                    required_content=["Order summary"],
+                    required_interactions=["Edit order"],
                 )
                 manifest = run_state.load_run(run_dir)
                 manifest["state"] = "mockups_generated"

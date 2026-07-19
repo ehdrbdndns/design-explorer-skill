@@ -9,20 +9,20 @@ Build evidence-backed directions, then implement only the user's selection. Use 
 
 ## Core workflow
 
-1. Create or resume a run with `scripts/run_state.py`. Read `references/artifact-contracts.md`.
-2. Normalize inputs, viewport, and project constraints into `brief.md`.
+1. Create or resume a run with `scripts/run_state.py`, recording target viewports, required content/interactions, and protected production paths. Read `references/artifact-contracts.md`.
+2. Normalize the same requirements into `brief.md`; the machine-readable run fields are the verification source of truth.
 3. Read `references/research-evidence.md`; collect traceable visual references and problem-relevant UX evidence.
 4. Produce at least five directions. Every pair differs on at least three axes: layout, typography, palette, density, imagery, interaction. Link official evidence and disclose `baseline_exceptions`.
 5. Validate research and directions. Present every direction in the response using the complete user-facing block in `references/research-evidence.md`; artifact links are not substitutes.
 6. Transition to `directions_pending_approval` and stop for explicit approval. Never infer it.
 7. Record approved IDs and transition to `directions_approved`.
-8. Read `references/mockups-implementation.md`; generate comparable full-screen UI mockups only for approved directions.
+8. Read `references/mockups-implementation.md`; run `can-generate` immediately before each provider call and generate comparable full-screen UI mockups only when it returns true.
 9. Record outputs and validate coverage. Ask the user to select, or `revise` a bounded variation as a first-class direction ID and reapprove it.
-10. Implement an isolated preview using the active project's stack, or the standalone React fallback. Verify its rendered result before offering production integration.
+10. Implement an isolated preview using the active project's stack, or the standalone React fallback. Record exact-size per-viewport screenshots and item-level passing evidence before offering production integration.
 
 ## Hard gates
 
-- Do not call image generation unless `run.json` is at `directions_approved`.
+- Do not call image generation unless `scripts/run_state.py can-generate --run <run-dir>` exits 0 immediately before the call.
 - Do not present color-only variations as distinct directions; the validator enforces three axes.
 - Do not fabricate citations or hide conflicting evidence. Separate sources from inference.
 - Do not silently violate an official accessibility/platform baseline; disclose justified exceptions for explicit approval.

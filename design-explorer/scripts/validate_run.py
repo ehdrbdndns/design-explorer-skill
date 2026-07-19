@@ -3,6 +3,7 @@ import argparse
 import ipaddress
 import json
 import re
+import struct
 import sys
 import unicodedata
 from datetime import datetime
@@ -43,6 +44,7 @@ RFC3339_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
 )
 VIEWPORT_PATTERN = re.compile(r"[1-9]\d*x[1-9]\d*")
+MAX_VIEWPORT_DIMENSION = 10_000
 PROMPT_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 BLOCKED_HOST_SUFFIXES = (
     "localhost",
@@ -180,6 +182,56 @@ def valid_artifact_ref(value, allow_provider_hint: bool = False) -> bool:
         not path.is_absolute()
         and all(part not in {"", ".", ".."} for part in parts)
     )
+
+
+def normalized_viewport(value) -> str | None:
+    if not isinstance(value, str) or not VIEWPORT_PATTERN.fullmatch(value):
+        return None
+    width, height = (int(part) for part in value.split("x"))
+    if width > MAX_VIEWPORT_DIMENSION or height > MAX_VIEWPORT_DIMENSION:
+        return None
+    return f"{width}x{height}"
+
+
+def normalized_string_list(value, label: str, errors: list[str]) -> list[str] | None:
+    if (
+        not isinstance(value, list)
+        or any(not isinstance(item, str) or not item.strip() for item in value)
+    ):
+        errors.append(f"{label} must be a list of non-empty strings")
+        return None
+    normalized = [item.strip() for item in value]
+    if normalized != value or len(set(normalized)) != len(normalized):
+        errors.append(f"{label} must be normalized and unique")
+        return None
+    return normalized
+
+
+def resolved_scoped_path(base: Path, relative: str) -> Path | None:
+    if not valid_artifact_ref(relative):
+        return None
+    try:
+        base = base.resolve(strict=True)
+        candidate = (base / relative).resolve(strict=True)
+        candidate.relative_to(base)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return candidate
+
+
+def png_dimensions(path: Path) -> tuple[int, int] | None:
+    try:
+        header = path.read_bytes()[:24]
+    except OSError:
+        return None
+    if (
+        len(header) != 24
+        or header[:8] != b"\x89PNG\r\n\x1a\n"
+        or header[8:12] != b"\x00\x00\x00\r"
+        or header[12:16] != b"IHDR"
+    ):
+        return None
+    return struct.unpack(">II", header[16:24])
 
 
 def find_secret_errors(value, label: str) -> list[str]:
@@ -633,26 +685,133 @@ def validate_implementation(run_dir: Path) -> list[str]:
     mode = implementation.get("mode")
     if not isinstance(mode, str) or mode not in {"project", "standalone"}:
         errors.append("implementation mode must be project or standalone")
-    if not isinstance(implementation.get("preview_path"), str) or not implementation["preview_path"].strip():
+
+    target_viewports = normalized_string_list(
+        run.get("target_viewports"), "run target_viewports", errors
+    )
+    if target_viewports is not None and any(
+        normalized_viewport(viewport) != viewport for viewport in target_viewports
+    ):
+        errors.append("run target_viewports must contain normalized WIDTHxHEIGHT values")
+        target_viewports = None
+    required_content = normalized_string_list(
+        run.get("required_content"), "run required_content", errors
+    )
+    required_interactions = normalized_string_list(
+        run.get("required_interactions"), "run required_interactions", errors
+    )
+    production_paths = normalized_string_list(
+        run.get("production_paths"), "run production_paths", errors
+    )
+    if production_paths is not None and any(
+        not valid_artifact_ref(path) for path in production_paths
+    ):
+        errors.append("run production_paths must be safe project-relative paths")
+        production_paths = None
+
+    preview_path = implementation.get("preview_path")
+    if not isinstance(preview_path, str) or not preview_path.strip():
         errors.append("implementation preview_path is required")
-    elif not valid_artifact_ref(implementation["preview_path"]):
-        errors.append("implementation preview_path must be a safe relative path")
+        preview_path = None
+    elif not valid_artifact_ref(preview_path):
+        errors.append("implementation preview_path must be a safe project-relative path")
+        preview_path = None
+
+    preview_files = normalized_string_list(
+        implementation.get("preview_files"), "implementation preview_files", errors
+    )
+    if preview_files is not None:
+        if not preview_files:
+            errors.append("implementation preview_files must be non-empty")
+        elif any(not valid_artifact_ref(path) for path in preview_files):
+            errors.append("implementation preview_files must be safe project-relative paths")
+            preview_files = None
+    if preview_path is not None and preview_files is not None and preview_path not in preview_files:
+        errors.append("implementation preview_path must be included in preview_files")
+
+    preview_route = implementation.get("preview_route")
+    if (
+        not isinstance(preview_route, str)
+        or not preview_route.startswith("/")
+        or preview_route.startswith("//")
+        or "//" in preview_route
+        or "?" in preview_route
+        or "#" in preview_route
+        or "\\" in preview_route
+        or re.search(r"%(?:2e|2f|5c)", preview_route, re.IGNORECASE)
+        or any(part in {".", ".."} for part in preview_route.split("/"))
+        or any(character.isspace() or unicodedata.category(character) == "Cc" for character in preview_route)
+    ):
+        errors.append("implementation preview_route must be a normalized absolute URL path")
+
+    project_root = None
+    project_path = run.get("project_path")
+    if mode == "project":
+        if not isinstance(project_path, str) or not Path(project_path).is_absolute():
+            errors.append("project mode requires project_path to be an existing absolute directory")
+        else:
+            try:
+                candidate = Path(project_path).resolve(strict=True)
+            except (OSError, RuntimeError):
+                candidate = None
+            if candidate is None or not candidate.is_dir():
+                errors.append("project mode requires project_path to be an existing absolute directory")
+            else:
+                project_root = candidate
+    elif mode == "standalone":
+        if production_paths:
+            errors.append("standalone mode requires production_paths to be empty")
+        project_root = Path(run_dir)
+
+    resolved_previews = []
+    if project_root is not None and preview_files is not None:
+        for path in preview_files:
+            resolved = resolved_scoped_path(project_root, path)
+            if resolved is None or not resolved.is_file():
+                errors.append(f"implementation preview file must be an existing file: {path}")
+            else:
+                resolved_previews.append((path, resolved))
+
+    resolved_production = []
+    if mode == "project" and project_root is not None and production_paths is not None:
+        for path in production_paths:
+            resolved = resolved_scoped_path(project_root, path)
+            if resolved is None or not resolved.exists():
+                errors.append(f"production_path must exist in project: {path}")
+            else:
+                resolved_production.append((path, resolved))
+        for preview_name, preview in resolved_previews:
+            for production_name, production in resolved_production:
+                try:
+                    preview.relative_to(production)
+                except ValueError:
+                    continue
+                errors.append(
+                    f"preview file {preview_name} overlaps production_path {production_name}"
+                )
+
+    if mode == "standalone" and preview_files is not None:
+        if not any(PurePosixPath(path).name == "package.json" for path in preview_files):
+            errors.append("standalone preview_files must include package.json")
+        entry_pattern = re.compile(r"(?:^|/)src/(?:main|index)\.(?:js|jsx|ts|tsx)$")
+        if not any(entry_pattern.search(path) for path in preview_files):
+            errors.append("standalone preview_files must include an entry source file")
+
     verification = implementation.get("verification", {})
     if not isinstance(verification, dict):
         errors.append("implementation verification must be an object")
         verification = {}
     rendered_viewports = verification.get("rendered_viewports")
-    if (
-        not isinstance(rendered_viewports, list)
-        or not rendered_viewports
-        or any(
-            not isinstance(viewport, str) or not viewport.strip()
-            for viewport in rendered_viewports
-        )
-    ):
-        errors.append(
-            "implementation rendered_viewports must be a non-empty list of non-empty strings"
-        )
+    normalized_rendered = normalized_string_list(
+        rendered_viewports, "implementation rendered_viewports", errors
+    )
+    if normalized_rendered is not None:
+        if not normalized_rendered or any(
+            normalized_viewport(viewport) != viewport for viewport in normalized_rendered
+        ):
+            errors.append("implementation rendered_viewports must use normalized WIDTHxHEIGHT")
+        elif target_viewports is not None and normalized_rendered != target_viewports:
+            errors.append("implementation rendered_viewports must exactly match run target_viewports")
     checks = verification.get("checks", {})
     if not isinstance(checks, dict):
         errors.append("implementation checks must be an object")
@@ -660,6 +819,53 @@ def validate_implementation(run_dir: Path) -> list[str]:
     for name in ("content", "overflow", "accessibility"):
         if checks.get(name) != "pass":
             errors.append(f"implementation check must pass: {name}")
+
+    viewport_checks = verification.get("viewport_checks")
+    if not isinstance(viewport_checks, dict):
+        errors.append("implementation viewport_checks must be an object")
+        viewport_checks = {}
+    if target_viewports is not None and set(viewport_checks) != set(target_viewports):
+        errors.append("implementation viewport_checks keys must exactly match run target_viewports")
+    for viewport in target_viewports or []:
+        check = viewport_checks.get(viewport)
+        label = f"implementation viewport_checks[{viewport}]"
+        if not isinstance(check, dict):
+            errors.append(f"{label} must be an object")
+            continue
+        for name in ("content", "overflow", "accessibility", "interaction"):
+            if check.get(name) != "pass":
+                errors.append(f"{label} status must pass: {name}")
+        for field, required in (
+            ("required_content", required_content),
+            ("required_interactions", required_interactions),
+        ):
+            item_checks = check.get(field)
+            if not isinstance(item_checks, dict):
+                errors.append(f"{label} {field} must be an object")
+            elif required is not None:
+                if set(item_checks) != set(required):
+                    errors.append(f"{label} {field} keys must exactly match run requirements")
+                for item in required:
+                    if item_checks.get(item) != "pass":
+                        errors.append(f"{label} {field} must pass: {item}")
+        screenshot_ref = check.get("screenshot_ref")
+        if not valid_artifact_ref(screenshot_ref):
+            errors.append(f"{label} screenshot_ref must be a safe run-relative path")
+            continue
+        screenshot = resolved_scoped_path(Path(run_dir), screenshot_ref)
+        if screenshot is None or not screenshot.is_file():
+            errors.append(f"{label} screenshot must be an existing file")
+            continue
+        dimensions = png_dimensions(screenshot)
+        if dimensions is None:
+            errors.append(f"{label} screenshot must be a PNG with IHDR")
+            continue
+        expected_dimensions = tuple(int(part) for part in viewport.split("x"))
+        if dimensions != expected_dimensions:
+            errors.append(
+                f"{label} screenshot dimensions {dimensions[0]}x{dimensions[1]} "
+                f"must match {viewport}"
+            )
     return errors
 
 
