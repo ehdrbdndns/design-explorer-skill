@@ -357,6 +357,21 @@ class ValidateRunTests(unittest.TestCase):
             errors,
         )
 
+    def test_non_string_direction_kind_returns_a_validation_error(self):
+        self.write("evidence.json", [evidence()])
+        for kind in ([], {}):
+            with self.subTest(kind=kind):
+                directions = distinct_directions()
+                directions[0]["kind"] = kind
+                self.write("directions.json", directions)
+
+                errors = validator.validate_phase(self.run, "directions")
+
+                self.assertIn(
+                    "directions[0] kind must be primary or derived",
+                    errors,
+                )
+
     def test_derived_sources_reject_malformed_dangling_self_and_later_ids(self):
         self.write("evidence.json", [evidence()])
         cases = (

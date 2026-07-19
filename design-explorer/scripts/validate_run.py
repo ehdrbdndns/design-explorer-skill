@@ -74,7 +74,7 @@ def validate_direction_derivation(
     errors: list[str],
 ) -> None:
     kind = item.get("kind")
-    if kind not in {"primary", "derived"}:
+    if not isinstance(kind, str) or kind not in {"primary", "derived"}:
         errors.append(f"directions[{index}] kind must be primary or derived")
         return
     if kind == "primary":
