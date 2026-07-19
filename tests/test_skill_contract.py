@@ -36,6 +36,23 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn('display_name: "Design Explorer"', text)
         self.assertIn("$design-explorer", text)
 
+    def test_skill_contains_required_gates_and_resource_routing(self):
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        required = (
+            "directions_pending_approval",
+            "directions_approved",
+            "Do not call image generation",
+            "at least five",
+            "three axes",
+            "explicit approval",
+            "isolated preview",
+            "references/research-evidence.md",
+            "references/mockups-implementation.md",
+            "references/artifact-contracts.md",
+        )
+        for phrase in required:
+            self.assertIn(phrase, text)
+
 
 if __name__ == "__main__":
     unittest.main()
