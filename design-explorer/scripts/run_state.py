@@ -34,6 +34,11 @@ DEFAULT_MAX_ATTEMPTS_PER_DIRECTION = 2
 GENERATION_TEMP_PATTERN = re.compile(
     r"\.mockup-manifest\.json\.generation-([0-9a-f]{32})\.tmp"
 )
+REVISION_MARKER_NAME = ".revision-transaction.json"
+REVISION_TEMP_PATTERN = re.compile(
+    r"\.(?:revision-transaction|run\.json\.revision)-([0-9a-f]{32})\.tmp"
+)
+REVISION_ARCHIVE_PATTERN = re.compile(r"mockup-manifest\.revision-([1-9]\d*)\.json")
 RFC3339_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
 )
@@ -217,7 +222,7 @@ def init_run(
     return run_dir
 
 
-def load_run(run_dir: Path) -> dict:
+def _load_run_without_recovery(run_dir: Path) -> dict:
     try:
         manifest = json.loads(
             (Path(run_dir) / "run.json").read_text(encoding="utf-8")
@@ -227,6 +232,17 @@ def load_run(run_dir: Path) -> dict:
     validate_run_manifest(manifest)
     validate_state_artifacts(Path(run_dir), manifest)
     return manifest
+
+
+def load_run(run_dir: Path) -> dict:
+    run_dir = Path(run_dir)
+    if os.path.lexists(run_dir / REVISION_MARKER_NAME):
+        owner = _acquire_generation_lock(run_dir, utc_now())
+        try:
+            _recover_revision_transaction(owner)
+        finally:
+            _release_generation_lock(owner)
+    return _load_run_without_recovery(run_dir)
 
 
 def _positive_integer(value) -> bool:
@@ -604,49 +620,62 @@ def revise_run(
     run_dir = Path(run_dir)
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("revision requires a non-empty reason")
-    manifest = load_run(run_dir)
-    current = manifest["state"]
-    if current != "mockups_generated":
-        raise ValueError(f"illegal revision from {current}")
-    _validate_target(run_dir, "mockups_generated", manifest)
-
-    revision_count = manifest.get("revision_count", 0)
-    if (
-        not isinstance(revision_count, int)
-        or isinstance(revision_count, bool)
-        or revision_count < 0
-    ):
-        raise ValueError("run.json revision_count must be a non-negative integer")
-    revision_count += 1
-    archive_path = run_dir / f"mockup-manifest.revision-{revision_count}.json"
-    if archive_path.exists():
-        raise ValueError(f"revision archive already exists: {archive_path.name}")
-    manifest_path = run_dir / "mockup-manifest.json"
-
     timestamp = now or utc_now()
     if not valid_rfc3339(timestamp):
         raise ValueError("revision timestamp must be RFC3339")
-    manifest["state"] = "directions_pending_approval"
-    manifest["revision_count"] = revision_count
-    manifest["last_revision_reason"] = reason.strip()
-    manifest["last_revision_at"] = timestamp
-    manifest["approved_direction_ids"] = []
-    manifest["selected_direction_id"] = None
-    manifest["generation_budget"] = DEFAULT_GENERATION_BUDGET
-    manifest["max_attempts_per_direction"] = DEFAULT_MAX_ATTEMPTS_PER_DIRECTION
-    manifest.pop("budget_expansion_approved_at", None)
-    manifest["updated_at"] = timestamp
-    validate_run_manifest(manifest)
-    manifest_path.replace(archive_path)
+    owner = _acquire_generation_lock(run_dir, timestamp)
     try:
-        _validate_phases(
-            run_dir, STATE_VALIDATION_PHASES["directions_pending_approval"]
+        _recover_revision_transaction(owner)
+        manifest = _load_run_without_recovery(owner.run_dir)
+        current = manifest["state"]
+        if current != "mockups_generated":
+            raise ValueError(f"illegal revision from {current}")
+        _validate_target(owner.run_dir, "mockups_generated", manifest)
+
+        revision_count = manifest.get("revision_count", 0)
+        if (
+            not isinstance(revision_count, int)
+            or isinstance(revision_count, bool)
+            or revision_count < 0
+        ):
+            raise ValueError("run.json revision_count must be a non-negative integer")
+        revision_count += 1
+        archive_name = f"mockup-manifest.revision-{revision_count}.json"
+        if _named_path_exists(owner.descriptor, archive_name):
+            raise ValueError(f"revision archive already exists: {archive_name}")
+
+        ledger_data, ledger_metadata = _read_run_file(
+            owner, "mockup-manifest.json"
         )
-        write_json_atomic(run_dir / "run.json", manifest)
-    except Exception:
-        archive_path.replace(manifest_path)
-        raise
-    return manifest
+        if ledger_metadata.st_nlink != 1:
+            raise ValueError("current mockup manifest must have exactly one link")
+        revised = _revision_target_manifest(manifest, reason.strip(), timestamp)
+        transaction = {
+            "schema_version": 1,
+            "transaction_id": owner.transaction_id,
+            "archive_name": archive_name,
+            "ledger_digest": "sha256:" + hashlib.sha256(ledger_data).hexdigest(),
+            "ledger_device": ledger_metadata.st_dev,
+            "ledger_inode": ledger_metadata.st_ino,
+            "old_run": manifest,
+            "new_run": revised,
+        }
+        try:
+            _publish_revision_marker(owner, transaction)
+            active = _load_revision_transaction(owner)
+            _archive_revision_ledger(owner, active)
+            _validate_phases(
+                owner.run_dir,
+                STATE_VALIDATION_PHASES["directions_pending_approval"],
+            )
+            _publish_revision_run(owner, active)
+            _remove_revision_marker(owner, active)
+        except BaseException:
+            _recover_revision_transaction(owner)
+            raise
+        return revised
+    finally:
+        _release_generation_lock(owner)
 
 
 def _read_mockup_manifest(run_dir: Path) -> dict:
@@ -1270,7 +1299,10 @@ def _acquire_generation_lock(run_dir: Path, timestamp: str) -> _GenerationLock:
         _assert_generation_run_identity(owner)
         removed_temp = False
         for name in os.listdir(descriptor):
-            if GENERATION_TEMP_PATTERN.fullmatch(name) is None:
+            if (
+                GENERATION_TEMP_PATTERN.fullmatch(name) is None
+                and REVISION_TEMP_PATTERN.fullmatch(name) is None
+            ):
                 continue
             try:
                 os.unlink(name, dir_fd=descriptor)
@@ -1313,6 +1345,413 @@ def _release_generation_lock(owner: _GenerationLock) -> None:
                 os.close(owner.account_home_descriptor)
 
 
+@dataclass(frozen=True)
+class _StagedRevisionJson:
+    descriptor: int
+    name: str
+    data: bytes
+    value: dict
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class _RevisionTransaction:
+    marker_device: int
+    marker_inode: int
+    transaction_id: str
+    archive_name: str
+    ledger_digest: str
+    ledger_device: int
+    ledger_inode: int
+    old_run: dict
+    new_run: dict
+
+
+def _named_path_exists(directory_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _revision_target_manifest(manifest: dict, reason: str, timestamp: str) -> dict:
+    revised = json.loads(json.dumps(manifest))
+    revised["state"] = "directions_pending_approval"
+    revised["revision_count"] += 1
+    revised["last_revision_reason"] = reason
+    revised["last_revision_at"] = timestamp
+    revised["approved_direction_ids"] = []
+    revised["selected_direction_id"] = None
+    revised["generation_budget"] = DEFAULT_GENERATION_BUDGET
+    revised["max_attempts_per_direction"] = DEFAULT_MAX_ATTEMPTS_PER_DIRECTION
+    revised.pop("budget_expansion_approved_at", None)
+    revised["updated_at"] = timestamp
+    validate_run_manifest(revised)
+    return revised
+
+
+def _stage_revision_json(
+    owner: _GenerationLock, prefix: str, value: dict
+) -> _StagedRevisionJson:
+    name = f".{prefix}-{owner.transaction_id}.tmp"
+    data = (json.dumps(value, indent=2) + "\n").encode("utf-8")
+    descriptor = os.open(
+        name,
+        os.O_CREAT
+        | os.O_EXCL
+        | os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=owner.descriptor,
+    )
+    initial = os.fstat(descriptor)
+    try:
+        if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1:
+            raise ValueError("staged revision JSON must be a private regular file")
+        _write_all(descriptor, data)
+        _fsync_generation_file(descriptor)
+        staged_data = _read_all(descriptor)
+        try:
+            staged_value = json.loads(staged_data)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ValueError(f"staged revision JSON is invalid: {error}") from None
+        current = os.fstat(descriptor)
+        if (
+            staged_data != data
+            or staged_value != value
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or (current.st_dev, current.st_ino) != (initial.st_dev, initial.st_ino)
+            or not _named_inode_matches(
+                owner.descriptor, name, current.st_dev, current.st_ino
+            )
+        ):
+            raise ValueError("staged revision JSON changed before publication")
+        return _StagedRevisionJson(
+            descriptor,
+            name,
+            data,
+            value,
+            current.st_dev,
+            current.st_ino,
+        )
+    except BaseException:
+        if _named_inode_matches(
+            owner.descriptor, name, initial.st_dev, initial.st_ino
+        ):
+            os.unlink(name, dir_fd=owner.descriptor)
+        os.close(descriptor)
+        raise
+
+
+def _close_staged_revision_json(
+    owner: _GenerationLock, stage: _StagedRevisionJson
+) -> None:
+    try:
+        if _named_inode_matches(
+            owner.descriptor, stage.name, stage.device, stage.inode
+        ):
+            os.unlink(stage.name, dir_fd=owner.descriptor)
+    finally:
+        os.close(stage.descriptor)
+
+
+def _read_named_json(
+    owner: _GenerationLock, name: str
+) -> tuple[dict, bytes, os.stat_result]:
+    data, metadata = _read_run_file(owner, name)
+    if metadata.st_nlink != 1:
+        raise ValueError(f"{name} must have exactly one link")
+    try:
+        value = json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError(f"invalid {name}: {error}") from None
+    if not isinstance(value, dict):
+        raise ValueError(f"invalid {name}: JSON value must be an object")
+    return value, data, metadata
+
+
+def _validate_revision_transaction(
+    value: dict, metadata: os.stat_result
+) -> _RevisionTransaction:
+    required = {
+        "schema_version",
+        "transaction_id",
+        "archive_name",
+        "ledger_digest",
+        "ledger_device",
+        "ledger_inode",
+        "old_run",
+        "new_run",
+    }
+    if set(value) != required or value.get("schema_version") != 1:
+        raise ValueError("invalid revision transaction marker schema")
+    transaction_id = value.get("transaction_id")
+    if not isinstance(transaction_id, str) or re.fullmatch(
+        r"[0-9a-f]{32}", transaction_id
+    ) is None:
+        raise ValueError("invalid revision transaction ID")
+    old_run = value.get("old_run")
+    new_run = value.get("new_run")
+    validate_run_manifest(old_run)
+    validate_run_manifest(new_run)
+    if old_run["state"] != "mockups_generated":
+        raise ValueError("revision transaction old state must be mockups_generated")
+    reason = new_run.get("last_revision_reason")
+    timestamp = new_run.get("last_revision_at")
+    if not isinstance(reason, str) or not reason.strip() or not valid_rfc3339(timestamp):
+        raise ValueError("revision transaction audit fields are invalid")
+    expected_new = _revision_target_manifest(old_run, reason, timestamp)
+    if new_run != expected_new:
+        raise ValueError("revision transaction target manifest is invalid")
+    archive_name = value.get("archive_name")
+    expected_archive = f"mockup-manifest.revision-{new_run['revision_count']}.json"
+    if (
+        not isinstance(archive_name, str)
+        or REVISION_ARCHIVE_PATTERN.fullmatch(archive_name) is None
+        or archive_name != expected_archive
+    ):
+        raise ValueError("revision transaction archive path is invalid")
+    ledger_digest = value.get("ledger_digest")
+    if not isinstance(ledger_digest, str) or re.fullmatch(
+        r"sha256:[0-9a-f]{64}", ledger_digest
+    ) is None:
+        raise ValueError("revision transaction ledger digest is invalid")
+    ledger_device = value.get("ledger_device")
+    ledger_inode = value.get("ledger_inode")
+    if any(
+        not isinstance(item, int) or isinstance(item, bool) or item <= 0
+        for item in (ledger_device, ledger_inode)
+    ):
+        raise ValueError("revision transaction ledger inode is invalid")
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+    ):
+        raise ValueError("revision transaction marker must be a private regular file")
+    return _RevisionTransaction(
+        metadata.st_dev,
+        metadata.st_ino,
+        transaction_id,
+        archive_name,
+        ledger_digest,
+        ledger_device,
+        ledger_inode,
+        old_run,
+        new_run,
+    )
+
+
+def _load_revision_transaction(owner: _GenerationLock) -> _RevisionTransaction:
+    value, _data, metadata = _read_named_json(owner, REVISION_MARKER_NAME)
+    return _validate_revision_transaction(value, metadata)
+
+
+def _publish_revision_marker(owner: _GenerationLock, value: dict) -> None:
+    if _named_path_exists(owner.descriptor, REVISION_MARKER_NAME):
+        raise ValueError("a revision transaction is already pending")
+    stage = _stage_revision_json(owner, "revision-transaction", value)
+    try:
+        os.link(
+            stage.name,
+            REVISION_MARKER_NAME,
+            src_dir_fd=owner.descriptor,
+            dst_dir_fd=owner.descriptor,
+            follow_symlinks=False,
+        )
+        _fsync_directory_descriptor(owner.descriptor)
+        if not _named_inode_matches(
+            owner.descriptor, REVISION_MARKER_NAME, stage.device, stage.inode
+        ):
+            raise ValueError("revision transaction marker inode changed")
+        os.unlink(stage.name, dir_fd=owner.descriptor)
+        _fsync_directory_descriptor(owner.descriptor)
+        _load_revision_transaction(owner)
+    finally:
+        _close_staged_revision_json(owner, stage)
+
+
+def _ledger_transaction_metadata(
+    owner: _GenerationLock,
+    transaction: _RevisionTransaction,
+    name: str,
+) -> os.stat_result | None:
+    if not _named_path_exists(owner.descriptor, name):
+        return None
+    data, metadata = _read_run_file(owner, name)
+    if (
+        metadata.st_dev != transaction.ledger_device
+        or metadata.st_ino != transaction.ledger_inode
+        or metadata.st_nlink not in {1, 2}
+        or "sha256:" + hashlib.sha256(data).hexdigest()
+        != transaction.ledger_digest
+    ):
+        raise ValueError(f"revision ledger identity mismatch: {name}")
+    try:
+        value = json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError(f"invalid revision ledger {name}: {error}") from None
+    if not isinstance(value, dict) or not isinstance(value.get("mockups"), list):
+        raise ValueError(f"invalid revision ledger {name}")
+    return metadata
+
+
+def _archive_revision_ledger(
+    owner: _GenerationLock, transaction: _RevisionTransaction
+) -> None:
+    current = _ledger_transaction_metadata(
+        owner, transaction, "mockup-manifest.json"
+    )
+    if current is None or current.st_nlink != 1:
+        raise ValueError("current revision ledger is unavailable")
+    if _named_path_exists(owner.descriptor, transaction.archive_name):
+        raise ValueError(
+            f"revision archive already exists: {transaction.archive_name}"
+        )
+    os.link(
+        "mockup-manifest.json",
+        transaction.archive_name,
+        src_dir_fd=owner.descriptor,
+        dst_dir_fd=owner.descriptor,
+        follow_symlinks=False,
+    )
+    _fsync_directory_descriptor(owner.descriptor)
+    linked_current = _ledger_transaction_metadata(
+        owner, transaction, "mockup-manifest.json"
+    )
+    linked_archive = _ledger_transaction_metadata(
+        owner, transaction, transaction.archive_name
+    )
+    if (
+        linked_current is None
+        or linked_archive is None
+        or linked_current.st_nlink != 2
+        or linked_archive.st_nlink != 2
+    ):
+        raise ValueError("revision archive link was not published safely")
+    os.unlink("mockup-manifest.json", dir_fd=owner.descriptor)
+    _fsync_directory_descriptor(owner.descriptor)
+    archived = _ledger_transaction_metadata(
+        owner, transaction, transaction.archive_name
+    )
+    if archived is None or archived.st_nlink != 1:
+        raise ValueError("revision archive move did not complete")
+
+
+def _publish_revision_run(
+    owner: _GenerationLock, transaction: _RevisionTransaction
+) -> None:
+    stage = _stage_revision_json(owner, "run.json.revision", transaction.new_run)
+    try:
+        _replace_path(
+            stage.name,
+            "run.json",
+            src_dir_fd=owner.descriptor,
+            dst_dir_fd=owner.descriptor,
+        )
+        _fsync_directory_descriptor(owner.descriptor)
+        value, data, metadata = _read_named_json(owner, "run.json")
+        if (
+            value != transaction.new_run
+            or data != stage.data
+            or (metadata.st_dev, metadata.st_ino) != (stage.device, stage.inode)
+        ):
+            raise ValueError("published revision run manifest did not match stage")
+    finally:
+        _close_staged_revision_json(owner, stage)
+
+
+def _remove_revision_marker(
+    owner: _GenerationLock, transaction: _RevisionTransaction
+) -> None:
+    if not _named_inode_matches(
+        owner.descriptor,
+        REVISION_MARKER_NAME,
+        transaction.marker_device,
+        transaction.marker_inode,
+    ):
+        raise ValueError("revision transaction marker path was replaced")
+    os.unlink(REVISION_MARKER_NAME, dir_fd=owner.descriptor)
+    _fsync_directory_descriptor(owner.descriptor)
+
+
+def _restore_revision_ledger(
+    owner: _GenerationLock,
+    transaction: _RevisionTransaction,
+    current: os.stat_result | None,
+    archive: os.stat_result | None,
+) -> None:
+    if current is not None and archive is None:
+        if current.st_nlink != 1:
+            raise ValueError("current revision ledger link count is invalid")
+        return
+    if current is not None and archive is not None:
+        if current.st_nlink != 2 or archive.st_nlink != 2:
+            raise ValueError("split revision ledger links are invalid")
+        os.unlink(transaction.archive_name, dir_fd=owner.descriptor)
+        _fsync_directory_descriptor(owner.descriptor)
+    elif current is None and archive is not None:
+        if archive.st_nlink != 1:
+            raise ValueError("revision archive link count is invalid")
+        os.link(
+            transaction.archive_name,
+            "mockup-manifest.json",
+            src_dir_fd=owner.descriptor,
+            dst_dir_fd=owner.descriptor,
+            follow_symlinks=False,
+        )
+        _fsync_directory_descriptor(owner.descriptor)
+        restored_archive = _ledger_transaction_metadata(
+            owner, transaction, transaction.archive_name
+        )
+        restored_current = _ledger_transaction_metadata(
+            owner, transaction, "mockup-manifest.json"
+        )
+        if (
+            restored_archive is None
+            or restored_current is None
+            or restored_archive.st_nlink != 2
+            or restored_current.st_nlink != 2
+        ):
+            raise ValueError("revision ledger rollback link failed")
+        os.unlink(transaction.archive_name, dir_fd=owner.descriptor)
+        _fsync_directory_descriptor(owner.descriptor)
+    else:
+        raise ValueError("revision transaction lost both ledger names")
+    restored = _ledger_transaction_metadata(
+        owner, transaction, "mockup-manifest.json"
+    )
+    if restored is None or restored.st_nlink != 1:
+        raise ValueError("revision ledger rollback did not complete")
+
+
+def _recover_revision_transaction(owner: _GenerationLock) -> bool:
+    if not _named_path_exists(owner.descriptor, REVISION_MARKER_NAME):
+        return False
+    transaction = _load_revision_transaction(owner)
+    actual_run, _run_data, _run_metadata = _read_named_json(owner, "run.json")
+    current = _ledger_transaction_metadata(
+        owner, transaction, "mockup-manifest.json"
+    )
+    archive = _ledger_transaction_metadata(
+        owner, transaction, transaction.archive_name
+    )
+    if actual_run == transaction.old_run:
+        _restore_revision_ledger(owner, transaction, current, archive)
+        _remove_revision_marker(owner, transaction)
+        return True
+    if actual_run == transaction.new_run:
+        if current is not None or archive is None or archive.st_nlink != 1:
+            raise ValueError("committed revision ledger/archive state is invalid")
+        _remove_revision_marker(owner, transaction)
+        return True
+    raise ValueError("run.json does not match either revision transaction state")
+
+
 def authorize_generation(
     run_dir: Path, direction_id: str, now: str | None = None
 ) -> dict:
@@ -1322,6 +1761,7 @@ def authorize_generation(
         raise ValueError("generation authorization timestamp must be RFC3339")
     owner = _acquire_generation_lock(run_dir, timestamp)
     try:
+        _recover_revision_transaction(owner)
         _manifest, mockup_manifest, entry = _generation_preflight(
             owner.run_dir, direction_id
         )

@@ -245,6 +245,83 @@ class RunStateTests(unittest.TestCase):
             },
         )
 
+    def prepare_revision_transaction(self):
+        self.set_state("mockups_generated")
+        self.write_mockups(["d-0"])
+        return (
+            (self.run_dir / "run.json").read_bytes(),
+            (self.run_dir / "mockup-manifest.json").read_bytes(),
+        )
+
+    def interrupt_after_revision_helper(self, helper_name):
+        original = getattr(run_state, helper_name, None)
+
+        def interrupt(*args, **kwargs):
+            result = original(*args, **kwargs)
+            raise KeyboardInterrupt(f"interrupted after {helper_name}")
+
+        return mock.patch.object(
+            run_state,
+            helper_name,
+            new=interrupt,
+            create=original is None,
+        )
+
+    def assert_revision_rolled_back(self, run_bytes, ledger_bytes):
+        first = run_state.load_run(self.run_dir)
+        second = run_state.load_run(self.run_dir)
+        self.assertEqual(first, second)
+        self.assertEqual(first["state"], "mockups_generated")
+        self.assertEqual(first["revision_count"], 0)
+        self.assertEqual((self.run_dir / "run.json").read_bytes(), run_bytes)
+        self.assertEqual(
+            (self.run_dir / "mockup-manifest.json").read_bytes(), ledger_bytes
+        )
+        self.assertFalse(
+            (self.run_dir / "mockup-manifest.revision-1.json").exists()
+        )
+        self.assertFalse((self.run_dir / ".revision-transaction.json").exists())
+
+    def assert_revision_committed(self, ledger_bytes, reason):
+        first = run_state.load_run(self.run_dir)
+        second = run_state.load_run(self.run_dir)
+        self.assertEqual(first, second)
+        self.assertEqual(first["state"], "directions_pending_approval")
+        self.assertEqual(first["revision_count"], 1)
+        self.assertEqual(first["last_revision_reason"], reason)
+        self.assertFalse((self.run_dir / "mockup-manifest.json").exists())
+        self.assertEqual(
+            (self.run_dir / "mockup-manifest.revision-1.json").read_bytes(),
+            ledger_bytes,
+        )
+        self.assertFalse((self.run_dir / ".revision-transaction.json").exists())
+
+    def leave_durable_revision_marker(self):
+        real_recover = run_state._recover_revision_transaction
+        recovery_calls = 0
+
+        def skip_exception_recovery(owner):
+            nonlocal recovery_calls
+            recovery_calls += 1
+            if recovery_calls == 1:
+                return real_recover(owner)
+            return False
+
+        with mock.patch.object(
+            run_state,
+            "_recover_revision_transaction",
+            side_effect=skip_exception_recovery,
+        ), self.interrupt_after_revision_helper("_publish_revision_marker"):
+            with self.assertRaises(KeyboardInterrupt):
+                run_state.revise_run(
+                    self.run_dir,
+                    "Create a recoverable variation",
+                    now="2026-07-19T12:03:00Z",
+                )
+        marker = self.run_dir / ".revision-transaction.json"
+        self.assertTrue(marker.is_file())
+        return marker
+
     def advance_to_pending(self, direction_count=5):
         self.write_brief()
         run_state.transition_run(self.run_dir, "brief_ready")
@@ -674,7 +751,7 @@ class RunStateTests(unittest.TestCase):
         self.write("run.json", manifest)
 
         with mock.patch.object(
-            run_state, "write_json_atomic", side_effect=OSError("disk full")
+            run_state, "_publish_revision_run", side_effect=OSError("disk full")
         ):
             with self.assertRaisesRegex(OSError, "disk full"):
                 run_state.revise_run(self.run_dir, "Create a variation")
@@ -716,6 +793,184 @@ class RunStateTests(unittest.TestCase):
         self.assertFalse(
             (self.run_dir / "mockup-manifest.revision-1.json").exists()
         )
+
+    def test_revision_recovers_interrupt_after_marker_publication(self):
+        run_bytes, ledger_bytes = self.prepare_revision_transaction()
+        with self.interrupt_after_revision_helper("_publish_revision_marker"):
+            with self.assertRaises(KeyboardInterrupt):
+                run_state.revise_run(
+                    self.run_dir,
+                    "Create a recoverable variation",
+                    now="2026-07-19T12:03:00Z",
+                )
+        self.assert_revision_rolled_back(run_bytes, ledger_bytes)
+
+    def test_revision_recovers_interrupt_after_archive_move(self):
+        run_bytes, ledger_bytes = self.prepare_revision_transaction()
+        with self.interrupt_after_revision_helper("_archive_revision_ledger"):
+            with self.assertRaises(KeyboardInterrupt):
+                run_state.revise_run(
+                    self.run_dir,
+                    "Create a recoverable variation",
+                    now="2026-07-19T12:03:00Z",
+                )
+        self.assert_revision_rolled_back(run_bytes, ledger_bytes)
+
+    def test_revision_does_not_rollback_interrupt_after_run_commit(self):
+        _run_bytes, ledger_bytes = self.prepare_revision_transaction()
+        reason = "Create a committed variation"
+        with self.interrupt_after_revision_helper("_publish_revision_run"):
+            with self.assertRaises(KeyboardInterrupt):
+                run_state.revise_run(
+                    self.run_dir,
+                    reason,
+                    now="2026-07-19T12:03:00Z",
+                )
+        self.assert_revision_committed(ledger_bytes, reason)
+
+    def test_revision_cleanup_interrupt_is_idempotently_committed(self):
+        _run_bytes, ledger_bytes = self.prepare_revision_transaction()
+        reason = "Create a durable variation"
+        with self.interrupt_after_revision_helper("_remove_revision_marker"):
+            with self.assertRaises(KeyboardInterrupt):
+                run_state.revise_run(
+                    self.run_dir,
+                    reason,
+                    now="2026-07-19T12:03:00Z",
+                )
+        self.assert_revision_committed(ledger_bytes, reason)
+
+    def test_revision_uses_generation_lock_order_against_public_cli(self):
+        run_bytes, ledger_bytes = self.prepare_revision_transaction()
+        owner = run_state._acquire_generation_lock(
+            self.run_dir, "2026-07-19T12:03:00Z"
+        )
+        try:
+            contender = subprocess.run(
+                [
+                    sys.executable,
+                    run_state.__file__,
+                    "revise",
+                    "--run",
+                    str(self.run_dir),
+                    "--reason",
+                    "Contending revision",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(contender.returncode, 0, contender.stdout)
+            self.assertIn("already in progress", contender.stderr)
+            self.assertEqual((self.run_dir / "run.json").read_bytes(), run_bytes)
+            self.assertEqual(
+                (self.run_dir / "mockup-manifest.json").read_bytes(), ledger_bytes
+            )
+        finally:
+            run_state._release_generation_lock(owner)
+
+    def test_revision_sigkill_after_archive_is_recovered_on_repeated_load(self):
+        run_bytes, ledger_bytes = self.prepare_revision_transaction()
+        child_code = '''
+import importlib.util
+import pathlib
+import sys
+import time
+
+module_path, run_path = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("revision_child", module_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+original = getattr(module, "_archive_revision_ledger", None)
+if original is not None:
+    def pause_after_archive(*args, **kwargs):
+        result = original(*args, **kwargs)
+        print("archived", flush=True)
+        time.sleep(60)
+        return result
+    module._archive_revision_ledger = pause_after_archive
+else:
+    original_replace = pathlib.Path.replace
+    def pause_after_replace(source, destination):
+        result = original_replace(source, destination)
+        if source.name == "mockup-manifest.json":
+            print("archived", flush=True)
+            time.sleep(60)
+        return result
+    pathlib.Path.replace = pause_after_replace
+module.revise_run(
+    pathlib.Path(run_path),
+    "Create a crash-safe variation",
+    now="2026-07-19T12:03:00Z",
+)
+'''
+        child = subprocess.Popen(
+            [sys.executable, "-c", child_code, run_state.__file__, str(self.run_dir)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "archived")
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=5)
+        try:
+            self.assert_revision_rolled_back(run_bytes, ledger_bytes)
+        except ValueError as error:
+            self.fail(f"SIGKILL split revision was not recoverable: {error}")
+
+    def test_revision_recovery_rejects_unsafe_marker_path_without_mutation(self):
+        run_bytes, ledger_bytes = self.prepare_revision_transaction()
+        marker = self.leave_durable_revision_marker()
+        value = json.loads(marker.read_text())
+        value["archive_name"] = "../outside.json"
+        marker.write_text(json.dumps(value), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "archive path is invalid"):
+            run_state.load_run(self.run_dir)
+        self.assertEqual((self.run_dir / "run.json").read_bytes(), run_bytes)
+        self.assertEqual(
+            (self.run_dir / "mockup-manifest.json").read_bytes(), ledger_bytes
+        )
+        self.assertFalse((self.root / "outside.json").exists())
+
+    def test_revision_recovery_never_overwrites_colliding_archive(self):
+        run_bytes, ledger_bytes = self.prepare_revision_transaction()
+        self.leave_durable_revision_marker()
+        collision = self.run_dir / "mockup-manifest.revision-1.json"
+        collision.write_bytes(b'{"collision": true}\n')
+        collision_bytes = collision.read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "ledger identity mismatch"):
+            run_state.load_run(self.run_dir)
+        self.assertEqual((self.run_dir / "run.json").read_bytes(), run_bytes)
+        self.assertEqual(
+            (self.run_dir / "mockup-manifest.json").read_bytes(), ledger_bytes
+        )
+        self.assertEqual(collision.read_bytes(), collision_bytes)
+
+    def test_revision_recovery_rejects_malformed_marker_json(self):
+        run_bytes, ledger_bytes = self.prepare_revision_transaction()
+        marker = self.leave_durable_revision_marker()
+        marker.write_bytes(b"{malformed")
+
+        with self.assertRaisesRegex(ValueError, "invalid .revision-transaction.json"):
+            run_state.load_run(self.run_dir)
+        self.assertEqual((self.run_dir / "run.json").read_bytes(), run_bytes)
+        self.assertEqual(
+            (self.run_dir / "mockup-manifest.json").read_bytes(), ledger_bytes
+        )
+
+    def test_generation_invocation_recovers_revision_under_its_held_lock(self):
+        run_bytes, ledger_bytes = self.prepare_revision_transaction()
+        self.leave_durable_revision_marker()
+
+        with self.assertRaisesRegex(ValueError, "generation requires state"):
+            run_state.authorize_generation(self.run_dir, "d-0")
+        self.assert_revision_rolled_back(run_bytes, ledger_bytes)
 
     def test_load_rejects_unsupported_or_malformed_manifest_schema(self):
         manifest = json.loads((self.run_dir / "run.json").read_text())

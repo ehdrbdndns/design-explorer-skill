@@ -87,6 +87,10 @@ python3 scripts/run_state.py revise --run <run-dir> --reason "<user-request>"
 
 `revise` requires a non-empty reason and validates the current mockup manifest before archiving or mutating anything. It archives `mockup-manifest.json` as `mockup-manifest.revision-<n>.json`, increments `revision_count`, records `last_revision_reason` and `last_revision_at`, clears approved/selected IDs, resets the generation/attempt budgets to defaults, clears the expansion timestamp, and returns to `directions_pending_approval`. Append the derived direction, validate and present it, obtain explicit approval again, and then create a new manifest containing only newly approved IDs.
 
+Revision uses the same account-home → runs-root → run-directory lock order as generation authorization. Before moving the ledger, it fsyncs a durable revision transaction marker containing the exact old and target run manifests, safe archive name, transaction ID, and bound ledger digest/inode. The archive move uses a no-overwrite link/unlink sequence with directory fsyncs; it never overwrites an existing revision archive. The target `run.json` is staged, fsynced, atomically replaced, verified, and directory-fsynced before marker cleanup.
+
+On `KeyboardInterrupt` or another `BaseException`, revision reconciles under the held locks and re-raises. After SIGKILL, the next `load`, `status`, `revise`, or generation authorization acquires the same locks and performs the same recovery. Recovery is idempotent: an exact old run manifest resolves to the old state with current ledger, while an exact target manifest resolves to the new directions_pending_approval state with archived ledger. Marker JSON, path, inode, ledger digest/inode, link counts, and both run manifests are validated before recovery mutates a name. A collision or mismatch fails closed. Recovery cannot roll back a committed revision, and repeated recovery never increments the revision count twice.
+
 ## Structured artifacts
 
 ### `brief.md`

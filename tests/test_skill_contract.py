@@ -313,6 +313,26 @@ class SkillContractTests(unittest.TestCase):
         ):
             self.assertIn(phrase, combined)
 
+    def test_revision_transaction_and_recovery_are_documented(self):
+        contracts = (SKILL_DIR / "references/artifact-contracts.md").read_text(
+            encoding="utf-8"
+        ).lower()
+        mockups = (SKILL_DIR / "references/mockups-implementation.md").read_text(
+            encoding="utf-8"
+        ).lower()
+        combined = contracts + "\n" + mockups
+        for phrase in (
+            "durable revision transaction marker",
+            "account-home → runs-root → run-directory",
+            "recovery is idempotent",
+            "never overwrites an existing revision archive",
+            "cannot roll back a committed revision",
+            "old state with current ledger",
+            "new directions_pending_approval state with archived ledger",
+            "sigkill",
+        ):
+            self.assertIn(phrase, combined)
+
     def test_lexer_and_render_asset_closure_are_documented(self):
         skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
         contracts = (SKILL_DIR / "references/artifact-contracts.md").read_text(
