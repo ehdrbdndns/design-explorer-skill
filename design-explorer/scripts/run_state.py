@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import pwd
 import re
 import stat
 import sys
@@ -372,6 +373,24 @@ def validate_state_artifacts(run_dir: Path, manifest: dict) -> None:
         _validate_phases(run_dir, (phase,))
         if phase == "directions":
             _validate_approved_directions(run_dir, manifest)
+    mockup_manifest_path = run_dir / "mockup-manifest.json"
+    try:
+        mockup_metadata = mockup_manifest_path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ValueError(f"invalid mockup-manifest.json: {error}") from None
+    if not stat.S_ISREG(mockup_metadata.st_mode):
+        raise ValueError(
+            "invalid mockup-manifest.json: ledger must be a regular file"
+        )
+    errors = _validator_module().validate_mockup_manifest_for_generation(run_dir)
+    if errors:
+        raise ValueError(
+            f"generation manifest validation failed: {'; '.join(errors[:5])}"
+        )
+
+
 def _validate_approved_directions(run_dir: Path, manifest: dict) -> None:
     if STATES.index(manifest["state"]) < STATES.index("directions_approved"):
         return
@@ -960,6 +979,10 @@ class _GenerationLock:
     runs_root: Path
     runs_root_device: int
     runs_root_inode: int
+    account_home_descriptor: int
+    account_home: Path
+    account_home_device: int
+    account_home_inode: int
 
 
 def _open_trusted_directory(path: Path, label: str) -> tuple[int, os.stat_result]:
@@ -988,7 +1011,117 @@ def _open_trusted_directory(path: Path, label: str) -> tuple[int, os.stat_result
         raise
 
 
+def _account_home_mutex_directory() -> tuple[int, Path, os.stat_result]:
+    uid = os.getuid()
+    try:
+        home_value = pwd.getpwuid(uid).pw_dir
+    except (KeyError, OSError) as error:
+        raise ValueError(
+            f"stable account-home generation mutex unavailable: {error}"
+        ) from None
+    if not isinstance(home_value, str) or not home_value:
+        raise ValueError(
+            "stable account-home generation mutex unavailable: passwd home is empty"
+        )
+    account_home = Path(home_value)
+    if not account_home.is_absolute():
+        raise ValueError(
+            "stable account-home generation mutex unavailable: passwd home must be absolute"
+        )
+    try:
+        resolved_home = account_home.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(
+            f"stable account-home generation mutex unavailable: {error}"
+        ) from None
+    if resolved_home != account_home:
+        raise ValueError(
+            "stable account-home generation mutex unavailable: passwd home must be a real path"
+        )
+
+    parent = account_home.parent
+    try:
+        parent_descriptor = os.open(
+            parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        raise ValueError(
+            f"stable account-home generation mutex unavailable: cannot open parent: {error}"
+        ) from None
+    try:
+        parent_metadata = os.fstat(parent_descriptor)
+        parent_named = parent.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != 0
+            or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+            or (parent_metadata.st_dev, parent_metadata.st_ino)
+            != (parent_named.st_dev, parent_named.st_ino)
+        ):
+            raise ValueError(
+                "stable account-home generation mutex unavailable: parent must be "
+                "root-owned and not group- or world-writable"
+            )
+    except OSError as error:
+        raise ValueError(
+            f"stable account-home generation mutex unavailable: invalid parent: {error}"
+        ) from None
+    finally:
+        os.close(parent_descriptor)
+
+    try:
+        descriptor = os.open(
+            account_home,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        raise ValueError(
+            f"stable account-home generation mutex unavailable: cannot open home: {error}"
+        ) from None
+    try:
+        metadata = os.fstat(descriptor)
+        named = account_home.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != uid
+            or (metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            raise ValueError(
+                "stable account-home generation mutex unavailable: passwd home "
+                "must be an owned stable directory"
+            )
+        return descriptor, account_home, metadata
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _assert_generation_account_home_identity(owner: _GenerationLock) -> None:
+    metadata = os.fstat(owner.account_home_descriptor)
+    try:
+        named = owner.account_home.stat(follow_symlinks=False)
+    except (FileNotFoundError, OSError):
+        raise ValueError("generation account home path was replaced") from None
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or (metadata.st_dev, metadata.st_ino)
+        != (owner.account_home_device, owner.account_home_inode)
+        or (named.st_dev, named.st_ino)
+        != (owner.account_home_device, owner.account_home_inode)
+    ):
+        raise ValueError("generation account home path was replaced")
+
+
 def _assert_generation_runs_root_identity(owner: _GenerationLock) -> None:
+    _assert_generation_account_home_identity(owner)
     metadata = os.fstat(owner.runs_root_descriptor)
     try:
         named = owner.runs_root.stat(follow_symlinks=False)
@@ -1026,51 +1159,79 @@ def _unlock_generation_lock(owner: _GenerationLock) -> None:
     try:
         fcntl.flock(owner.descriptor, fcntl.LOCK_UN)
     finally:
-        fcntl.flock(owner.runs_root_descriptor, fcntl.LOCK_UN)
+        try:
+            fcntl.flock(owner.runs_root_descriptor, fcntl.LOCK_UN)
+        finally:
+            fcntl.flock(owner.account_home_descriptor, fcntl.LOCK_UN)
 
 
 def _generation_lock_is_held(run_dir: Path) -> bool:
-    resolved = Path(run_dir).expanduser().resolve(strict=True)
-    runs_root = resolved.parent.resolve(strict=True)
-    root_descriptor, _root_metadata = _open_trusted_directory(
-        runs_root, "generation runs root"
+    home_descriptor, _account_home, _home_metadata = (
+        _account_home_mutex_directory()
     )
     try:
         try:
-            fcntl.flock(root_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(home_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
             if error.errno in {errno.EACCES, errno.EAGAIN}:
                 return True
             raise
-        descriptor, _metadata = _open_trusted_directory(
-            resolved, "generation run path"
+        resolved = Path(run_dir).expanduser().resolve(strict=True)
+        runs_root = resolved.parent.resolve(strict=True)
+        root_descriptor, _root_metadata = _open_trusted_directory(
+            runs_root, "generation runs root"
         )
         try:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(root_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as error:
                 if error.errno in {errno.EACCES, errno.EAGAIN}:
                     return True
                 raise
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-            return False
+            descriptor, _metadata = _open_trusted_directory(
+                resolved, "generation run path"
+            )
+            try:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as error:
+                    if error.errno in {errno.EACCES, errno.EAGAIN}:
+                        return True
+                    raise
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                return False
+            finally:
+                os.close(descriptor)
         finally:
-            os.close(descriptor)
+            try:
+                fcntl.flock(root_descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(root_descriptor)
     finally:
         try:
-            fcntl.flock(root_descriptor, fcntl.LOCK_UN)
+            fcntl.flock(home_descriptor, fcntl.LOCK_UN)
         finally:
-            os.close(root_descriptor)
+            os.close(home_descriptor)
 
 
 def _acquire_generation_lock(run_dir: Path, timestamp: str) -> _GenerationLock:
-    resolved = Path(run_dir).expanduser().resolve(strict=True)
-    runs_root = resolved.parent.resolve(strict=True)
-    root_descriptor, root_stat = _open_trusted_directory(
-        runs_root, "generation runs root"
-    )
+    home_descriptor, account_home, home_stat = _account_home_mutex_directory()
+    root_descriptor = None
     descriptor = None
     try:
+        try:
+            fcntl.flock(home_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                raise ValueError(
+                    "generation authorization is already in progress"
+                ) from None
+            raise
+        resolved = Path(run_dir).expanduser().resolve(strict=True)
+        runs_root = resolved.parent.resolve(strict=True)
+        root_descriptor, root_stat = _open_trusted_directory(
+            runs_root, "generation runs root"
+        )
         try:
             fcntl.flock(root_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
@@ -1101,6 +1262,10 @@ def _acquire_generation_lock(run_dir: Path, timestamp: str) -> _GenerationLock:
             runs_root,
             root_stat.st_dev,
             root_stat.st_ino,
+            home_descriptor,
+            account_home,
+            home_stat.st_dev,
+            home_stat.st_ino,
         )
         _assert_generation_run_identity(owner)
         removed_temp = False
@@ -1123,10 +1288,15 @@ def _acquire_generation_lock(run_dir: Path, timestamp: str) -> _GenerationLock:
                 finally:
                     os.close(descriptor)
         finally:
+            if root_descriptor is not None:
+                try:
+                    fcntl.flock(root_descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(root_descriptor)
             try:
-                fcntl.flock(root_descriptor, fcntl.LOCK_UN)
+                fcntl.flock(home_descriptor, fcntl.LOCK_UN)
             finally:
-                os.close(root_descriptor)
+                os.close(home_descriptor)
         raise
 
 
@@ -1137,7 +1307,10 @@ def _release_generation_lock(owner: _GenerationLock) -> None:
         try:
             os.close(owner.descriptor)
         finally:
-            os.close(owner.runs_root_descriptor)
+            try:
+                os.close(owner.runs_root_descriptor)
+            finally:
+                os.close(owner.account_home_descriptor)
 
 
 def authorize_generation(

@@ -1,6 +1,9 @@
+import errno
+import fcntl
 import hashlib
 import json
 import os
+import pwd
 import shutil
 import subprocess
 import sys
@@ -538,21 +541,40 @@ class PublicationGateTests(unittest.TestCase):
         self.advance_to_approved()
         self.write_pending_manifest()
         child_code = """
-import fcntl, os, sys, time
+import importlib.util, pathlib, sys, time
 path = sys.argv[1]
-fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-fcntl.flock(fd, fcntl.LOCK_EX)
+module_path = sys.argv[2]
+spec = importlib.util.spec_from_file_location("child_run_state", module_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+owner = module._acquire_generation_lock(
+    pathlib.Path(path), "2026-07-20T00:00:00Z"
+)
 print("locked", flush=True)
 time.sleep(60)
 """
         child = subprocess.Popen(
-            [sys.executable, "-c", child_code, str(self.run)],
+            [sys.executable, "-c", child_code, str(self.run), run_state.__file__],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
         try:
             self.assertEqual(child.stdout.readline().strip(), "locked")
+            account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+            home_descriptor = os.open(
+                account_home,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                with self.assertRaises(OSError) as blocked:
+                    fcntl.flock(
+                        home_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+                self.assertIn(blocked.exception.errno, {errno.EACCES, errno.EAGAIN})
+            finally:
+                os.close(home_descriptor)
             before_run = (self.run / "run.json").read_bytes()
             before_ledger = (self.run / "mockup-manifest.json").read_bytes()
             self.assertFalse(run_state.image_generation_allowed(self.run, "d-0"))
@@ -567,6 +589,15 @@ time.sleep(60)
             if child.poll() is None:
                 child.kill()
             child.communicate(timeout=5)
+        home_descriptor = os.open(
+            Path(pwd.getpwuid(os.getuid()).pw_dir),
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            fcntl.flock(home_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(home_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(home_descriptor)
         run_state.authorize_generation(self.run, "d-0")
         self.assertEqual(self.run.stat().st_ino, inode)
         self.assert_generation_lock_released()
@@ -612,7 +643,7 @@ time.sleep(60)
         self.assertEqual(ledger["generation_attempts_used"], 1)
         self.assertEqual(ledger["mockups"][0]["attempt_count"], 1)
 
-    def test_runs_root_mutex_blocks_real_process_run_directory_aba(self):
+    def test_account_home_mutex_blocks_public_cli_runs_root_aba_and_home_spoof(self):
         self.advance_to_approved()
         self.write_pending_manifest()
         before_run = (self.run / "run.json").read_bytes()
@@ -620,10 +651,16 @@ time.sleep(60)
         owner = run_state._acquire_generation_lock(
             self.run, "2026-07-20T00:00:00Z"
         )
-        moved = self.root / "publication-run-original"
-        self.run.rename(moved)
-        shutil.copytree(moved, self.run)
+        moved = self.root.with_name(f"{self.root.name}-original")
+        fake_home = self.root.with_name(f"{self.root.name}-fake-home")
+        fake_home_alias = self.root.with_name(f"{self.root.name}-fake-home-alias")
+        fake_home.mkdir()
+        fake_home_alias.symlink_to(fake_home, target_is_directory=True)
+        self.root.rename(moved)
+        shutil.copytree(moved, self.root)
         try:
+            environment = os.environ.copy()
+            environment["HOME"] = str(fake_home_alias)
             contender = subprocess.run(
                 [
                     sys.executable,
@@ -637,13 +674,16 @@ time.sleep(60)
                 capture_output=True,
                 text=True,
                 check=False,
+                env=environment,
             )
             self.assertNotEqual(contender.returncode, 0, contender.stdout)
             self.assertIn("already in progress", contender.stderr)
         finally:
-            shutil.rmtree(self.run)
-            moved.rename(self.run)
+            shutil.rmtree(self.root)
+            moved.rename(self.root)
             run_state._release_generation_lock(owner)
+            fake_home_alias.unlink()
+            fake_home.rmdir()
         self.assertEqual((self.run / "run.json").read_bytes(), before_run)
         self.assertEqual(
             (self.run / "mockup-manifest.json").read_bytes(), before_ledger
@@ -676,8 +716,28 @@ time.sleep(60)
         finally:
             self.root.chmod(original_mode)
 
+    def test_account_home_mutex_fails_closed_without_stable_parent(self):
+        fake_account_home = self.root.resolve() / "fake-account-home"
+        fake_account_home.mkdir()
+        account = mock.Mock(pw_dir=str(fake_account_home))
+        with mock.patch.object(run_state.pwd, "getpwuid", return_value=account):
+            with self.assertRaisesRegex(
+                ValueError,
+                "stable account-home generation mutex unavailable: parent must be",
+            ):
+                run_state._account_home_mutex_directory()
+
     def test_post_return_same_uid_tampering_is_detected_on_next_validation(self):
         self.advance_to_approved()
+        self.assertFalse((self.run / "mockup-manifest.json").exists())
+        self.assertEqual(run_state.load_run(self.run)["state"], "directions_approved")
+        initial_status = subprocess.run(
+            [sys.executable, run_state.__file__, "status", "--run", str(self.run)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(initial_status.returncode, 0, initial_status.stderr)
         self.write_pending_manifest()
         run_state.authorize_generation(self.run, "d-0")
         published = (self.run / "mockup-manifest.json").read_bytes()
@@ -689,6 +749,17 @@ time.sleep(60)
             any("invalid mockup-manifest.json" in error for error in errors), errors
         )
         self.assertFalse(run_state.image_generation_allowed(self.run, "d-0"))
+        with self.assertRaisesRegex(ValueError, "invalid mockup-manifest.json"):
+            run_state.load_run(self.run)
+        status = subprocess.run(
+            [sys.executable, run_state.__file__, "status", "--run", str(self.run)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(status.returncode, 1, status.stdout)
+        self.assertIn("invalid mockup-manifest.json", status.stderr)
+        self.assertNotIn("Traceback", status.stderr)
         with self.assertRaisesRegex(ValueError, "generation manifest validation failed"):
             run_state.authorize_generation(self.run, "d-0")
 

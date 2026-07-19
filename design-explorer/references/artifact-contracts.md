@@ -54,7 +54,7 @@ python3 scripts/run_state.py transition --run <run-dir> --to directions_approved
   --max-attempts-per-direction <n> --approve-budget-expansion
 ```
 
-Omit expansion flags for the default five-image/two-attempt limits. Every consuming transition invokes the relevant validator itself, including approval after review, selection after mockup generation, and integration after preview review. A validation failure leaves `run.json` unchanged; manual validator commands are useful diagnostics, not a substitute for the transition gate.
+Omit expansion flags for the default five-image/two-attempt limits. Every consuming transition invokes the relevant validator itself, including approval after review, selection after mockup generation, and integration after preview review. If mockup-manifest.json exists, its authoritative ledger and accounting integrity are checked on every load and status, including `directions_approved`; absence is allowed before first authorization. A validation failure leaves `run.json` unchanged; manual validator commands are useful diagnostics, not a substitute for the transition gate.
 
 Every caller-supplied `now` value must be RFC3339. Initialization and transitions validate the completed manifest before writing it; revision validates its timestamp and completed manifest before any archive or manifest write.
 

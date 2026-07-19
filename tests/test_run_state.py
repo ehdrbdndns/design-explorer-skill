@@ -632,6 +632,7 @@ class RunStateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-empty reason"):
             run_state.revise_run(self.run_dir, "   ")
 
+        (self.run_dir / "mockup-manifest.json").unlink()
         self.set_state("directions_approved")
         with self.assertRaisesRegex(ValueError, "illegal revision"):
             run_state.revise_run(self.run_dir, "Try a combined direction")
@@ -874,9 +875,18 @@ class RunStateTests(unittest.TestCase):
             self.run_dir, "directions_approved", approved_direction_ids=["d-0"]
         )
         self.write("mockup-manifest.json", {"mockups": []})
-        with self.assertRaisesRegex(ValueError, "mockups validation failed"):
+        with self.assertRaisesRegex(
+            ValueError, "generation manifest validation failed"
+        ):
             run_state.transition_run(self.run_dir, "mockups_generated")
-        self.assertEqual(run_state.load_run(self.run_dir)["state"], "directions_approved")
+        with self.assertRaisesRegex(
+            ValueError, "generation manifest validation failed"
+        ):
+            run_state.load_run(self.run_dir)
+        self.assertEqual(
+            json.loads((self.run_dir / "run.json").read_text())["state"],
+            "directions_approved",
+        )
 
         self.write_mockups(["d-0"])
         run_state.transition_run(self.run_dir, "mockups_generated")
