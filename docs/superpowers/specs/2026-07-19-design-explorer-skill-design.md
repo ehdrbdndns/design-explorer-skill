@@ -17,7 +17,7 @@ The skill is a clean-room alternative inspired by the useful workflow of design-
 - Run entirely through a Codex/Orca conversation.
 - Accept a text brief, user-provided images, an existing project screen, or a combination of these inputs.
 - Research references using normal web search and, when useful, the user's existing Chrome session for sites such as Google Images or Pinterest.
-- Show references and proposed mood directions before spending resources on image generation.
+- Show visual references, UX evidence, and proposed mood directions before spending resources on image generation.
 - Propose at least five directions that differ in layout and visual language, not merely color.
 - Generate a full-page or full-mobile-screen static UI mockup for every approved direction.
 - Turn a selected direction into working code that follows the active project's stack and design system.
@@ -39,8 +39,8 @@ The skill is a clean-room alternative inspired by the useful workflow of design-
 The normal workflow is a stateful sequence:
 
 1. **Brief** — understand the target screen, product goal, platform, viewport, constraints, and what must be preserved.
-2. **Research** — collect relevant references and record their source URLs and useful design traits.
-3. **Direction proposal** — present a reference board and at least five distinct mood directions.
+2. **Research** — collect relevant visual references, official UX/accessibility guidance, and task-relevant research with source URLs.
+3. **Direction proposal** — present a reference board, an evidence summary, and at least five distinct mood directions.
 4. **Approval gate 1** — allow the user to approve, reject, edit, or combine directions. No image generation occurs before this gate passes.
 5. **Mockup generation** — generate one comparable, full-screen UI mockup image per approved direction.
 6. **Selection gate 2** — allow the user to select a direction, request bounded variations, or combine chosen traits.
@@ -82,7 +82,28 @@ Each shortlisted reference records:
 
 The researcher must report low coverage honestly and broaden the search rather than invent evidence.
 
-### 5.4 Reference analyzer and mood director
+### 5.4 Design evidence researcher
+
+The evidence researcher prevents the visual search from becoming style-only imitation. It creates `design-evidence.md` using three evidence layers:
+
+1. **Official baselines** — applicable accessibility standards and platform guidance, such as W3C accessibility guidance and the target platform's official interface guidelines.
+2. **Research and established UX principles** — peer-reviewed or otherwise credible work relevant to the screen's actual problem, such as readability, cognitive load, choice architecture, error prevention, trust, or task completion.
+3. **Observed product patterns** — current real-product examples that show how comparable interfaces apply or intentionally depart from those principles.
+
+The researcher must distinguish evidence from interpretation. It must not invent papers, authors, findings, quotations, or source links. Research is problem-driven rather than exhaustive: it investigates only principles that can materially affect the target screen.
+
+Every evidence entry includes:
+
+- the UX problem or decision it informs;
+- source title, publisher or author, and direct URL;
+- source type and publication/update date when available;
+- a concise paraphrase of the relevant finding or guideline;
+- the proposed application to the target interface;
+- limitations, uncertainty, or trade-offs.
+
+Official accessibility and platform constraints form a common usability baseline for all directions. Mood exploration may vary visual expression and interaction character, but it may not silently violate that baseline. A deliberate exception must be identified, justified, and approved by the user.
+
+### 5.5 Reference analyzer and mood director
 
 The analyzer converts visual references into reusable design traits rather than copying pixels. The mood director then proposes at least five named directions using the same product requirements.
 
@@ -97,15 +118,18 @@ Every direction includes:
 - density and spacing rules;
 - interaction and motion character;
 - reference provenance;
+- the UX problem it is intended to improve;
+- applicable evidence and how the direction applies it;
+- usability, accessibility, and aesthetic trade-offs;
 - implementation difficulty and risks.
 
 For diversity, every pair of directions must differ materially on at least three of these axes: layout, typography, palette, density, imagery, interaction. Directions that only recolor the same composition are invalid and must be revised before presentation.
 
-### 5.5 Approval gate controller
+### 5.6 Approval gate controller
 
-The run manifest records the current state and approved direction IDs. Image-generation tools are unavailable to the workflow until `directions_approved` is recorded. Rejected directions are not generated. Users may combine explicit traits from multiple directions into a new approved direction.
+The run manifest records the current state and approved direction IDs. The first approval view includes the visual reference board, `design-evidence.md`, and the proposed directions. Image-generation tools are unavailable to the workflow until `directions_approved` is recorded. Rejected directions are not generated. Users may combine explicit traits from multiple directions into a new approved direction.
 
-### 5.6 UI mockup generator
+### 5.7 UI mockup generator
 
 The generator produces a static image that looks like a complete web page or mobile screen, not merely a decorative asset. All directions use the same required content, viewport, and comparable presentation.
 
@@ -113,7 +137,7 @@ The generator receives a structured design description. Third-party reference im
 
 The default generation budget is one image for each of five approved directions. Automatic retries are bounded to one retry for a technical failure and must not silently create extra variations. Further variations require a user request and are normally limited to selected directions.
 
-### 5.7 Implementation adapter
+### 5.8 Implementation adapter
 
 When an active project exists, the adapter inspects package manifests, framework configuration, existing components, tokens, routes, and styling conventions. It creates an isolated preview route, screen, story, or component consistent with the repository. It does not overwrite the current production screen during exploration.
 
@@ -121,7 +145,7 @@ When no usable project exists, the fallback is a standalone Vite React TypeScrip
 
 The adapter must preserve unrelated user changes. Integration into the real screen is a separate, explicit step after preview approval.
 
-### 5.8 Render verifier
+### 5.9 Render verifier
 
 The verifier starts the relevant local application, captures the implemented preview at the target viewport, and compares it with the selected design direction. It checks content completeness, hierarchy, layout, typography, color, responsive behavior, overflow, and basic accessibility. It runs the repository's relevant lint, typecheck, and test commands when available.
 
@@ -135,6 +159,7 @@ Research runs are stored outside product repositories by default:
 ├── brief.md
 ├── references.json
 ├── reference-board.md
+├── design-evidence.md
 ├── captures/
 ├── mood-directions.md
 ├── mockup-manifest.json
@@ -173,6 +198,8 @@ An interrupted run resumes from the last completed state. A state advances only 
 
 - **Chrome login or CAPTCHA:** pause and tell the user what manual action is required; resume afterward.
 - **Insufficient references:** mark coverage as low, simplify or broaden the query, and show the closest evidence with a limitation note.
+- **Weak or conflicting UX evidence:** label the uncertainty, preserve competing interpretations, and present the decision as a trade-off rather than a fact.
+- **Unverifiable research claim:** omit the claim or clearly label it as an inference; never fabricate a citation.
 - **Dead source image:** keep the source metadata and analysis, mark the capture unavailable, and continue when enough other evidence exists.
 - **Image generation failure:** record the failure, perform at most one automatic retry for a technical error, then ask before spending more.
 - **Inconsistent mockup content:** regenerate only the affected direction with the same brief and a corrected constraint.
@@ -187,6 +214,7 @@ An interrupted run resumes from the last completed state. A state advances only 
 - No silent extra images or unbounded retries.
 - Additional generations are focused on selected directions.
 - Reference analysis and approved directions are cached in the run directory.
+- Verified UX evidence is cached with its source metadata and can be reused when it remains applicable.
 - A resumed run reuses valid artifacts instead of repeating searches or generations.
 - The user is told before a requested action materially exceeds the default generation budget.
 
@@ -203,6 +231,8 @@ An interrupted run resumes from the last completed state. A state advances only 
 ### 10.2 Artifact contract tests
 
 - `references.json` entries include valid source URLs and required analysis fields.
+- `design-evidence.md` separates official guidance, research, observed patterns, and the skill's own inferences.
+- Every evidence-based claim has a traceable source and an explicit application to the target screen.
 - `mood-directions.md` contains at least five valid directions by default.
 - The diversity check rejects directions that fail the three-axis rule.
 - `mockup-manifest.json` maps every generated file to a direction and prompt configuration.
@@ -211,6 +241,7 @@ An interrupted run resumes from the last completed state. A state advances only 
 ### 10.3 Integration tests
 
 - Browser research succeeds with public search results.
+- Relevant official guidance and research are retrieved without fabricated or broken citations.
 - A blocked or signed-in browser flow pauses cleanly for user action.
 - Approved directions invoke image generation; unapproved directions do not.
 - An existing representative React project receives only isolated preview additions.
@@ -222,14 +253,15 @@ An interrupted run resumes from the last completed state. A state advances only 
 The first release is acceptable when:
 
 1. A user can start with a prompt, an image, or an existing screen.
-2. Every presented reference has traceable provenance.
-3. The skill presents at least five directions that pass the diversity rule.
-4. No image-generation call occurs before explicit approval.
-5. Each approved direction receives a comparable full-screen UI mockup.
-6. A selected direction becomes a runnable preview without overwriting the production screen.
-7. The rendered preview is captured and checked at the target viewport.
-8. Interrupted runs resume without repeating valid completed work.
-9. Costs remain bounded by the documented defaults unless the user explicitly expands them.
+2. Every presented visual reference and evidence-based UX claim has traceable provenance.
+3. All directions satisfy the shared accessibility and platform baseline, or clearly disclose and justify an exception.
+4. The skill presents at least five directions that pass the diversity rule.
+5. No image-generation call occurs before explicit approval of the references, evidence summary, and directions.
+6. Each approved direction receives a comparable full-screen UI mockup.
+7. A selected direction becomes a runnable preview without overwriting the production screen.
+8. The rendered preview is captured and checked at the target viewport.
+9. Interrupted runs resume without repeating valid completed work.
+10. Costs remain bounded by the documented defaults unless the user explicitly expands them.
 
 ## 11. Delivery Boundary for Version 1
 
