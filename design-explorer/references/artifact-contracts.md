@@ -58,6 +58,8 @@ Omit expansion flags for the default five-image/two-attempt limits. Every consum
 
 Every caller-supplied `now` value must be RFC3339. Initialization and transitions validate the completed manifest before writing it; revision validates its timestamp and completed manifest before any archive or manifest write.
 
+Every existing-run mutation—transition, revision, and generation authorization—uses the same account-home → runs-root → run-directory lock order. Each public mutation wrapper acquires those locks before loading run state, recovers any durable revision marker, and then re-loads and revalidates under the held locks before calling its locked internal helper. Competing mutations therefore produce exactly one legal serial outcome instead of two apparent successes with a lost update. `init` is separate because it publishes a new run directory rather than mutating an existing run. Read-only `load` and `status` acquire the locks only when a revision marker requires recovery.
+
 ```bash
 python3 scripts/validate_run.py --run <run-dir> --phase mockups
 python3 scripts/run_state.py transition --run <run-dir> --to mockups_generated

@@ -333,6 +333,19 @@ class SkillContractTests(unittest.TestCase):
         ):
             self.assertIn(phrase, combined)
 
+    def test_existing_run_mutations_share_one_serial_lock_contract(self):
+        contracts = (SKILL_DIR / "references/artifact-contracts.md").read_text(
+            encoding="utf-8"
+        ).lower()
+        for phrase in (
+            "every existing-run mutation",
+            "transition, revision, and generation authorization",
+            "account-home → runs-root → run-directory",
+            "exactly one legal serial outcome",
+            "re-loads and revalidates under the held locks",
+        ):
+            self.assertIn(phrase, contracts)
+
     def test_lexer_and_render_asset_closure_are_documented(self):
         skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
         contracts = (SKILL_DIR / "references/artifact-contracts.md").read_text(

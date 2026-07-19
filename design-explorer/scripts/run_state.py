@@ -36,7 +36,7 @@ GENERATION_TEMP_PATTERN = re.compile(
 )
 REVISION_MARKER_NAME = ".revision-transaction.json"
 REVISION_TEMP_PATTERN = re.compile(
-    r"\.(?:revision-transaction|run\.json\.revision)-([0-9a-f]{32})\.tmp"
+    r"\.(?:revision-transaction|run\.json\.(?:revision|transition))-([0-9a-f]{32})\.tmp"
 )
 REVISION_ARCHIVE_PATTERN = re.compile(r"mockup-manifest\.revision-([1-9]\d*)\.json")
 RFC3339_PATTERN = re.compile(
@@ -517,27 +517,23 @@ def _validate_target(run_dir: Path, target: str, manifest: dict) -> None:
         _validate_phases(run_dir, STATE_VALIDATION_PHASES[target])
 
 
-def transition_run(
-    run_dir: Path,
+def _transition_run_locked(
+    owner,
     target: str,
+    timestamp: str,
     approved_direction_ids: list[str] | None = None,
     selected_direction_id: str | None = None,
-    now: str | None = None,
     integration_approved: bool = False,
     generation_budget: int | None = None,
     max_attempts_per_direction: int | None = None,
     budget_expansion_approved: bool = False,
 ) -> dict:
-    run_dir = Path(run_dir)
-    manifest = load_run(run_dir)
+    run_dir = owner.run_dir
+    manifest = _load_run_without_recovery(run_dir)
     current = manifest["state"]
     if NEXT_STATE.get(current) != target:
         raise ValueError(f"illegal transition: {current} -> {target}")
     _validate_target(run_dir, target, manifest)
-    timestamp = now or utc_now()
-    if not valid_rfc3339(timestamp):
-        raise ValueError("transition timestamp must be RFC3339")
-
     if target == "integrated":
         if not integration_approved:
             raise ValueError("integrated requires explicit integration approval")
@@ -608,8 +604,89 @@ def transition_run(
     manifest["state"] = target
     manifest["updated_at"] = timestamp
     validate_run_manifest(manifest)
-    write_json_atomic(run_dir / "run.json", manifest)
+    _publish_transition_run(owner, manifest)
     return manifest
+
+
+def transition_run(
+    run_dir: Path,
+    target: str,
+    approved_direction_ids: list[str] | None = None,
+    selected_direction_id: str | None = None,
+    now: str | None = None,
+    integration_approved: bool = False,
+    generation_budget: int | None = None,
+    max_attempts_per_direction: int | None = None,
+    budget_expansion_approved: bool = False,
+) -> dict:
+    timestamp = now or utc_now()
+    if not valid_rfc3339(timestamp):
+        raise ValueError("transition timestamp must be RFC3339")
+    owner = _acquire_generation_lock(Path(run_dir), timestamp)
+    try:
+        _recover_revision_transaction(owner)
+        return _transition_run_locked(
+            owner,
+            target,
+            approved_direction_ids=approved_direction_ids,
+            selected_direction_id=selected_direction_id,
+            timestamp=timestamp,
+            integration_approved=integration_approved,
+            generation_budget=generation_budget,
+            max_attempts_per_direction=max_attempts_per_direction,
+            budget_expansion_approved=budget_expansion_approved,
+        )
+    finally:
+        _release_generation_lock(owner)
+
+
+def _revise_run_locked(owner, reason: str, timestamp: str) -> dict:
+    manifest = _load_run_without_recovery(owner.run_dir)
+    current = manifest["state"]
+    if current != "mockups_generated":
+        raise ValueError(f"illegal revision from {current}")
+    _validate_target(owner.run_dir, "mockups_generated", manifest)
+
+    revision_count = manifest.get("revision_count", 0)
+    if (
+        not isinstance(revision_count, int)
+        or isinstance(revision_count, bool)
+        or revision_count < 0
+    ):
+        raise ValueError("run.json revision_count must be a non-negative integer")
+    revision_count += 1
+    archive_name = f"mockup-manifest.revision-{revision_count}.json"
+    if _named_path_exists(owner.descriptor, archive_name):
+        raise ValueError(f"revision archive already exists: {archive_name}")
+
+    ledger_data, ledger_metadata = _read_run_file(owner, "mockup-manifest.json")
+    if ledger_metadata.st_nlink != 1:
+        raise ValueError("current mockup manifest must have exactly one link")
+    revised = _revision_target_manifest(manifest, reason.strip(), timestamp)
+    transaction = {
+        "schema_version": 1,
+        "transaction_id": owner.transaction_id,
+        "archive_name": archive_name,
+        "ledger_digest": "sha256:" + hashlib.sha256(ledger_data).hexdigest(),
+        "ledger_device": ledger_metadata.st_dev,
+        "ledger_inode": ledger_metadata.st_ino,
+        "old_run": manifest,
+        "new_run": revised,
+    }
+    try:
+        _publish_revision_marker(owner, transaction)
+        active = _load_revision_transaction(owner)
+        _archive_revision_ledger(owner, active)
+        _validate_phases(
+            owner.run_dir,
+            STATE_VALIDATION_PHASES["directions_pending_approval"],
+        )
+        _publish_revision_run(owner, active)
+        _remove_revision_marker(owner, active)
+    except BaseException:
+        _recover_revision_transaction(owner)
+        raise
+    return revised
 
 
 def revise_run(
@@ -617,63 +694,15 @@ def revise_run(
     reason: str,
     now: str | None = None,
 ) -> dict:
-    run_dir = Path(run_dir)
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("revision requires a non-empty reason")
     timestamp = now or utc_now()
     if not valid_rfc3339(timestamp):
         raise ValueError("revision timestamp must be RFC3339")
-    owner = _acquire_generation_lock(run_dir, timestamp)
+    owner = _acquire_generation_lock(Path(run_dir), timestamp)
     try:
         _recover_revision_transaction(owner)
-        manifest = _load_run_without_recovery(owner.run_dir)
-        current = manifest["state"]
-        if current != "mockups_generated":
-            raise ValueError(f"illegal revision from {current}")
-        _validate_target(owner.run_dir, "mockups_generated", manifest)
-
-        revision_count = manifest.get("revision_count", 0)
-        if (
-            not isinstance(revision_count, int)
-            or isinstance(revision_count, bool)
-            or revision_count < 0
-        ):
-            raise ValueError("run.json revision_count must be a non-negative integer")
-        revision_count += 1
-        archive_name = f"mockup-manifest.revision-{revision_count}.json"
-        if _named_path_exists(owner.descriptor, archive_name):
-            raise ValueError(f"revision archive already exists: {archive_name}")
-
-        ledger_data, ledger_metadata = _read_run_file(
-            owner, "mockup-manifest.json"
-        )
-        if ledger_metadata.st_nlink != 1:
-            raise ValueError("current mockup manifest must have exactly one link")
-        revised = _revision_target_manifest(manifest, reason.strip(), timestamp)
-        transaction = {
-            "schema_version": 1,
-            "transaction_id": owner.transaction_id,
-            "archive_name": archive_name,
-            "ledger_digest": "sha256:" + hashlib.sha256(ledger_data).hexdigest(),
-            "ledger_device": ledger_metadata.st_dev,
-            "ledger_inode": ledger_metadata.st_ino,
-            "old_run": manifest,
-            "new_run": revised,
-        }
-        try:
-            _publish_revision_marker(owner, transaction)
-            active = _load_revision_transaction(owner)
-            _archive_revision_ledger(owner, active)
-            _validate_phases(
-                owner.run_dir,
-                STATE_VALIDATION_PHASES["directions_pending_approval"],
-            )
-            _publish_revision_run(owner, active)
-            _remove_revision_marker(owner, active)
-        except BaseException:
-            _recover_revision_transaction(owner)
-            raise
-        return revised
+        return _revise_run_locked(owner, reason, timestamp)
     finally:
         _release_generation_lock(owner)
 
@@ -688,10 +717,11 @@ def _read_mockup_manifest(run_dir: Path) -> dict:
     return value
 
 
-def _generation_preflight(run_dir: Path, direction_id: str) -> tuple[dict, dict, dict]:
+def _generation_preflight_for_manifest(
+    run_dir: Path, direction_id: str, manifest: dict
+) -> tuple[dict, dict, dict]:
     if not isinstance(direction_id, str) or not direction_id.strip():
         raise ValueError("generation requires a non-empty direction_id")
-    manifest = load_run(run_dir)
     if manifest["state"] != "directions_approved":
         raise ValueError("generation requires state directions_approved")
     if direction_id not in manifest["approved_direction_ids"]:
@@ -722,6 +752,21 @@ def _generation_preflight(run_dir: Path, direction_id: str) -> tuple[dict, dict,
     if mockup_manifest["generation_attempts_used"] >= total_ceiling:
         raise ValueError("generation total attempt authorization ceiling exhausted")
     return manifest, mockup_manifest, entry
+
+
+def _generation_preflight(run_dir: Path, direction_id: str) -> tuple[dict, dict, dict]:
+    run_dir = Path(run_dir)
+    return _generation_preflight_for_manifest(
+        run_dir, direction_id, load_run(run_dir)
+    )
+
+
+def _generation_preflight_locked(owner, direction_id: str) -> tuple[dict, dict, dict]:
+    return _generation_preflight_for_manifest(
+        owner.run_dir,
+        direction_id,
+        _load_run_without_recovery(owner.run_dir),
+    )
 
 
 def image_generation_allowed(run_dir: Path, direction_id: str) -> bool:
@@ -1253,7 +1298,7 @@ def _acquire_generation_lock(run_dir: Path, timestamp: str) -> _GenerationLock:
         except OSError as error:
             if error.errno in {errno.EACCES, errno.EAGAIN}:
                 raise ValueError(
-                    "generation authorization is already in progress"
+                    "run mutation is already in progress"
                 ) from None
             raise
         resolved = Path(run_dir).expanduser().resolve(strict=True)
@@ -1266,7 +1311,7 @@ def _acquire_generation_lock(run_dir: Path, timestamp: str) -> _GenerationLock:
         except OSError as error:
             if error.errno in {errno.EACCES, errno.EAGAIN}:
                 raise ValueError(
-                    "generation authorization is already in progress"
+                    "run mutation is already in progress"
                 ) from None
             raise
         descriptor, descriptor_stat = _open_trusted_directory(
@@ -1277,7 +1322,7 @@ def _acquire_generation_lock(run_dir: Path, timestamp: str) -> _GenerationLock:
         except OSError as error:
             if error.errno in {errno.EACCES, errno.EAGAIN}:
                 raise ValueError(
-                    "generation authorization is already in progress"
+                    "run mutation is already in progress"
                 ) from None
             raise
         transaction_id = uuid.uuid4().hex
@@ -1642,10 +1687,11 @@ def _archive_revision_ledger(
         raise ValueError("revision archive move did not complete")
 
 
-def _publish_revision_run(
-    owner: _GenerationLock, transaction: _RevisionTransaction
+def _publish_run_manifest(
+    owner: _GenerationLock, value: dict, prefix: str, label: str
 ) -> None:
-    stage = _stage_revision_json(owner, "run.json.revision", transaction.new_run)
+    _assert_generation_run_identity(owner)
+    stage = _stage_revision_json(owner, prefix, value)
     try:
         _replace_path(
             stage.name,
@@ -1656,13 +1702,26 @@ def _publish_revision_run(
         _fsync_directory_descriptor(owner.descriptor)
         value, data, metadata = _read_named_json(owner, "run.json")
         if (
-            value != transaction.new_run
+            value != stage.value
             or data != stage.data
             or (metadata.st_dev, metadata.st_ino) != (stage.device, stage.inode)
         ):
-            raise ValueError("published revision run manifest did not match stage")
+            raise ValueError(f"published {label} run manifest did not match stage")
+        _assert_generation_run_identity(owner)
     finally:
         _close_staged_revision_json(owner, stage)
+
+
+def _publish_revision_run(
+    owner: _GenerationLock, transaction: _RevisionTransaction
+) -> None:
+    _publish_run_manifest(
+        owner, transaction.new_run, "run.json.revision", "revision"
+    )
+
+
+def _publish_transition_run(owner: _GenerationLock, value: dict) -> None:
+    _publish_run_manifest(owner, value, "run.json.transition", "transition")
 
 
 def _remove_revision_marker(
@@ -1752,44 +1811,47 @@ def _recover_revision_transaction(owner: _GenerationLock) -> bool:
     raise ValueError("run.json does not match either revision transaction state")
 
 
+def _authorize_generation_locked(
+    owner: _GenerationLock, direction_id: str, timestamp: str
+) -> dict:
+    _manifest, mockup_manifest, entry = _generation_preflight_locked(
+        owner, direction_id
+    )
+    _assert_generation_run_identity(owner)
+    prior_data, _prior_metadata = _read_run_file(owner, "mockup-manifest.json")
+    try:
+        prior_value = json.loads(prior_data)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError(f"invalid prior generation manifest: {error}") from None
+    if prior_value != mockup_manifest:
+        raise ValueError("generation manifest changed during authorization")
+    entry["attempt_count"] += 1
+    entry["status"] = "pending"
+    for key in ("failure", "output_kind", "output_ref"):
+        entry.pop(key, None)
+    mockup_manifest["generation_attempts_used"] += 1
+    mockup_manifest["last_generation_authorized_at"] = timestamp
+    mockup_manifest["last_generation_direction_id"] = direction_id
+    _assert_generation_run_identity(owner)
+    _write_mockup_manifest_atomic(owner, mockup_manifest, prior_data)
+    return {
+        "direction_id": direction_id,
+        "attempt_count": entry["attempt_count"],
+        "generation_attempts_used": mockup_manifest["generation_attempts_used"],
+        "authorized_at": timestamp,
+    }
+
+
 def authorize_generation(
     run_dir: Path, direction_id: str, now: str | None = None
 ) -> dict:
-    run_dir = Path(run_dir)
     timestamp = now or utc_now()
     if not valid_rfc3339(timestamp):
         raise ValueError("generation authorization timestamp must be RFC3339")
-    owner = _acquire_generation_lock(run_dir, timestamp)
+    owner = _acquire_generation_lock(Path(run_dir), timestamp)
     try:
         _recover_revision_transaction(owner)
-        _manifest, mockup_manifest, entry = _generation_preflight(
-            owner.run_dir, direction_id
-        )
-        _assert_generation_run_identity(owner)
-        prior_data, _prior_metadata = _read_run_file(
-            owner, "mockup-manifest.json"
-        )
-        try:
-            prior_value = json.loads(prior_data)
-        except (json.JSONDecodeError, UnicodeDecodeError) as error:
-            raise ValueError(f"invalid prior generation manifest: {error}") from None
-        if prior_value != mockup_manifest:
-            raise ValueError("generation manifest changed during authorization")
-        entry["attempt_count"] += 1
-        entry["status"] = "pending"
-        for key in ("failure", "output_kind", "output_ref"):
-            entry.pop(key, None)
-        mockup_manifest["generation_attempts_used"] += 1
-        mockup_manifest["last_generation_authorized_at"] = timestamp
-        mockup_manifest["last_generation_direction_id"] = direction_id
-        _assert_generation_run_identity(owner)
-        _write_mockup_manifest_atomic(owner, mockup_manifest, prior_data)
-        return {
-            "direction_id": direction_id,
-            "attempt_count": entry["attempt_count"],
-            "generation_attempts_used": mockup_manifest["generation_attempts_used"],
-            "authorized_at": timestamp,
-        }
+        return _authorize_generation_locked(owner, direction_id, timestamp)
     finally:
         _release_generation_lock(owner)
 

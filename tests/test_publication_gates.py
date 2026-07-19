@@ -96,6 +96,87 @@ class PublicationGateTests(unittest.TestCase):
             self.ledger([self.entry(identifier) for identifier in approved]),
         )
 
+    def advance_to_pending_approval(self):
+        (self.run / "brief.md").write_text("# Brief", encoding="utf-8")
+        run_state.transition_run(self.run, "brief_ready")
+        self.write_research()
+        run_state.transition_run(self.run, "research_complete")
+        self.write_directions()
+        run_state.transition_run(self.run, "directions_pending_approval")
+
+    def start_paused_mutation(self, mode, *arguments):
+        child_code = r'''
+import importlib.util
+import pathlib
+import sys
+
+module_path, run_path, mode, *arguments = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("mutation_child", module_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+hook_name = {
+    "revise": "_publish_revision_marker",
+    "transition-select": "_publish_transition_run",
+    "transition-approve": "_publish_transition_run",
+    "authorize": "_write_mockup_manifest_atomic",
+}[mode]
+if not hasattr(module, hook_name):
+    hook_name = "write_json_atomic"
+original = getattr(module, hook_name)
+
+def pause(*args, **kwargs):
+    print("paused", flush=True)
+    if not sys.stdin.readline():
+        raise RuntimeError("test coordinator closed pause pipe")
+    return original(*args, **kwargs)
+
+setattr(module, hook_name, pause)
+run = pathlib.Path(run_path)
+if mode == "revise":
+    module.revise_run(run, arguments[0], now="2026-07-20T00:02:00Z")
+elif mode == "transition-select":
+    module.transition_run(
+        run,
+        "implementation_selected",
+        selected_direction_id=arguments[0],
+        now="2026-07-20T00:02:00Z",
+    )
+elif mode == "transition-approve":
+    module.transition_run(
+        run,
+        "directions_approved",
+        approved_direction_ids=[arguments[0]],
+        now="2026-07-20T00:02:00Z",
+    )
+else:
+    module.authorize_generation(
+        run, arguments[0], now="2026-07-20T00:02:00Z"
+    )
+'''
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                child_code,
+                run_state.__file__,
+                str(self.run),
+                mode,
+                *arguments,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(child.stdout.readline().strip(), "paused")
+        return child
+
+    def release_paused_mutation(self, child):
+        stdout, stderr = child.communicate("continue\n", timeout=5)
+        self.assertEqual(child.returncode, 0, stdout + stderr)
+
     def ledger(self, entries, used=None, authorized_at=None, direction_id=None):
         used = sum(item.get("attempt_count", 0) for item in entries) if used is None else used
         if used and authorized_at is None:
@@ -447,10 +528,10 @@ class PublicationGateTests(unittest.TestCase):
         before_ledger = (self.run / "mockup-manifest.json").read_bytes()
         moved = self.root / "held-run-directory"
         marker = self.run / "replacement-marker"
-        real_preflight = run_state._generation_preflight
+        real_preflight = run_state._generation_preflight_locked
 
-        def replace_path_after_preflight(run_dir, direction_id):
-            result = real_preflight(run_dir, direction_id)
+        def replace_path_after_preflight(owner, direction_id):
+            result = real_preflight(owner, direction_id)
             self.run.rename(moved)
             self.run.mkdir()
             marker.write_text("untouched", encoding="utf-8")
@@ -459,7 +540,7 @@ class PublicationGateTests(unittest.TestCase):
         try:
             with mock.patch.object(
                 run_state,
-                "_generation_preflight",
+                "_generation_preflight_locked",
                 side_effect=replace_path_after_preflight,
             ):
                 with self.assertRaisesRegex(
@@ -601,6 +682,138 @@ time.sleep(60)
         run_state.authorize_generation(self.run, "d-0")
         self.assertEqual(self.run.stat().st_ino, inode)
         self.assert_generation_lock_released()
+
+    def test_paused_revision_blocks_transition_without_lost_selection(self):
+        self.advance_to_approved()
+        success = self.entry(
+            status="success",
+            attempts=1,
+            output_kind="provider",
+            output_ref="provider:openai:artifact_revision_race",
+        )
+        self.write_json("mockup-manifest.json", self.ledger([success]))
+        run_state.transition_run(self.run, "mockups_generated")
+
+        child = self.start_paused_mutation("revise", "Concurrent revision")
+        try:
+            contender = subprocess.run(
+                [
+                    sys.executable,
+                    run_state.__file__,
+                    "transition",
+                    "--run",
+                    str(self.run),
+                    "--to",
+                    "implementation_selected",
+                    "--selected-direction",
+                    "d-0",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(contender.returncode, 0, contender.stdout)
+            self.assertIn("already in progress", contender.stderr)
+        finally:
+            self.release_paused_mutation(child)
+        manifest = run_state.load_run(self.run)
+        self.assertEqual(manifest["state"], "directions_pending_approval")
+        self.assertEqual(manifest["revision_count"], 1)
+        self.assertIsNone(manifest["selected_direction_id"])
+
+    def test_paused_transition_blocks_revision_without_lost_transition(self):
+        self.advance_to_approved()
+        success = self.entry(
+            status="success",
+            attempts=1,
+            output_kind="provider",
+            output_ref="provider:openai:artifact_transition_race",
+        )
+        self.write_json("mockup-manifest.json", self.ledger([success]))
+        run_state.transition_run(self.run, "mockups_generated")
+
+        child = self.start_paused_mutation("transition-select", "d-0")
+        try:
+            contender = subprocess.run(
+                [
+                    sys.executable,
+                    run_state.__file__,
+                    "revise",
+                    "--run",
+                    str(self.run),
+                    "--reason",
+                    "Concurrent revision",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(contender.returncode, 0, contender.stdout)
+            self.assertIn("already in progress", contender.stderr)
+        finally:
+            self.release_paused_mutation(child)
+        manifest = run_state.load_run(self.run)
+        self.assertEqual(manifest["state"], "implementation_selected")
+        self.assertEqual(manifest["selected_direction_id"], "d-0")
+        self.assertEqual(manifest["revision_count"], 0)
+        self.assertTrue((self.run / "mockup-manifest.json").is_file())
+
+    def test_two_transitions_have_one_legal_serial_outcome(self):
+        self.advance_to_pending_approval()
+        child = self.start_paused_mutation("transition-approve", "d-0")
+        try:
+            contender = subprocess.run(
+                [
+                    sys.executable,
+                    run_state.__file__,
+                    "transition",
+                    "--run",
+                    str(self.run),
+                    "--to",
+                    "directions_approved",
+                    "--approved-direction",
+                    "d-1",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(contender.returncode, 0, contender.stdout)
+            self.assertIn("already in progress", contender.stderr)
+        finally:
+            self.release_paused_mutation(child)
+        manifest = run_state.load_run(self.run)
+        self.assertEqual(manifest["state"], "directions_approved")
+        self.assertEqual(manifest["approved_direction_ids"], ["d-0"])
+
+    def test_paused_authorization_blocks_transition_before_validation(self):
+        self.advance_to_approved()
+        self.write_pending_manifest()
+        child = self.start_paused_mutation("authorize", "d-0")
+        try:
+            contender = subprocess.run(
+                [
+                    sys.executable,
+                    run_state.__file__,
+                    "transition",
+                    "--run",
+                    str(self.run),
+                    "--to",
+                    "mockups_generated",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(contender.returncode, 0, contender.stdout)
+            self.assertIn("already in progress", contender.stderr)
+        finally:
+            self.release_paused_mutation(child)
+        manifest = run_state.load_run(self.run)
+        ledger = json.loads((self.run / "mockup-manifest.json").read_text())
+        self.assertEqual(manifest["state"], "directions_approved")
+        self.assertEqual(ledger["generation_attempts_used"], 1)
+        self.assertEqual(ledger["mockups"][0]["attempt_count"], 1)
 
     def test_recreated_legacy_lock_path_cannot_admit_second_process(self):
         self.advance_to_approved()
