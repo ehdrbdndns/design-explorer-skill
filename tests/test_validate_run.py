@@ -78,12 +78,166 @@ class ValidateRunTests(unittest.TestCase):
         errors = validator.validate_phase(self.run, "research")
         self.assertTrue(any("source_url" in error for error in errors))
 
+    def test_http_urls_reject_whitespace_invalid_hosts_and_invalid_ports(self):
+        invalid_urls = (
+            "https://example.com/a path",
+            "https:///missing-host",
+            "https://-bad.example/path",
+            "https://256.256.256.256/path",
+            "https://example.com:not-a-port/path",
+            "https://example.com:70000/path",
+        )
+
+        for value in invalid_urls:
+            with self.subTest(value=value):
+                self.assertFalse(validator.valid_url(value))
+
+        self.assertTrue(validator.valid_url("https://example.com:443/path"))
+
+    def test_research_rejects_duplicate_ids_per_source_collection(self):
+        self.write("references.json", [reference(), reference()])
+        self.write("evidence.json", [evidence(), evidence()])
+
+        errors = validator.validate_phase(self.run, "research")
+
+        self.assertIn("duplicate references id: ref-1", errors)
+        self.assertIn("duplicate evidence id: ev-1", errors)
+
+    def test_nested_research_and_direction_types_return_errors(self):
+        bad_reference = reference()
+        bad_reference["observations"] = "observed"
+        self.write("references.json", [bad_reference])
+        self.write("evidence.json", [evidence()])
+
+        research_errors = validator.validate_phase(self.run, "research")
+
+        self.assertIn("references[0] observations must be an object", research_errors)
+
+        directions = [direction(f"d-{index}") for index in range(5)]
+        directions[0]["evidence_ids"] = 42
+        self.write("directions.json", directions)
+
+        direction_errors = validator.validate_phase(self.run, "directions")
+
+        self.assertIn(
+            "directions[0] evidence_ids must be a non-empty list of non-empty strings",
+            direction_errors,
+        )
+
+    def test_malformed_ids_modes_and_source_types_return_errors(self):
+        bad_evidence = evidence()
+        bad_evidence["source_type"] = []
+        self.write("references.json", [reference()])
+        self.write("evidence.json", [bad_evidence])
+
+        research_errors = validator.validate_phase(self.run, "research")
+
+        self.assertIn("evidence[0] has unsupported source_type", research_errors)
+
+        bad_evidence = evidence()
+        bad_evidence["id"] = {}
+        directions = [direction(f"d-{index}") for index in range(5)]
+        directions[0]["id"] = {}
+        self.write("evidence.json", [bad_evidence])
+        self.write("directions.json", directions)
+
+        direction_errors = validator.validate_phase(self.run, "directions")
+
+        self.assertIn("evidence[0] missing id", direction_errors)
+        self.assertIn("directions[0] missing id", direction_errors)
+
+        self.write(
+            "run.json",
+            {"selected_direction_id": "a", "approved_direction_ids": ["a"]},
+        )
+        self.write(
+            "implementation.json",
+            {
+                "selected_direction_id": "a",
+                "mode": [],
+                "preview_path": "src/previews/Checkout.tsx",
+                "verification": {
+                    "rendered_viewports": ["390x844"],
+                    "checks": {
+                        "content": "pass",
+                        "overflow": "pass",
+                        "accessibility": "pass",
+                    },
+                },
+            },
+        )
+
+        implementation_errors = validator.validate_phase(self.run, "implementation")
+
+        self.assertIn("implementation mode must be project or standalone", implementation_errors)
+
     def test_directions_require_five_and_three_axis_pairwise_difference(self):
         self.write("evidence.json", [evidence()])
         directions = [direction(f"d-{index}") for index in range(5)]
         self.write("directions.json", directions)
         errors = validator.validate_phase(self.run, "directions")
         self.assertTrue(any("fewer than three axes" in error for error in errors))
+
+    def test_scalar_evidence_returns_an_error(self):
+        self.write("evidence.json", 42)
+        self.write("directions.json", [direction(f"d-{index}") for index in range(5)])
+
+        errors = validator.validate_phase(self.run, "directions")
+
+        self.assertIn("evidence.json must be a list", errors)
+
+    def test_non_dict_axes_returns_an_error(self):
+        self.write("evidence.json", [evidence()])
+        directions = [direction(f"d-{index}") for index in range(5)]
+        directions[0]["axes"] = "stacked"
+        self.write("directions.json", directions)
+
+        errors = validator.validate_phase(self.run, "directions")
+
+        self.assertIn("directions[0] axes must be an object", errors)
+
+    def test_axes_values_must_be_non_empty_strings(self):
+        self.write("evidence.json", [evidence()])
+        directions = [direction(f"d-{index}") for index in range(5)]
+        directions[0]["axes"]["layout"] = "   "
+        directions[1]["axes"]["typography"] = 42
+        self.write("directions.json", directions)
+
+        errors = validator.validate_phase(self.run, "directions")
+
+        self.assertIn("directions[0] axis layout must be a non-empty string", errors)
+        self.assertIn("directions[1] axis typography must be a non-empty string", errors)
+
+    def test_axis_case_and_whitespace_do_not_count_as_material_difference(self):
+        self.write("evidence.json", [evidence()])
+        directions = [
+            direction("first"),
+            direction(
+                "cosmetic",
+                layout=" STACKED ",
+                typography="SANS",
+                palette="Neutral",
+            ),
+            direction("visual", layout="split", palette="vivid", imagery="photo"),
+            direction(
+                "calm",
+                typography="rounded",
+                density="spacious",
+                interaction="guided",
+            ),
+            direction(
+                "dark",
+                layout="cards",
+                palette="dark",
+                imagery="illustration",
+                interaction="direct",
+            ),
+        ]
+        self.write("directions.json", directions)
+
+        errors = validator.validate_phase(self.run, "directions")
+
+        self.assertIn("first and cosmetic differ on fewer than three axes", errors)
 
     def test_distinct_evidence_linked_directions_pass(self):
         self.write("evidence.json", [evidence()])
@@ -116,8 +270,65 @@ class ValidateRunTests(unittest.TestCase):
         errors = validator.validate_phase(self.run, "mockups")
         self.assertEqual(errors, ["missing successful mockups for: b"])
 
+    def test_mockups_require_at_least_one_approved_direction(self):
+        self.write("run.json", {"approved_direction_ids": []})
+        self.write("mockup-manifest.json", {"mockups": []})
+
+        errors = validator.validate_phase(self.run, "mockups")
+
+        self.assertIn(
+            "run.json approved_direction_ids must be a non-empty list",
+            errors,
+        )
+
+    def test_mockups_reject_invalid_or_duplicate_approved_direction_ids(self):
+        self.write("run.json", {"approved_direction_ids": ["a", " ", "a", 42]})
+        self.write("mockup-manifest.json", {"mockups": []})
+
+        errors = validator.validate_phase(self.run, "mockups")
+
+        self.assertIn(
+            "run.json approved_direction_ids must contain non-empty strings",
+            errors,
+        )
+        self.assertIn(
+            "run.json approved_direction_ids must contain unique values",
+            errors,
+        )
+
+    def test_mockups_reject_unapproved_directions_and_invalid_success_fields(self):
+        self.write("run.json", {"approved_direction_ids": ["a"]})
+        self.write(
+            "mockup-manifest.json",
+            {
+                "mockups": [
+                    {"direction_id": "b", "status": "failed"},
+                    {
+                        "direction_id": "a",
+                        "status": "success",
+                        "viewport": 390,
+                        "prompt_digest": " ",
+                        "output_ref": None,
+                    },
+                    {"direction_id": 42, "status": "failed"},
+                ]
+            },
+        )
+
+        errors = validator.validate_phase(self.run, "mockups")
+
+        self.assertIn("mockups[0] direction_id is not approved: b", errors)
+        self.assertIn("mockups[1] missing viewport", errors)
+        self.assertIn("mockups[1] missing prompt_digest", errors)
+        self.assertIn("mockups[1] missing output_ref", errors)
+        self.assertIn("mockups[2] direction_id must be a non-empty string", errors)
+        self.assertIn("missing successful mockups for: a", errors)
+
     def test_implementation_matches_selection_and_records_render_checks(self):
-        self.write("run.json", {"selected_direction_id": "a"})
+        self.write(
+            "run.json",
+            {"selected_direction_id": "a", "approved_direction_ids": ["a", "b"]},
+        )
         self.write(
             "implementation.json",
             {
@@ -148,6 +359,124 @@ class ValidateRunTests(unittest.TestCase):
             },
         )
         self.assertEqual(validator.validate_phase(self.run, "implementation"), [])
+
+    def test_implementation_selection_must_be_non_empty_and_approved(self):
+        valid_verification = {
+            "rendered_viewports": ["390x844"],
+            "checks": {
+                "content": "pass",
+                "overflow": "pass",
+                "accessibility": "pass",
+            },
+        }
+        self.write(
+            "run.json",
+            {"selected_direction_id": "a", "approved_direction_ids": ["a"]},
+        )
+        self.write(
+            "implementation.json",
+            {
+                "selected_direction_id": " ",
+                "mode": "project",
+                "preview_path": "src/previews/Checkout.tsx",
+                "verification": valid_verification,
+            },
+        )
+
+        errors = validator.validate_phase(self.run, "implementation")
+
+        self.assertIn(
+            "implementation selected_direction_id must be a non-empty string",
+            errors,
+        )
+
+        self.write(
+            "run.json",
+            {"selected_direction_id": "b", "approved_direction_ids": ["a"]},
+        )
+        self.write(
+            "implementation.json",
+            {
+                "selected_direction_id": "b",
+                "mode": "project",
+                "preview_path": "src/previews/Checkout.tsx",
+                "verification": valid_verification,
+            },
+        )
+
+        errors = validator.validate_phase(self.run, "implementation")
+
+        self.assertIn("implementation selected direction is not approved", errors)
+
+    def test_implementation_non_dict_verification_returns_an_error(self):
+        self.write(
+            "run.json",
+            {"selected_direction_id": "a", "approved_direction_ids": ["a"]},
+        )
+        self.write(
+            "implementation.json",
+            {
+                "selected_direction_id": "a",
+                "mode": "project",
+                "preview_path": "src/previews/Checkout.tsx",
+                "verification": "complete",
+            },
+        )
+
+        errors = validator.validate_phase(self.run, "implementation")
+
+        self.assertIn("implementation verification must be an object", errors)
+
+    def test_implementation_non_dict_checks_returns_an_error(self):
+        self.write(
+            "run.json",
+            {"selected_direction_id": "a", "approved_direction_ids": ["a"]},
+        )
+        self.write(
+            "implementation.json",
+            {
+                "selected_direction_id": "a",
+                "mode": "project",
+                "preview_path": "src/previews/Checkout.tsx",
+                "verification": {
+                    "rendered_viewports": ["390x844"],
+                    "checks": ["content", "overflow", "accessibility"],
+                },
+            },
+        )
+
+        errors = validator.validate_phase(self.run, "implementation")
+
+        self.assertIn("implementation checks must be an object", errors)
+
+    def test_implementation_rendered_viewports_are_non_empty_strings(self):
+        self.write(
+            "run.json",
+            {"selected_direction_id": "a", "approved_direction_ids": ["a"]},
+        )
+        self.write(
+            "implementation.json",
+            {
+                "selected_direction_id": "a",
+                "mode": "project",
+                "preview_path": "src/previews/Checkout.tsx",
+                "verification": {
+                    "rendered_viewports": ["390x844", " ", 42],
+                    "checks": {
+                        "content": "pass",
+                        "overflow": "pass",
+                        "accessibility": "pass",
+                    },
+                },
+            },
+        )
+
+        errors = validator.validate_phase(self.run, "implementation")
+
+        self.assertIn(
+            "implementation rendered_viewports must be a non-empty list of non-empty strings",
+            errors,
+        )
 
 
 if __name__ == "__main__":
