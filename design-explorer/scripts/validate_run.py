@@ -363,6 +363,12 @@ FUNCTION_PARAMETER_PATTERN = re.compile(
     r"\bfunction(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s*"
     r"\(([^)]*)\)\s*(?::[^\{;]+)?\{"
 )
+PAREN_ARROW_PARAMETER_PATTERN = re.compile(
+    r"\(([^()]*)\)\s*(?::[^=;]+)?=>"
+)
+SINGLE_ARROW_PARAMETER_PATTERN = re.compile(
+    r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*=>"
+)
 TOKEN_STYLESHEET_SUFFIXES = frozenset({".css", ".less", ".sass", ".scss"})
 
 
@@ -504,6 +510,29 @@ def brace_scope_at(source: str, position: int) -> tuple[int, ...]:
     return tuple(stack)
 
 
+def parameter_binding_names(source: str) -> set[str]:
+    source = source.strip()
+    if source.startswith("{"):
+        close = source.find("}")
+        if close == -1:
+            return set()
+        return set(
+            re.findall(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\b", source[1:close])
+        )
+    match = re.match(r"(?:\.\.\.)?([A-Za-z_$][A-Za-z0-9_$]*)", source)
+    return {match.group(1)} if match else set()
+
+
+def arrow_body_range(source: str, start: int) -> tuple[int, int, tuple[int, ...]]:
+    while start < len(source) and source[start].isspace():
+        start += 1
+    if start < len(source) and source[start] == "{":
+        end = matching_brace(source, start)
+        end = len(source) if end is None else end
+        return start, end, brace_scope_at(source, start + 1)
+    return start, statement_end(source, start), brace_scope_at(source, start)
+
+
 def jsx_style_value_literals(source: str) -> list[str]:
     lexed = lex_js(source)
     values = []
@@ -539,6 +568,7 @@ def jsx_style_value_literals(source: str) -> list[str]:
                 brace_scope_at(lexed.executable, match.start()),
                 object_range,
                 False,
+                None,
             )
         )
 
@@ -548,13 +578,26 @@ def jsx_style_value_literals(source: str) -> list[str]:
         for start, end in top_level_ranges(
             lexed.executable, match.start(1), match.end(1), ","
         ):
-            parameter = re.match(
-                r"\s*(?:\.\.\.)?([A-Za-z_$][A-Za-z0-9_$]*)",
-                lexed.executable[start:end],
-            )
-            if parameter:
+            for name in parameter_binding_names(lexed.executable[start:end]):
                 bindings.append(
-                    (parameter.group(1), match.start(), parameter_scope, None, True)
+                    (name, match.start(), parameter_scope, None, True, None)
+                )
+
+    for pattern in (PAREN_ARROW_PARAMETER_PATTERN, SINGLE_ARROW_PARAMETER_PATTERN):
+        for match in pattern.finditer(lexed.executable):
+            body_start, body_end, parameter_scope = arrow_body_range(
+                lexed.executable, match.end()
+            )
+            for name in parameter_binding_names(match.group(1)):
+                bindings.append(
+                    (
+                        name,
+                        match.start(),
+                        parameter_scope,
+                        None,
+                        True,
+                        (body_start, body_end),
+                    )
                 )
 
     for match in STATIC_FROM_PATTERN.finditer(lexed.executable):
@@ -567,6 +610,7 @@ def jsx_style_value_literals(source: str) -> list[str]:
                     brace_scope_at(lexed.executable, match.start()),
                     None,
                     True,
+                    None,
                 )
             )
 
@@ -576,8 +620,12 @@ def jsx_style_value_literals(source: str) -> list[str]:
         use_scope = brace_scope_at(lexed.executable, alias.start())
         candidates = []
         for binding in bindings:
-            declared_name, declared_at, declared_scope, _, hoisted = binding
+            declared_name, declared_at, declared_scope, _, hoisted, visibility = binding
             if declared_name != name:
+                continue
+            if visibility is not None and not (
+                visibility[0] <= alias.start() < visibility[1]
+            ):
                 continue
             if use_scope[: len(declared_scope)] != declared_scope:
                 continue

@@ -1334,6 +1334,14 @@ class ValidateRunTests(unittest.TestCase):
             "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
             "export function Screen(styles: CSSProperties){"
             "return <main style={styles}><Button /></main>}\n",
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "export const Screen = styles => <main style={styles}><Button /></main>;\n",
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "export const Screen = (styles: CSSProperties) => "
+            "<main style={styles}><Button /></main>;\n",
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "export function Screen({styles}: Props){"
+            "return <main style={styles}><Button /></main>}\n",
             "import { styles } from '../../src/Button';\n"
             "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
             "export function Screen(){return <main style={styles}><Button /></main>}\n",
