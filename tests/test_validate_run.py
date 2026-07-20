@@ -1021,6 +1021,10 @@ class ValidateRunTests(unittest.TestCase):
             "const fake: typeof import('../../src/Button').Button = null as never;",
             "function fake(): import('../../src/Button').Button { throw new Error(); }",
             "class Fake { value!: typeof import('../../src/Button').Button }",
+            "const fake: Promise<import('../../src/Button').Button> = Promise.reject();",
+            "function fake(): Promise<ReadonlyArray<import('../../src/Button').Button>> { throw new Error(); }",
+            "class Fake { value!: Array<import('../../src/Button').Button | null> }",
+            "const fake: true extends boolean ? import('../../src/Button').Button[] : never = null as never;",
         )
         for mode in ("project", "standalone"):
             for annotation in annotations:
@@ -1286,6 +1290,64 @@ class ValidateRunTests(unittest.TestCase):
                 f"mockups[0] code preview used token must be referenced by preview dependency set: {token}",
                 errors,
             )
+
+    def test_code_preview_style_alias_uses_lexical_const_binding(self):
+        valid_sources = (
+            "const styles: CSSProperties = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "export function Screen(){return <main style={styles}><Button /></main>}\n",
+            "export function Screen(){const styles: CSSProperties = "
+            "{ background: 'var(--color-surface)', gap: 'var(--space-4)' }; "
+            "return <main style={styles}><Button /></main>}\n",
+        )
+        for source in valid_sources:
+            with self.subTest(valid=source):
+                run, item, source_root = self.code_preview_fixture(mode="project")
+                screen = source_root / item["preview_path"]
+                screen.write_text(
+                    "import '../../src/tokens.css';\n"
+                    "import { Button } from '../../src/Button';\n"
+                    f"{source}",
+                    encoding="utf-8",
+                )
+                item["source_digest"] = preview_digest(
+                    source_root, item["preview_files"]
+                )
+                self.write("run.json", run)
+                self.write("mockup-manifest.json", mockup_manifest([item]))
+
+                self.assertEqual(validator.validate_mockups(self.run), [])
+
+        decoys = (
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "export function Screen(){const styles = { background: 'white', gap: '1rem' }; "
+            "return <main style={styles}><Button /></main>}\n",
+            "function Decoy(){const styles = { background: 'var(--color-surface)', "
+            "gap: 'var(--space-4)' }; return styles}\n"
+            "const styles = { background: 'white', gap: '1rem' };\n"
+            "export function Screen(){return <main style={styles}><Button /></main>}\n",
+        )
+        for source in decoys:
+            with self.subTest(decoy=source):
+                run, item, source_root = self.code_preview_fixture(mode="project")
+                screen = source_root / item["preview_path"]
+                screen.write_text(
+                    "import '../../src/tokens.css';\n"
+                    "import { Button } from '../../src/Button';\n"
+                    f"{source}",
+                    encoding="utf-8",
+                )
+                item["source_digest"] = preview_digest(
+                    source_root, item["preview_files"]
+                )
+                self.write("run.json", run)
+                self.write("mockup-manifest.json", mockup_manifest([item]))
+
+                errors = validator.validate_mockups(self.run)
+                for token in item["used_tokens"]:
+                    self.assertIn(
+                        f"mockups[0] code preview used token must be referenced by preview dependency set: {token}",
+                        errors,
+                    )
 
     def test_code_preview_sources_are_digest_bound_and_contained(self):
         run, item, source_root = self.code_preview_fixture(mode="project")

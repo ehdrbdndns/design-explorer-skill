@@ -353,7 +353,8 @@ JSX_STYLE_ALIAS_PATTERN = re.compile(
     r"\bstyle\s*=\s*\{\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\}"
 )
 CONST_OBJECT_PATTERN = re.compile(
-    r"\bconst\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*\{"
+    r"\bconst\s+([A-Za-z_$][A-Za-z0-9_$]*)"
+    r"\s*(?::\s*[^=;\n]+)?=\s*\{"
 )
 TOKEN_STYLESHEET_SUFFIXES = frozenset({".css", ".less", ".sass", ".scss"})
 
@@ -486,6 +487,16 @@ def object_style_value_literals(
     return values
 
 
+def brace_scope_at(source: str, position: int) -> tuple[int, ...]:
+    stack = []
+    for index, character in enumerate(source[:position]):
+        if character == "{":
+            stack.append(index)
+        elif character == "}" and stack:
+            stack.pop()
+    return tuple(stack)
+
+
 def jsx_style_value_literals(source: str) -> list[str]:
     lexed = lex_js(source)
     values = []
@@ -500,14 +511,41 @@ def jsx_style_value_literals(source: str) -> list[str]:
             continue
         values.extend(object_style_value_literals(lexed, inner_start, inner_end))
 
-    aliases = set(JSX_STYLE_ALIAS_PATTERN.findall(lexed.executable))
+    declarations = []
     for match in CONST_OBJECT_PATTERN.finditer(lexed.executable):
-        if match.group(1) not in aliases:
-            continue
         object_start = match.end() - 1
         object_end = matching_brace(lexed.executable, object_start)
         if object_end is not None:
-            values.extend(object_style_value_literals(lexed, object_start, object_end))
+            declarations.append(
+                (
+                    match.group(1),
+                    match.start(),
+                    brace_scope_at(lexed.executable, match.start()),
+                    object_start,
+                    object_end,
+                )
+            )
+
+    used_declarations = set()
+    for alias in JSX_STYLE_ALIAS_PATTERN.finditer(lexed.executable):
+        name = alias.group(1)
+        use_scope = brace_scope_at(lexed.executable, alias.start())
+        candidates = []
+        for declaration in declarations:
+            declared_name, declared_at, declared_scope, _, _ = declaration
+            if declared_name != name:
+                continue
+            if use_scope[: len(declared_scope)] != declared_scope:
+                continue
+            if declared_scope == use_scope and declared_at > alias.start():
+                continue
+            candidates.append(declaration)
+        if candidates:
+            selected = max(candidates, key=lambda item: (len(item[2]), item[1]))
+            used_declarations.add((selected[3], selected[4]))
+
+    for object_start, object_end in used_declarations:
+        values.extend(object_style_value_literals(lexed, object_start, object_end))
     return values
 
 
@@ -1106,26 +1144,58 @@ def inside_direct_class_body(source: str, position: int) -> bool:
     return False
 
 
+def annotation_prefix_is_type(
+    source: str, start: int, position: int, *, stop_at_brace: bool = False
+) -> bool:
+    parens = brackets = braces = 0
+    for index in range(start, position):
+        character = source[index]
+        if character == "(":
+            parens += 1
+        elif character == ")":
+            parens = max(0, parens - 1)
+        elif character == "[":
+            brackets += 1
+        elif character == "]":
+            brackets = max(0, brackets - 1)
+        elif character == "{":
+            if stop_at_brace and parens == brackets == braces == 0:
+                return False
+            braces += 1
+        elif character == "}":
+            braces = max(0, braces - 1)
+        elif (
+            character == "="
+            and parens == brackets == braces == 0
+            and source[index + 1 : index + 2] != ">"
+        ):
+            return False
+    return True
+
+
 def typescript_import_is_type_only(source: str, position: int) -> bool:
     prefix = source[:position]
     if re.search(r"\b(?:as|satisfies)\s*$", prefix):
         return True
 
-    annotation_tail = r"\s*(?:typeof\s*)?"
     variable_annotation_pattern = re.compile(
         rf"(?m)(?:^|[;\n])\s*(?:export\s+)?(?:declare\s+)?"
         rf"(?:const|let|var)\s+{IDENTIFIER}(?:\s*[?!])?\s*:"
     )
     for match in variable_annotation_pattern.finditer(source, 0, position):
-        if re.fullmatch(annotation_tail, source[match.end() : position]):
+        if position < statement_end(source, match.end()) and annotation_prefix_is_type(
+            source, match.end(), position
+        ):
             return True
 
-    if re.search(
+    return_annotation_pattern = re.compile(
         rf"\bfunction(?:\s+{IDENTIFIER})?\s*\([^)]*\)\s*:"
-        rf"{annotation_tail}$",
-        prefix,
-    ):
-        return True
+    )
+    for match in return_annotation_pattern.finditer(source, 0, position):
+        if annotation_prefix_is_type(
+            source, match.end(), position, stop_at_brace=True
+        ):
+            return True
 
     property_annotation_pattern = re.compile(
         rf"(?m)(?:^|[;{{\n])\s*"
@@ -1134,7 +1204,10 @@ def typescript_import_is_type_only(source: str, position: int) -> bool:
     )
     for match in property_annotation_pattern.finditer(source, 0, position):
         if (
-            re.fullmatch(annotation_tail, source[match.end() : position])
+            position < statement_end(source, match.end())
+            and annotation_prefix_is_type(
+                source, match.end(), position, stop_at_brace=True
+            )
             and inside_direct_class_body(source, match.end())
         ):
             return True
