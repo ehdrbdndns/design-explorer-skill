@@ -5,7 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from design_explorer_import import load_script_module
 from test_preview_evidence import preview_digest, write_png
@@ -1016,6 +1016,37 @@ class ValidateRunTests(unittest.TestCase):
 
                 self.assertEqual(validator.validate_mockups(self.run), [])
 
+    def test_code_preview_ts_annotations_are_not_runtime_reachable(self):
+        annotations = (
+            "const fake: typeof import('../../src/Button').Button = null as never;",
+            "function fake(): import('../../src/Button').Button { throw new Error(); }",
+            "class Fake { value!: typeof import('../../src/Button').Button }",
+        )
+        for mode in ("project", "standalone"):
+            for annotation in annotations:
+                with self.subTest(mode=mode, annotation=annotation):
+                    run, item, source_root = self.code_preview_fixture(mode=mode)
+                    screen = source_root / item["preview_path"]
+                    screen.write_text(
+                        "import '../../src/tokens.css';\n"
+                        f"{annotation}\n"
+                        "export function Screen(){return <main style={{background: "
+                        "'var(--color-surface)', gap: 'var(--space-4)'}}>Preview</main>}\n",
+                        encoding="utf-8",
+                    )
+                    item["source_digest"] = preview_digest(
+                        source_root, item["preview_files"]
+                    )
+                    self.write("run.json", run)
+                    self.write("mockup-manifest.json", mockup_manifest([item]))
+
+                    errors = validator.validate_mockups(self.run)
+
+                    self.assertIn(
+                        f"mockups[0] code preview component_source must be reachable from preview_path: {item['component_sources'][0]}",
+                        errors,
+                    )
+
     def test_code_preview_css_token_definitions_ignore_comments(self):
         run, item, source_root = self.code_preview_fixture(mode="project")
         tokens = source_root / item["token_sources"][0]
@@ -1149,6 +1180,112 @@ class ValidateRunTests(unittest.TestCase):
         self.write("mockup-manifest.json", mockup_manifest([item]))
 
         self.assertEqual(validator.validate_mockups(self.run), [])
+
+    def test_code_preview_css_like_token_sources_mask_comments_and_quotes(self):
+        for suffix in (".scss", ".sass", ".less"):
+            for comment_only in (True, False):
+                with self.subTest(suffix=suffix, comment_only=comment_only):
+                    run, item, source_root = self.code_preview_fixture(mode="project")
+                    old_relative = item["token_sources"][0]
+                    new_relative = str(PurePosixPath(old_relative).with_suffix(suffix))
+                    old_path = source_root / old_relative
+                    new_path = source_root / new_relative
+                    old_path.rename(new_path)
+                    item["token_sources"] = [new_relative]
+                    item["preview_files"] = [
+                        new_relative if path == old_relative else path
+                        for path in item["preview_files"]
+                    ]
+                    screen = source_root / item["preview_path"]
+                    screen.write_text(
+                        screen.read_text(encoding="utf-8").replace(
+                            "tokens.css", f"tokens{suffix}"
+                        ),
+                        encoding="utf-8",
+                    )
+                    new_path.write_text(
+                        (
+                            ':root { --marker: "/*"; /* --color-surface: white; */ --space-4: 1rem; }\n'
+                            if comment_only
+                            else ':root { --marker: "/*"; --color-surface: white; --space-4: 1rem; }\n'
+                        ),
+                        encoding="utf-8",
+                    )
+                    item["source_digest"] = preview_digest(
+                        source_root, item["preview_files"]
+                    )
+                    self.write("run.json", run)
+                    self.write("mockup-manifest.json", mockup_manifest([item]))
+
+                    errors = validator.validate_mockups(self.run)
+
+                    if comment_only:
+                        self.assertIn(
+                            "mockups[0] code preview used token must be defined by token_sources: --color-surface",
+                            errors,
+                        )
+                    else:
+                        self.assertEqual(errors, [])
+
+    def test_code_preview_rejects_unsupported_token_source_suffix(self):
+        run, item, source_root = self.code_preview_fixture(mode="project")
+        old_relative = item["token_sources"][0]
+        new_relative = str(PurePosixPath(old_relative).with_suffix(".tokens"))
+        old_path = source_root / old_relative
+        new_path = source_root / new_relative
+        old_path.rename(new_path)
+        item["token_sources"] = [new_relative]
+        item["preview_files"] = [
+            new_relative if path == old_relative else path
+            for path in item["preview_files"]
+        ]
+        screen = source_root / item["preview_path"]
+        screen.write_text(
+            screen.read_text(encoding="utf-8").replace("tokens.css", "tokens.tokens"),
+            encoding="utf-8",
+        )
+        item["source_digest"] = preview_digest(source_root, item["preview_files"])
+        self.write("run.json", run)
+        self.write("mockup-manifest.json", mockup_manifest([item]))
+
+        errors = validator.validate_mockups(self.run)
+
+        self.assertIn(
+            f"mockups[0] code preview token_source must use a supported stylesheet suffix (.css, .less, .sass, .scss): {new_relative}",
+            errors,
+        )
+
+    def test_code_preview_style_alias_must_be_referenced_by_jsx(self):
+        run, item, source_root = self.code_preview_fixture(mode="project")
+        screen = source_root / item["preview_path"]
+        screen.write_text(
+            "import '../../src/tokens.css';\n"
+            "import { Button } from '../../src/Button';\n"
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "export function Screen(){return <main style={styles}><Button /></main>}\n",
+            encoding="utf-8",
+        )
+        item["source_digest"] = preview_digest(source_root, item["preview_files"])
+        self.write("run.json", run)
+        self.write("mockup-manifest.json", mockup_manifest([item]))
+
+        self.assertEqual(validator.validate_mockups(self.run), [])
+
+        screen.write_text(
+            screen.read_text(encoding="utf-8").replace(
+                "style={styles}", "data-style-name=\"styles\""
+            ),
+            encoding="utf-8",
+        )
+        item["source_digest"] = preview_digest(source_root, item["preview_files"])
+        self.write("mockup-manifest.json", mockup_manifest([item]))
+
+        errors = validator.validate_mockups(self.run)
+        for token in item["used_tokens"]:
+            self.assertIn(
+                f"mockups[0] code preview used token must be referenced by preview dependency set: {token}",
+                errors,
+            )
 
     def test_code_preview_sources_are_digest_bound_and_contained(self):
         run, item, source_root = self.code_preview_fixture(mode="project")

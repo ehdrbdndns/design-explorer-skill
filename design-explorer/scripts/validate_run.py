@@ -349,9 +349,16 @@ CSS_CUSTOM_PROPERTY_USE_PATTERN = re.compile(
     r"var\(\s*(--[A-Za-z0-9_-]+)\s*(?:,|\))"
 )
 JSX_STYLE_ATTRIBUTE_START_PATTERN = re.compile(r"\bstyle\s*=\s*\{")
+JSX_STYLE_ALIAS_PATTERN = re.compile(
+    r"\bstyle\s*=\s*\{\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\}"
+)
+CONST_OBJECT_PATTERN = re.compile(
+    r"\bconst\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*\{"
+)
+TOKEN_STYLESHEET_SUFFIXES = frozenset({".css", ".less", ".sass", ".scss"})
 
 
-def css_without_comments(source: str) -> str:
+def css_without_comments(source: str, *, line_comments: bool = False) -> str:
     output = list(source)
     index = 0
     quote = None
@@ -373,6 +380,12 @@ def css_without_comments(source: str) -> str:
         if current == "/" and following == "*":
             close = source.find("*/", index + 2)
             end = len(source) if close == -1 else close + 2
+            _mask_span(output, index, end)
+            index = end
+            continue
+        if line_comments and current == "/" and following == "/":
+            end = source.find("\n", index + 2)
+            end = len(source) if end == -1 else end
             _mask_span(output, index, end)
             index = end
             continue
@@ -452,6 +465,27 @@ def literal_is_style_value(source: str, start: int, literal_start: int) -> bool:
     return not any(kind in {"call", "bracket", "object"} for kind in stack)
 
 
+def object_style_value_literals(
+    lexed: "JsLexResult", object_start: int, object_end: int
+) -> list[str]:
+    values = []
+    for property_start, property_end in top_level_ranges(
+        lexed.executable, object_start + 1, object_end, ","
+    ):
+        colon = top_level_character(
+            lexed.executable, property_start, property_end, ":"
+        )
+        if colon is None:
+            continue
+        value_start = colon + 1
+        for literal in lexed.literals:
+            if value_start <= literal.start < property_end and literal_is_style_value(
+                lexed.executable, value_start, literal.start
+            ):
+                values.append(literal.value)
+    return values
+
+
 def jsx_style_value_literals(source: str) -> list[str]:
     lexed = lex_js(source)
     values = []
@@ -464,20 +498,16 @@ def jsx_style_value_literals(source: str) -> list[str]:
         inner_end = matching_brace(lexed.executable, inner_start)
         if inner_end is None:
             continue
-        for property_start, property_end in top_level_ranges(
-            lexed.executable, inner_start + 1, inner_end, ","
-        ):
-            colon = top_level_character(
-                lexed.executable, property_start, property_end, ":"
-            )
-            if colon is None:
-                continue
-            value_start = colon + 1
-            for literal in lexed.literals:
-                if value_start <= literal.start < property_end and literal_is_style_value(
-                    lexed.executable, value_start, literal.start
-                ):
-                    values.append(literal.value)
+        values.extend(object_style_value_literals(lexed, inner_start, inner_end))
+
+    aliases = set(JSX_STYLE_ALIAS_PATTERN.findall(lexed.executable))
+    for match in CONST_OBJECT_PATTERN.finditer(lexed.executable):
+        if match.group(1) not in aliases:
+            continue
+        object_start = match.end() - 1
+        object_end = matching_brace(lexed.executable, object_start)
+        if object_end is not None:
+            values.extend(object_style_value_literals(lexed, object_start, object_end))
     return values
 
 
@@ -488,8 +518,9 @@ def css_custom_properties(paths: list[Path]) -> set[str]:
             source = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
-        if path.suffix.casefold() == ".css":
-            source = css_without_comments(source)
+        suffix = path.suffix.casefold()
+        if suffix in TOKEN_STYLESHEET_SUFFIXES:
+            source = css_without_comments(source, line_comments=suffix != ".css")
         elif path.suffix.casefold() in {
             ".ts",
             ".tsx",
@@ -511,10 +542,10 @@ def css_custom_property_uses(paths: list[Path]) -> set[str]:
         except (OSError, UnicodeError):
             continue
         suffix = path.suffix.casefold()
-        if suffix == ".css":
+        if suffix in TOKEN_STYLESHEET_SUFFIXES:
             values.update(
                 CSS_CUSTOM_PROPERTY_USE_PATTERN.findall(
-                    css_without_comments(source)
+                    css_without_comments(source, line_comments=suffix != ".css")
                 )
             )
         elif suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
@@ -628,6 +659,14 @@ def code_preview_errors(
                         f"{label} {field} must be included in preview_files: {relative}"
                     )
 
+    supported_suffixes = ", ".join(sorted(TOKEN_STYLESHEET_SUFFIXES))
+    for relative in token_sources or []:
+        if PurePosixPath(relative).suffix.casefold() not in TOKEN_STYLESHEET_SUFFIXES:
+            errors.append(
+                f"{label} token_source must use a supported stylesheet suffix "
+                f"({supported_suffixes}): {relative}"
+            )
+
     reachable = set()
     if source_root is not None and preview_files is not None and preview_path is not None:
         absolute_root = source_root
@@ -664,7 +703,9 @@ def code_preview_errors(
     token_paths = [
         resolved_files[path]
         for path in token_sources or []
-        if path in reachable and path in resolved_files
+        if path in reachable
+        and path in resolved_files
+        and PurePosixPath(path).suffix.casefold() in TOKEN_STYLESHEET_SUFFIXES
     ]
     definitions = css_custom_properties(token_paths)
     references = css_custom_property_uses(reachable_paths)
@@ -1045,10 +1086,58 @@ def matching_parenthesis(source: str, start: int) -> int | None:
     return None
 
 
+def inside_direct_class_body(source: str, position: int) -> bool:
+    class_pattern = re.compile(
+        r"\bclass\s+[A-Za-z_$][A-Za-z0-9_$]*[^\{]*\{"
+    )
+    for match in class_pattern.finditer(source, 0, position):
+        open_brace = match.end() - 1
+        close_brace = matching_brace(source, open_brace)
+        if close_brace is None or position >= close_brace:
+            continue
+        depth = 0
+        for character in source[open_brace:position]:
+            if character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+        if depth == 1:
+            return True
+    return False
+
+
 def typescript_import_is_type_only(source: str, position: int) -> bool:
     prefix = source[:position]
     if re.search(r"\b(?:as|satisfies)\s*$", prefix):
         return True
+
+    annotation_tail = r"\s*(?:typeof\s*)?"
+    variable_annotation_pattern = re.compile(
+        rf"(?m)(?:^|[;\n])\s*(?:export\s+)?(?:declare\s+)?"
+        rf"(?:const|let|var)\s+{IDENTIFIER}(?:\s*[?!])?\s*:"
+    )
+    for match in variable_annotation_pattern.finditer(source, 0, position):
+        if re.fullmatch(annotation_tail, source[match.end() : position]):
+            return True
+
+    if re.search(
+        rf"\bfunction(?:\s+{IDENTIFIER})?\s*\([^)]*\)\s*:"
+        rf"{annotation_tail}$",
+        prefix,
+    ):
+        return True
+
+    property_annotation_pattern = re.compile(
+        rf"(?m)(?:^|[;{{\n])\s*"
+        rf"(?:(?:public|private|protected|readonly|static|abstract|declare|"
+        rf"override)\s+)*{IDENTIFIER}\s*[?!]?\s*:"
+    )
+    for match in property_annotation_pattern.finditer(source, 0, position):
+        if (
+            re.fullmatch(annotation_tail, source[match.end() : position])
+            and inside_direct_class_body(source, match.end())
+        ):
+            return True
 
     type_alias_pattern = re.compile(
         rf"(?m)(?:^|[;\n])\s*(?:export\s+)?type\s+{IDENTIFIER}"
