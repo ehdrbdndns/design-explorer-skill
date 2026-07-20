@@ -345,17 +345,183 @@ def preview_files_digest(root: Path, paths: list[str]) -> str | None:
 
 
 CSS_CUSTOM_PROPERTY_PATTERN = re.compile(r"(?m)(--[A-Za-z0-9_-]+)\s*:")
+CSS_CUSTOM_PROPERTY_USE_PATTERN = re.compile(
+    r"var\(\s*(--[A-Za-z0-9_-]+)\s*(?:,|\))"
+)
+JSX_STYLE_ATTRIBUTE_START_PATTERN = re.compile(r"\bstyle\s*=\s*\{")
+
+
+def css_without_comments(source: str) -> str:
+    output = list(source)
+    index = 0
+    quote = None
+    while index < len(source):
+        current = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        if quote is not None:
+            if current == "\\" and index + 1 < len(source):
+                index += 2
+                continue
+            if current == quote:
+                quote = None
+            index += 1
+            continue
+        if current in {"'", '"'}:
+            quote = current
+            index += 1
+            continue
+        if current == "/" and following == "*":
+            close = source.find("*/", index + 2)
+            end = len(source) if close == -1 else close + 2
+            _mask_span(output, index, end)
+            index = end
+            continue
+        index += 1
+    return "".join(output)
+
+
+def matching_brace(source: str, start: int) -> int | None:
+    depth = 0
+    for index in range(start, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def top_level_ranges(source: str, start: int, end: int, separator: str) -> list[tuple[int, int]]:
+    ranges = []
+    range_start = start
+    parens = brackets = braces = 0
+    for index in range(start, end):
+        character = source[index]
+        if character == "(":
+            parens += 1
+        elif character == ")":
+            parens = max(0, parens - 1)
+        elif character == "[":
+            brackets += 1
+        elif character == "]":
+            brackets = max(0, brackets - 1)
+        elif character == "{":
+            braces += 1
+        elif character == "}":
+            braces = max(0, braces - 1)
+        elif character == separator and parens == brackets == braces == 0:
+            ranges.append((range_start, index))
+            range_start = index + 1
+    ranges.append((range_start, end))
+    return ranges
+
+
+def top_level_character(source: str, start: int, end: int, target: str) -> int | None:
+    for range_start, range_end in top_level_ranges(source, start, end, target):
+        if range_end < end:
+            return range_end
+    return None
+
+
+def literal_is_style_value(source: str, start: int, literal_start: int) -> bool:
+    stack = []
+    for index in range(start, literal_start):
+        character = source[index]
+        if character == "(":
+            previous = index - 1
+            while previous >= start and source[previous].isspace():
+                previous -= 1
+            is_call = previous >= start and (
+                source[previous].isalnum() or source[previous] in "_$.)]"
+            )
+            stack.append("call" if is_call else "group")
+        elif character == ")":
+            if stack and stack[-1] in {"call", "group"}:
+                stack.pop()
+        elif character == "[":
+            stack.append("bracket")
+        elif character == "]":
+            if stack and stack[-1] == "bracket":
+                stack.pop()
+        elif character == "{":
+            stack.append("object")
+        elif character == "}":
+            if stack and stack[-1] == "object":
+                stack.pop()
+    return not any(kind in {"call", "bracket", "object"} for kind in stack)
+
+
+def jsx_style_value_literals(source: str) -> list[str]:
+    lexed = lex_js(source)
+    values = []
+    for match in JSX_STYLE_ATTRIBUTE_START_PATTERN.finditer(lexed.executable):
+        inner_start = match.end()
+        while inner_start < len(source) and lexed.executable[inner_start].isspace():
+            inner_start += 1
+        if inner_start >= len(source) or lexed.executable[inner_start] != "{":
+            continue
+        inner_end = matching_brace(lexed.executable, inner_start)
+        if inner_end is None:
+            continue
+        for property_start, property_end in top_level_ranges(
+            lexed.executable, inner_start + 1, inner_end, ","
+        ):
+            colon = top_level_character(
+                lexed.executable, property_start, property_end, ":"
+            )
+            if colon is None:
+                continue
+            value_start = colon + 1
+            for literal in lexed.literals:
+                if value_start <= literal.start < property_end and literal_is_style_value(
+                    lexed.executable, value_start, literal.start
+                ):
+                    values.append(literal.value)
+    return values
 
 
 def css_custom_properties(paths: list[Path]) -> set[str]:
     values: set[str] = set()
     for path in paths:
         try:
-            values.update(
-                CSS_CUSTOM_PROPERTY_PATTERN.findall(path.read_text(encoding="utf-8"))
-            )
+            source = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
+        if path.suffix.casefold() == ".css":
+            source = css_without_comments(source)
+        elif path.suffix.casefold() in {
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".mjs",
+            ".cjs",
+        }:
+            source = lex_js(source).executable
+        values.update(CSS_CUSTOM_PROPERTY_PATTERN.findall(source))
+    return values
+
+
+def css_custom_property_uses(paths: list[Path]) -> set[str]:
+    values: set[str] = set()
+    for path in paths:
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        suffix = path.suffix.casefold()
+        if suffix == ".css":
+            values.update(
+                CSS_CUSTOM_PROPERTY_USE_PATTERN.findall(
+                    css_without_comments(source)
+                )
+            )
+        elif suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+            for value in jsx_style_value_literals(source):
+                values.update(
+                    CSS_CUSTOM_PROPERTY_USE_PATTERN.findall(value)
+                )
     return values
 
 
@@ -462,19 +628,46 @@ def code_preview_errors(
                         f"{label} {field} must be included in preview_files: {relative}"
                     )
 
+    reachable = set()
+    if source_root is not None and preview_files is not None and preview_path is not None:
+        absolute_root = source_root
+        if mode == "standalone":
+            packages = [
+                path
+                for path in preview_files
+                if PurePosixPath(path).name == "package.json"
+            ]
+            if len(packages) == 1:
+                absolute_root = source_root / PurePosixPath(packages[0]).parent
+        reachable, closure_errors = dependency_closure(
+            source_root,
+            preview_files,
+            [preview_path],
+            absolute_root,
+            runtime_only=True,
+        )
+        errors.extend(f"{label} {error}" for error in closure_errors)
+
+    for singular, values in (
+        ("token_source", token_sources),
+        ("component_source", component_sources),
+    ):
+        for relative in values or []:
+            if relative not in reachable:
+                errors.append(
+                    f"{label} {singular} must be reachable from preview_path: {relative}"
+                )
+
+    reachable_paths = [
+        resolved_files[path] for path in reachable if path in resolved_files
+    ]
     token_paths = [
         resolved_files[path]
         for path in token_sources or []
-        if path in resolved_files
+        if path in reachable and path in resolved_files
     ]
     definitions = css_custom_properties(token_paths)
-    dependency_sources = []
-    for path in resolved_files.values():
-        try:
-            dependency_sources.append(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError):
-            continue
-    dependency_source = "\n".join(dependency_sources)
+    references = css_custom_property_uses(reachable_paths)
     for token in used_tokens or []:
         if CSS_CUSTOM_PROPERTY_PATTERN.fullmatch(f"{token}:") is None:
             errors.append(f"{label} used_tokens contains an invalid CSS variable: {token}")
@@ -483,9 +676,7 @@ def code_preview_errors(
             errors.append(
                 f"{label} used token must be defined by token_sources: {token}"
             )
-        if re.search(
-            rf"var\(\s*{re.escape(token)}\s*(?:,|\))", dependency_source
-        ) is None:
+        if token not in references:
             errors.append(
                 f"{label} used token must be referenced by preview dependency set: {token}"
             )
@@ -523,26 +714,6 @@ def code_preview_errors(
         or source_digest != expected_digest
     ):
         errors.append(f"{label} source_digest must match current preview_files")
-
-    if source_root is not None and preview_files is not None and preview_path is not None:
-        absolute_root = source_root
-        if mode == "standalone":
-            packages = [
-                path
-                for path in preview_files
-                if PurePosixPath(path).name == "package.json"
-            ]
-            if len(packages) == 1:
-                absolute_root = source_root / PurePosixPath(packages[0]).parent
-        errors.extend(
-            f"{label} {error}"
-            for error in dependency_closure_errors(
-                source_root,
-                preview_files,
-                [preview_path, *(component_sources or [])],
-                absolute_root,
-            )
-        )
 
     if item.get("status") == "success" and item.get("output_kind") != "local":
         errors.append(f"{label} success requires local output_kind")
@@ -614,6 +785,7 @@ class JsModuleReference:
     kind: str
     specifier: str
     clause: str = ""
+    type_only: bool = False
 
 
 def _mask_span(output: list[str], start: int, end: int, keep_quotes: bool = False) -> None:
@@ -751,15 +923,24 @@ def lex_js(source: str) -> JsLexResult:
             continue
         if current == "`":
             end = index + 1
+            closed = False
+            has_interpolation = False
             while end < len(source):
                 if source[end] == "\\" and end + 1 < len(source):
                     end += 2
                     continue
+                if source[end : end + 2] == "${":
+                    has_interpolation = True
                 if source[end] == "`":
                     end += 1
+                    closed = True
                     break
                 end += 1
-            _mask_span(output, index, end)
+            if closed and not has_interpolation:
+                value = _decode_js_string(source[index + 1 : end - 1])
+                if value is not None:
+                    literals.append(JsStringLiteral(index, end, value, current))
+            _mask_span(output, index, end, keep_quotes=closed)
             index = end
             continue
         jsx_closing_tag = (
@@ -802,7 +983,7 @@ SIDE_EFFECT_IMPORT_PATTERN = re.compile(
     r"(?m)^[ \t]*import\s*(?P<quote>[\"'])"
 )
 EXPORT_FROM_PATTERN = re.compile(
-    r"(?m)^[ \t]*export\b[^;]*?\bfrom\s*(?P<quote>[\"'])"
+    r"(?m)^[ \t]*export\b(?P<clause>[^;]*?)\bfrom\s*(?P<quote>[\"'])"
 )
 DYNAMIC_IMPORT_PATTERN = re.compile(
     r"\bimport\s*\(\s*(?P<quote>[\"'])\s*(?P=quote)\s*\)"
@@ -810,6 +991,106 @@ DYNAMIC_IMPORT_PATTERN = re.compile(
 REQUIRE_PATTERN = re.compile(
     r"\brequire\s*\(\s*(?P<quote>[\"'])\s*(?P=quote)\s*\)"
 )
+
+
+def statement_end(source: str, start: int) -> int:
+    parens = brackets = braces = 0
+    for index in range(start, len(source)):
+        character = source[index]
+        if character == "(":
+            parens += 1
+        elif character == ")":
+            parens = max(0, parens - 1)
+        elif character == "[":
+            brackets += 1
+        elif character == "]":
+            brackets = max(0, brackets - 1)
+        elif character == "{":
+            braces += 1
+        elif character == "}":
+            braces = max(0, braces - 1)
+        elif character == ";" and parens == brackets == braces == 0:
+            return index
+        elif character == "\n" and parens == brackets == braces == 0:
+            next_statement = source[index + 1 :]
+            if re.match(
+                r"[ \t]*(?:(?:export\b)|(?:import\b(?!\s*\())|"
+                r"(?:(?:const|let|var|function|class|type|interface|declare|"
+                r"enum|namespace|module)\b))",
+                next_statement,
+            ):
+                return index
+    return len(source)
+
+
+def enclosing_parentheses(source: str, position: int) -> list[int]:
+    stack = []
+    for index in range(position):
+        if source[index] == "(":
+            stack.append(index)
+        elif source[index] == ")" and stack:
+            stack.pop()
+    return stack
+
+
+def matching_parenthesis(source: str, start: int) -> int | None:
+    depth = 0
+    for index in range(start, len(source)):
+        if source[index] == "(":
+            depth += 1
+        elif source[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def typescript_import_is_type_only(source: str, position: int) -> bool:
+    prefix = source[:position]
+    if re.search(r"\b(?:as|satisfies)\s*$", prefix):
+        return True
+
+    type_alias_pattern = re.compile(
+        rf"(?m)(?:^|[;\n])\s*(?:export\s+)?type\s+{IDENTIFIER}"
+        r"(?:\s*<[^;=]*>)?\s*="
+    )
+    for match in type_alias_pattern.finditer(source, 0, position):
+        if position < statement_end(source, match.end()):
+            return True
+
+    interface_pattern = re.compile(
+        rf"\binterface\s+{IDENTIFIER}(?:\s+extends\s+[^{{]+)?\s*\{{"
+    )
+    for match in interface_pattern.finditer(source, 0, position):
+        close = matching_brace(source, match.end() - 1)
+        if close is not None and position < close:
+            return True
+
+    declare_pattern = re.compile(r"(?m)(?:^|[;\n])\s*declare\b")
+    for match in declare_pattern.finditer(source, 0, position):
+        if position < statement_end(source, match.end()):
+            return True
+
+    for open_paren in reversed(enclosing_parentheses(source, position)):
+        close_paren = matching_parenthesis(source, open_paren)
+        if close_paren is None:
+            continue
+        before = source[max(0, open_paren - 200) : open_paren]
+        after = source[close_paren + 1 : close_paren + 200]
+        is_parameters = re.search(
+            rf"\bfunction(?:\s+{IDENTIFIER})?\s*$", before
+        ) is not None or re.match(r"\s*(?::[^=]+)?=>", after) is not None
+        if not is_parameters:
+            continue
+        segment_start = open_paren + 1
+        comma_ranges = top_level_ranges(source, segment_start, position, ",")
+        if comma_ranges:
+            segment_start = comma_ranges[-1][0]
+        colon = top_level_character(source, segment_start, position, ":")
+        equals = top_level_character(source, segment_start, position, "=")
+        if colon is not None and (equals is None or colon > equals):
+            return True
+    return False
 
 
 def js_module_references(source: str) -> tuple[JsLexResult, list[JsModuleReference]]:
@@ -832,7 +1113,12 @@ def js_module_references(source: str) -> tuple[JsLexResult, list[JsModuleReferen
                 continue
             seen.add(key)
             clause = match.groupdict().get("clause") or ""
-            references.append(JsModuleReference(kind, literal.value, clause))
+            type_only = kind == "dynamic" and typescript_import_is_type_only(
+                lexed.executable, match.start()
+            )
+            references.append(
+                JsModuleReference(kind, literal.value, clause, type_only)
+            )
     return lexed, references
 
 
@@ -870,6 +1156,21 @@ def import_bindings(reference: JsModuleReference) -> dict[str, str]:
 
 def is_runtime_import(reference: JsModuleReference) -> bool:
     return reference.kind == "import" and bool(import_bindings(reference))
+
+
+def is_runtime_export(reference: JsModuleReference) -> bool:
+    if reference.kind != "export":
+        return False
+    clause = reference.clause.strip()
+    if re.match(r"^type\b", clause):
+        return False
+    named = re.fullmatch(r"\{(.*?)\}", clause, re.S)
+    if named:
+        return any(
+            item.strip() and not re.match(r"^type\b", item.strip())
+            for item in named.group(1).split(",")
+        )
+    return True
 
 
 def imported_locals(
@@ -963,6 +1264,22 @@ def js_dependencies(source: str) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+def js_runtime_dependencies(source: str) -> list[str]:
+    lexed, references = js_module_references(source)
+    values = []
+    for reference in references:
+        if reference.type_only:
+            continue
+        if reference.kind == "import" and reference.clause.strip():
+            if not is_runtime_import(reference):
+                continue
+        elif reference.kind == "export" and not is_runtime_export(reference):
+            continue
+        values.append(reference.specifier)
+    values.extend(js_render_dependencies(lexed))
+    return list(dict.fromkeys(values))
+
+
 class _HtmlDependencyParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -1032,6 +1349,16 @@ def local_dependencies(path: Path) -> list[str]:
     return []
 
 
+def runtime_local_dependencies(path: Path) -> list[str]:
+    if path.suffix.casefold() not in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+        return local_dependencies(path)
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return []
+    return js_runtime_dependencies(source)
+
+
 def _is_local_specifier(specifier: str) -> bool:
     return specifier.startswith(("./", "../", "/")) and not specifier.startswith("//")
 
@@ -1063,16 +1390,18 @@ def resolve_local_dependency(
     return None, f"missing local dependency: {specifier}"
 
 
-def dependency_closure_errors(
+def dependency_closure(
     root: Path,
     preview_files: list[str],
     roots: list[str],
     absolute_root: Path | None = None,
-) -> list[str]:
+    runtime_only: bool = False,
+) -> tuple[set[str], list[str]]:
     errors = []
     listed = set(preview_files)
     pending = list(dict.fromkeys(roots))
     visited = set()
+    reachable = set()
     absolute_root = absolute_root or root
     while pending:
         relative = pending.pop()
@@ -1086,7 +1415,11 @@ def dependency_closure_errors(
         if path is None or not path.is_file():
             errors.append(f"preview dependency must be contained and existing: {relative}")
             continue
-        for specifier in local_dependencies(path):
+        reachable.add(relative)
+        dependencies = (
+            runtime_local_dependencies(path) if runtime_only else local_dependencies(path)
+        )
+        for specifier in dependencies:
             resolved, error = resolve_local_dependency(root, path, specifier, absolute_root)
             if error:
                 errors.append(f"{relative}: {error}")
@@ -1095,7 +1428,16 @@ def dependency_closure_errors(
                     errors.append(f"unlisted local dependency from {relative}: {resolved}")
                 else:
                     pending.append(resolved)
-    return errors
+    return reachable, errors
+
+
+def dependency_closure_errors(
+    root: Path,
+    preview_files: list[str],
+    roots: list[str],
+    absolute_root: Path | None = None,
+) -> list[str]:
+    return dependency_closure(root, preview_files, roots, absolute_root)[1]
 
 
 def _standalone_topology_errors(

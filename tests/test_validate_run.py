@@ -199,7 +199,7 @@ class ValidateRunTests(unittest.TestCase):
         screen = source_root / preview_files[0]
         tokens = source_root / preview_files[1]
         button = source_root / preview_files[2]
-        screen.parent.mkdir(parents=True)
+        screen.parent.mkdir(parents=True, exist_ok=True)
         tokens.parent.mkdir(parents=True, exist_ok=True)
         tokens.write_text(
             ":root { --color-surface: white; --space-4: 1rem; }\n",
@@ -847,6 +847,308 @@ class ValidateRunTests(unittest.TestCase):
             "mockups[0] code preview used token must be referenced by preview dependency set: --space-8",
             errors,
         )
+
+    def test_code_preview_provenance_must_be_reachable_from_preview_path(self):
+        for mode in ("project", "standalone"):
+            with self.subTest(mode=mode):
+                run, item, source_root = self.code_preview_fixture(mode=mode)
+                screen = source_root / item["preview_path"]
+                screen.write_text(
+                    "export function Screen(){return <main style={{background: "
+                    "'var(--color-surface)', gap: 'var(--space-4)'}}>Preview</main>}\n",
+                    encoding="utf-8",
+                )
+                item["source_digest"] = preview_digest(
+                    source_root, item["preview_files"]
+                )
+                self.write("run.json", run)
+                self.write("mockup-manifest.json", mockup_manifest([item]))
+
+                errors = validator.validate_mockups(self.run)
+
+                self.assertIn(
+                    f"mockups[0] code preview token_source must be reachable from preview_path: {item['token_sources'][0]}",
+                    errors,
+                )
+                self.assertIn(
+                    f"mockups[0] code preview component_source must be reachable from preview_path: {item['component_sources'][0]}",
+                    errors,
+                )
+
+        run, item, source_root = self.code_preview_fixture(mode="project")
+        screen = source_root / item["preview_path"]
+        screen.write_text(
+            "import '../../src/tokens.css';\n"
+            "import { Button } from '../../src/Button';\n"
+            "export function Screen(){return <main><Button /></main>}\n",
+            encoding="utf-8",
+        )
+        unreachable = "previews/d-0/Unused.tsx"
+        (source_root / unreachable).write_text(
+            "export const Unused=()=> <aside style={{background: "
+            "'var(--color-surface)', gap: 'var(--space-4)'}} />;\n",
+            encoding="utf-8",
+        )
+        item["preview_files"].append(unreachable)
+        item["source_digest"] = preview_digest(source_root, item["preview_files"])
+        self.write("run.json", run)
+        self.write("mockup-manifest.json", mockup_manifest([item]))
+
+        errors = validator.validate_mockups(self.run)
+
+        for token in item["used_tokens"]:
+            self.assertIn(
+                f"mockups[0] code preview used token must be referenced by preview dependency set: {token}",
+                errors,
+            )
+
+    def test_code_preview_component_source_requires_runtime_reachability(self):
+        for mode in ("project", "standalone"):
+            with self.subTest(mode=mode):
+                run, item, source_root = self.code_preview_fixture(mode=mode)
+                screen = source_root / item["preview_path"]
+                screen.write_text(
+                    "import '../../src/tokens.css';\n"
+                    "import type { Button } from '../../src/Button';\n"
+                    "export function Screen(){return <main style={{background: "
+                    "'var(--color-surface)', gap: 'var(--space-4)'}}>Preview</main>}\n",
+                    encoding="utf-8",
+                )
+                item["source_digest"] = preview_digest(
+                    source_root, item["preview_files"]
+                )
+                self.write("run.json", run)
+                self.write("mockup-manifest.json", mockup_manifest([item]))
+
+                errors = validator.validate_mockups(self.run)
+
+                self.assertIn(
+                    f"mockups[0] code preview component_source must be reachable from preview_path: {item['component_sources'][0]}",
+                    errors,
+                )
+
+    def test_code_preview_type_only_reexport_is_not_runtime_reachable(self):
+        for mode in ("project", "standalone"):
+            with self.subTest(mode=mode):
+                run, item, source_root = self.code_preview_fixture(mode=mode)
+                screen = source_root / item["preview_path"]
+                screen.write_text(
+                    "import '../../src/tokens.css';\n"
+                    "export type { Button } from '../../src/Button';\n"
+                    "export function Screen(){return <main style={{background: "
+                    "'var(--color-surface)', gap: 'var(--space-4)'}}>Preview</main>}\n",
+                    encoding="utf-8",
+                )
+                item["source_digest"] = preview_digest(
+                    source_root, item["preview_files"]
+                )
+                self.write("run.json", run)
+                self.write("mockup-manifest.json", mockup_manifest([item]))
+
+                errors = validator.validate_mockups(self.run)
+
+                self.assertIn(
+                    f"mockups[0] code preview component_source must be reachable from preview_path: {item['component_sources'][0]}",
+                    errors,
+                )
+
+    def test_code_preview_ts_type_import_expressions_are_not_runtime_reachable(self):
+        type_expressions = (
+            "type ButtonType = typeof import('../../src/Button');",
+            "type ButtonType = import('../../src/Button').Button;",
+            "type ButtonType =\n typeof import('../../src/Button');",
+            "type ButtonType =\n import('../../src/Button').Button;",
+            "type ButtonType = { button: import('../../src/Button').Button };",
+            "interface Props { button: import('../../src/Button').Button }",
+            "declare const button: import('../../src/Button').Button;",
+            "declare function use(button: import('../../src/Button').Button): void;",
+            "const button = null as import('../../src/Button').Button;",
+            "function use(button: import('../../src/Button').Button): void {}",
+        )
+        for mode in ("project", "standalone"):
+            for type_expression in type_expressions:
+                with self.subTest(mode=mode, type_expression=type_expression):
+                    run, item, source_root = self.code_preview_fixture(mode=mode)
+                    screen = source_root / item["preview_path"]
+                    screen.write_text(
+                        "import '../../src/tokens.css';\n"
+                        f"{type_expression}\n"
+                        "export function Screen(){return <main style={{background: "
+                        "'var(--color-surface)', gap: 'var(--space-4)'}}>Preview</main>}\n",
+                        encoding="utf-8",
+                    )
+                    item["source_digest"] = preview_digest(
+                        source_root, item["preview_files"]
+                    )
+                    self.write("run.json", run)
+                    self.write("mockup-manifest.json", mockup_manifest([item]))
+
+                    errors = validator.validate_mockups(self.run)
+
+                    self.assertIn(
+                        f"mockups[0] code preview component_source must be reachable from preview_path: {item['component_sources'][0]}",
+                        errors,
+                    )
+
+    def test_code_preview_runtime_dynamic_import_remains_reachable(self):
+        prefixes = (
+            "",
+            "type Meta = string\n",
+            "declare const metadata: string\n",
+        )
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                run, item, source_root = self.code_preview_fixture(mode="project")
+                screen = source_root / item["preview_path"]
+                screen.write_text(
+                    "import '../../src/tokens.css';\n"
+                    f"{prefix}"
+                    "const buttonModule = import('../../src/Button');\n"
+                    "export function Screen(){return <main style={{background: "
+                    "'var(--color-surface)', gap: 'var(--space-4)'}}>Preview</main>}\n",
+                    encoding="utf-8",
+                )
+                item["source_digest"] = preview_digest(
+                    source_root, item["preview_files"]
+                )
+                self.write("run.json", run)
+                self.write("mockup-manifest.json", mockup_manifest([item]))
+
+                self.assertEqual(validator.validate_mockups(self.run), [])
+
+    def test_code_preview_css_token_definitions_ignore_comments(self):
+        run, item, source_root = self.code_preview_fixture(mode="project")
+        tokens = source_root / item["token_sources"][0]
+        tokens.write_text(
+            ":root { /* --color-surface: white; */ --space-4: 1rem; }\n",
+            encoding="utf-8",
+        )
+        item["source_digest"] = preview_digest(source_root, item["preview_files"])
+        self.write("run.json", run)
+        self.write("mockup-manifest.json", mockup_manifest([item]))
+        errors = validator.validate_mockups(self.run)
+        self.assertIn(
+            "mockups[0] code preview used token must be defined by token_sources: --color-surface",
+            errors,
+        )
+
+    def test_code_preview_css_token_uses_ignore_comments(self):
+        run, item, source_root = self.code_preview_fixture(mode="project")
+        screen = source_root / item["preview_path"]
+        screen.write_text(
+            "import '../../src/tokens.css';\n"
+            "import { Button } from '../../src/Button';\n"
+            "export function Screen(){return <main><Button /></main>}\n",
+            encoding="utf-8",
+        )
+        tokens = source_root / item["token_sources"][0]
+        tokens.write_text(
+            tokens.read_text(encoding="utf-8")
+            + "/* var(--color-surface); var(--space-4); */\n",
+            encoding="utf-8",
+        )
+        item["source_digest"] = preview_digest(source_root, item["preview_files"])
+        self.write("run.json", run)
+        self.write("mockup-manifest.json", mockup_manifest([item]))
+        errors = validator.validate_mockups(self.run)
+        self.assertIn(
+            "mockups[0] code preview used token must be referenced by preview dependency set: --color-surface",
+            errors,
+        )
+
+    def test_code_preview_js_token_uses_ignore_comments_and_inert_strings(self):
+        run, item, source_root = self.code_preview_fixture(mode="project")
+        screen = source_root / item["preview_path"]
+        screen.write_text(
+            "import '../../src/tokens.css';\n"
+            "import { Button } from '../../src/Button';\n"
+            "// var(--color-surface); var(--space-4);\n"
+            "/* var(--color-surface); var(--space-4); */\n"
+            "const inert = 'var(--color-surface) var(--space-4)';\n"
+            "export function Screen(){return <main><Button /></main>}\n",
+            encoding="utf-8",
+        )
+        item["source_digest"] = preview_digest(source_root, item["preview_files"])
+        self.write("run.json", run)
+        self.write("mockup-manifest.json", mockup_manifest([item]))
+        errors = validator.validate_mockups(self.run)
+        for token in item["used_tokens"]:
+            self.assertIn(
+                f"mockups[0] code preview used token must be referenced by preview dependency set: {token}",
+                errors,
+            )
+
+    def test_code_preview_jsx_style_values_are_direct_and_type_aware(self):
+        valid_styles = (
+            "{{background: 'var(--color-surface)', gap: 'var(--space-4)'} as React.CSSProperties}",
+            "{{background: 'var(--color-surface)', gap: 'var(--space-4)'} satisfies React.CSSProperties}",
+            "{{background: `var(--color-surface)`, gap: `var(--space-4)`}}",
+            "{{background: active ? 'var(--color-surface)' : 'transparent', gap: ('var(--space-4)')}}",
+        )
+        for style in valid_styles:
+            with self.subTest(valid=style):
+                run, item, source_root = self.code_preview_fixture(mode="project")
+                screen = source_root / item["preview_path"]
+                screen.write_text(
+                    "import '../../src/tokens.css';\n"
+                    "import { Button } from '../../src/Button';\n"
+                    f"export function Screen(){{return <main style={style}><Button /></main>}}\n",
+                    encoding="utf-8",
+                )
+                item["source_digest"] = preview_digest(
+                    source_root, item["preview_files"]
+                )
+                self.write("run.json", run)
+                self.write("mockup-manifest.json", mockup_manifest([item]))
+                self.assertEqual(validator.validate_mockups(self.run), [])
+
+        inert_styles = (
+            "{{background: log('var(--color-surface)'), gap: log('var(--space-4)')}}",
+            "{{'var(--color-surface)': 'red', 'var(--space-4)': '1rem'}}",
+            "{{background: log(active ? 'red' : 'var(--color-surface)'), gap: log(active ? '0' : 'var(--space-4)')}}",
+        )
+        for style in inert_styles:
+            with self.subTest(inert=style):
+                run, item, source_root = self.code_preview_fixture(mode="project")
+                screen = source_root / item["preview_path"]
+                screen.write_text(
+                    "import '../../src/tokens.css';\n"
+                    "import { Button } from '../../src/Button';\n"
+                    f"export function Screen(){{return <main style={style}><Button /></main>}}\n",
+                    encoding="utf-8",
+                )
+                item["source_digest"] = preview_digest(
+                    source_root, item["preview_files"]
+                )
+                self.write("run.json", run)
+                self.write("mockup-manifest.json", mockup_manifest([item]))
+                errors = validator.validate_mockups(self.run)
+                for token in item["used_tokens"]:
+                    self.assertIn(
+                        f"mockups[0] code preview used token must be referenced by preview dependency set: {token}",
+                        errors,
+                    )
+
+    def test_code_preview_css_comment_scanner_preserves_quoted_markers(self):
+        run, item, source_root = self.code_preview_fixture(mode="project")
+        screen = source_root / item["preview_path"]
+        screen.write_text(
+            "import '../../src/tokens.css';\n"
+            "import { Button } from '../../src/Button';\n"
+            "export function Screen(){return <main><Button /></main>}\n",
+            encoding="utf-8",
+        )
+        tokens = source_root / item["token_sources"][0]
+        tokens.write_text(
+            ':root { --marker: "/*"; --color-surface: white; --space-4: 1rem; }\n'
+            ".preview { background: var(--color-surface); gap: var(--space-4); }\n",
+            encoding="utf-8",
+        )
+        item["source_digest"] = preview_digest(source_root, item["preview_files"])
+        self.write("run.json", run)
+        self.write("mockup-manifest.json", mockup_manifest([item]))
+
+        self.assertEqual(validator.validate_mockups(self.run), [])
 
     def test_code_preview_sources_are_digest_bound_and_contained(self):
         run, item, source_root = self.code_preview_fixture(mode="project")
