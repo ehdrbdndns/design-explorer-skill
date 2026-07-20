@@ -1325,6 +1325,18 @@ class ValidateRunTests(unittest.TestCase):
             "gap: 'var(--space-4)' }; return styles}\n"
             "const styles = { background: 'white', gap: '1rem' };\n"
             "export function Screen(){return <main style={styles}><Button /></main>}\n",
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "export function Screen(){let styles = { background: 'white', gap: '1rem' }; "
+            "return <main style={styles}><Button /></main>}\n",
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "export function Screen(){const preview = <main style={styles}><Button /></main>; "
+            "let styles = { background: 'white', gap: '1rem' }; return preview}\n",
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "export function Screen(styles: CSSProperties){"
+            "return <main style={styles}><Button /></main>}\n",
+            "import { styles } from '../../src/Button';\n"
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "export function Screen(){return <main style={styles}><Button /></main>}\n",
         )
         for source in decoys:
             with self.subTest(decoy=source):

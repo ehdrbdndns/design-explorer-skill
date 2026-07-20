@@ -356,6 +356,13 @@ CONST_OBJECT_PATTERN = re.compile(
     r"\bconst\s+([A-Za-z_$][A-Za-z0-9_$]*)"
     r"\s*(?::\s*[^=;\n]+)?=\s*\{"
 )
+VARIABLE_BINDING_PATTERN = re.compile(
+    r"\b(const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)"
+)
+FUNCTION_PARAMETER_PATTERN = re.compile(
+    r"\bfunction(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s*"
+    r"\(([^)]*)\)\s*(?::[^\{;]+)?\{"
+)
 TOKEN_STYLESHEET_SUFFIXES = frozenset({".css", ".less", ".sass", ".scss"})
 
 
@@ -511,18 +518,55 @@ def jsx_style_value_literals(source: str) -> list[str]:
             continue
         values.extend(object_style_value_literals(lexed, inner_start, inner_end))
 
-    declarations = []
+    object_initializers = {}
     for match in CONST_OBJECT_PATTERN.finditer(lexed.executable):
         object_start = match.end() - 1
         object_end = matching_brace(lexed.executable, object_start)
         if object_end is not None:
-            declarations.append(
+            object_initializers[(match.group(1), match.start())] = (
+                object_start,
+                object_end,
+            )
+
+    bindings = []
+    for match in VARIABLE_BINDING_PATTERN.finditer(lexed.executable):
+        name = match.group(2)
+        object_range = object_initializers.get((name, match.start()))
+        bindings.append(
+            (
+                name,
+                match.start(),
+                brace_scope_at(lexed.executable, match.start()),
+                object_range,
+                False,
+            )
+        )
+
+    for match in FUNCTION_PARAMETER_PATTERN.finditer(lexed.executable):
+        body_start = match.end() - 1
+        parameter_scope = brace_scope_at(lexed.executable, body_start + 1)
+        for start, end in top_level_ranges(
+            lexed.executable, match.start(1), match.end(1), ","
+        ):
+            parameter = re.match(
+                r"\s*(?:\.\.\.)?([A-Za-z_$][A-Za-z0-9_$]*)",
+                lexed.executable[start:end],
+            )
+            if parameter:
+                bindings.append(
+                    (parameter.group(1), match.start(), parameter_scope, None, True)
+                )
+
+    for match in STATIC_FROM_PATTERN.finditer(lexed.executable):
+        reference = JsModuleReference("import", "", match.group("clause"))
+        for name in import_bindings(reference):
+            bindings.append(
                 (
-                    match.group(1),
+                    name,
                     match.start(),
                     brace_scope_at(lexed.executable, match.start()),
-                    object_start,
-                    object_end,
+                    None,
+                    True,
                 )
             )
 
@@ -531,18 +575,28 @@ def jsx_style_value_literals(source: str) -> list[str]:
         name = alias.group(1)
         use_scope = brace_scope_at(lexed.executable, alias.start())
         candidates = []
-        for declaration in declarations:
-            declared_name, declared_at, declared_scope, _, _ = declaration
+        for binding in bindings:
+            declared_name, declared_at, declared_scope, _, hoisted = binding
             if declared_name != name:
                 continue
             if use_scope[: len(declared_scope)] != declared_scope:
                 continue
-            if declared_scope == use_scope and declared_at > alias.start():
-                continue
-            candidates.append(declaration)
+            candidates.append(binding)
         if candidates:
-            selected = max(candidates, key=lambda item: (len(item[2]), item[1]))
-            used_declarations.add((selected[3], selected[4]))
+            closest_depth = max(len(item[2]) for item in candidates)
+            closest = [item for item in candidates if len(item[2]) == closest_depth]
+            if len(closest) != 1:
+                continue
+            selected = closest[0]
+            if (
+                selected[2] == use_scope
+                and selected[1] > alias.start()
+                and not selected[4]
+            ):
+                continue
+            if selected[3] is None:
+                continue
+            used_declarations.add(selected[3])
 
     for object_start, object_end in used_declarations:
         values.extend(object_style_value_literals(lexed, object_start, object_end))
