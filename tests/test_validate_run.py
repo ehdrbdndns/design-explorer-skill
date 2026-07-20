@@ -1298,6 +1298,9 @@ class ValidateRunTests(unittest.TestCase):
             "export function Screen(){const styles: CSSProperties = "
             "{ background: 'var(--color-surface)', gap: 'var(--space-4)' }; "
             "return <main style={styles}><Button /></main>}\n",
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "export function Screen({styles: theme}: Props){"
+            "return <main style={styles}><Button /></main>}\n",
         )
         for source in valid_sources:
             with self.subTest(valid=source):
@@ -1342,6 +1345,15 @@ class ValidateRunTests(unittest.TestCase):
             "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
             "export function Screen({styles}: Props){"
             "return <main style={styles}><Button /></main>}\n",
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "export function Screen({foo: styles = fallback}: Props){"
+            "return <main style={styles}><Button /></main>}\n",
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "export function Screen({...styles}: Props){"
+            "return <main style={styles}><Button /></main>}\n",
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "export function Screen({theme: {styles}}: Props){"
+            "return <main style={styles}><Button /></main>}\n",
             "import { styles } from '../../src/Button';\n"
             "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
             "export function Screen(){return <main style={styles}><Button /></main>}\n",
@@ -1368,6 +1380,25 @@ class ValidateRunTests(unittest.TestCase):
                         f"mockups[0] code preview used token must be referenced by preview dependency set: {token}",
                         errors,
                     )
+
+    def test_parameter_binding_names_collects_only_local_destructured_bindings(self):
+        cases = (
+            ("styles: CSSProperties", {"styles"}),
+            ("{styles}", {"styles"}),
+            ("{styles: theme}", {"theme"}),
+            ("{foo: styles}", {"styles"}),
+            ("{styles = fallback}", {"styles"}),
+            ("{foo: styles = fallback}", {"styles"}),
+            ("{...styles}", {"styles"}),
+            (
+                "{theme: {styles, color: accent = fallback}, ...rest}",
+                {"styles", "accent", "rest"},
+            ),
+            ("{theme: [styles, ...rest]}", {"styles", "rest"}),
+        )
+        for source, expected in cases:
+            with self.subTest(source=source):
+                self.assertEqual(validator.parameter_binding_names(source), expected)
 
     def test_code_preview_sources_are_digest_bound_and_contained(self):
         run, item, source_root = self.code_preview_fixture(mode="project")

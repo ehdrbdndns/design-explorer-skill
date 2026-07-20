@@ -512,14 +512,40 @@ def brace_scope_at(source: str, position: int) -> tuple[int, ...]:
 
 def parameter_binding_names(source: str) -> set[str]:
     source = source.strip()
-    if source.startswith("{"):
-        close = source.find("}")
-        if close == -1:
+
+    def matching_pattern_end(start: int) -> int | None:
+        pairs = {"(": ")", "[": "]", "{": "}"}
+        stack = []
+        for index in range(start, len(source)):
+            character = source[index]
+            if character in pairs:
+                stack.append(pairs[character])
+            elif stack and character == stack[-1]:
+                stack.pop()
+                if not stack:
+                    return index
+        return None
+
+    if source.startswith("..."):
+        return parameter_binding_names(source[3:])
+    if source.startswith(("{", "[")):
+        close = matching_pattern_end(0)
+        if close is None:
             return set()
-        return set(
-            re.findall(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\b", source[1:close])
-        )
-    match = re.match(r"(?:\.\.\.)?([A-Za-z_$][A-Za-z0-9_$]*)", source)
+        names = set()
+        for start, end in top_level_ranges(source, 1, close, ","):
+            item = source[start:end]
+            colon = top_level_character(item, 0, len(item), ":")
+            binding = item[colon + 1 :] if colon is not None else item
+            names.update(parameter_binding_names(binding))
+        return names
+    default = top_level_character(source, 0, len(source), "=")
+    if default is not None:
+        source = source[:default].rstrip()
+    annotation = top_level_character(source, 0, len(source), ":")
+    if annotation is not None:
+        source = source[:annotation].rstrip()
+    match = re.match(r"([A-Za-z_$][A-Za-z0-9_$]*)", source)
     return {match.group(1)} if match else set()
 
 
