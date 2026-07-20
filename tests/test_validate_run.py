@@ -180,6 +180,80 @@ class ValidateRunTests(unittest.TestCase):
     def write(self, name, value):
         (self.run / name).write_text(json.dumps(value), encoding="utf-8")
 
+    def code_preview_fixture(self, *, mode="project", viewports=None):
+        viewports = viewports or ["390x844"]
+        direction_id = "d-0"
+        if mode == "project":
+            source_root = self.run / "project"
+            prefix = ""
+            project_path = str(source_root)
+        else:
+            source_root = self.run
+            prefix = "standalone/"
+            project_path = None
+        preview_files = [
+            f"{prefix}previews/{direction_id}/Screen.tsx",
+            f"{prefix}src/tokens.css",
+            f"{prefix}src/Button.tsx",
+        ]
+        screen = source_root / preview_files[0]
+        tokens = source_root / preview_files[1]
+        button = source_root / preview_files[2]
+        screen.parent.mkdir(parents=True)
+        tokens.parent.mkdir(parents=True, exist_ok=True)
+        tokens.write_text(
+            ":root { --color-surface: white; --space-4: 1rem; }\n",
+            encoding="utf-8",
+        )
+        button.write_text(
+            "export function Button(){return <button>Continue</button>}\n",
+            encoding="utf-8",
+        )
+        screen.write_text(
+            "import '../../src/tokens.css';\n"
+            "import { Button } from '../../src/Button';\n"
+            "export function Screen(){return <main style={{background: "
+            "'var(--color-surface)', gap: 'var(--space-4)'}}><Button /></main>}\n",
+            encoding="utf-8",
+        )
+        checks = {}
+        for viewport in viewports:
+            screenshot_ref = f"evidence/{direction_id}/{viewport}.png"
+            screenshot = self.run / screenshot_ref
+            screenshot.parent.mkdir(parents=True, exist_ok=True)
+            width, height = (int(value) for value in viewport.split("x"))
+            write_png(screenshot, width, height)
+            checks[viewport] = {
+                "screenshot_ref": screenshot_ref,
+                "content": "pass",
+                "overflow": "pass",
+                "accessibility": "pass",
+                "interaction": "pass",
+            }
+        run = run_manifest(
+            approved_direction_ids=[direction_id],
+            target_viewports=viewports,
+            project_path=project_path,
+        )
+        item = mockup(
+            direction_id,
+            artifact_kind="code-preview",
+            attempt_count=0,
+            output_kind="local",
+            output_ref=checks[viewports[0]]["screenshot_ref"],
+            preview_mode=mode,
+            preview_path=preview_files[0],
+            preview_files=preview_files,
+            preview_route=f"/design-explorer/{direction_id}",
+            token_sources=[preview_files[1]],
+            used_tokens=["--color-surface", "--space-4"],
+            component_sources=[preview_files[2]],
+            supporting_provider_refs=[],
+            source_digest=preview_digest(source_root, preview_files),
+            viewport_checks=checks,
+        )
+        return run, item, source_root
+
     def test_research_requires_traceable_http_sources(self):
         bad = reference()
         bad["source_url"] = "pinterest screenshot"
@@ -667,6 +741,196 @@ class ValidateRunTests(unittest.TestCase):
         errors = validator.validate_phase(self.run, "mockups")
         self.assertIn("missing current mockup entries for: b", errors)
         self.assertIn("missing successful mockups for: b", errors)
+
+    def test_code_preview_success_allows_zero_provider_attempts(self):
+        for mode in ("project", "standalone"):
+            with self.subTest(mode=mode):
+                run, item, _ = self.code_preview_fixture(mode=mode)
+                self.write("run.json", run)
+                self.write("mockup-manifest.json", mockup_manifest([item]))
+
+                self.assertEqual(validator.validate_mockups(self.run), [])
+
+    def test_code_preview_requires_complete_topology_and_all_viewports(self):
+        run, item, _ = self.code_preview_fixture(
+            mode="project", viewports=["390x844", "1280x720"]
+        )
+        self.write("run.json", run)
+
+        cases = []
+        missing_tokens = copy.deepcopy(item)
+        missing_tokens.pop("token_sources")
+        cases.append(
+            (missing_tokens, "code preview token_sources must be a non-empty list")
+        )
+        missing_components = copy.deepcopy(item)
+        missing_components["component_sources"] = []
+        cases.append(
+            (
+                missing_components,
+                "project code preview component_sources must be a non-empty list",
+            )
+        )
+        missing_viewport = copy.deepcopy(item)
+        missing_viewport["viewport_checks"].pop("1280x720")
+        cases.append(
+            (
+                missing_viewport,
+                "code preview viewport_checks keys must exactly match run target_viewports",
+            )
+        )
+        incomplete_check = copy.deepcopy(item)
+        incomplete_check["viewport_checks"]["1280x720"].pop("interaction")
+        cases.append(
+            (
+                incomplete_check,
+                "code preview viewport_checks[1280x720] status must pass: interaction",
+            )
+        )
+        missing_screenshot = copy.deepcopy(item)
+        missing_screenshot["viewport_checks"]["1280x720"]["screenshot_ref"] = (
+            "evidence/d-0/missing.png"
+        )
+        cases.append(
+            (
+                missing_screenshot,
+                "code preview viewport_checks[1280x720] screenshot must be an existing file",
+            )
+        )
+        for invalid, expected in cases:
+            with self.subTest(expected=expected):
+                self.write("mockup-manifest.json", mockup_manifest([invalid]))
+                errors = validator.validate_mockups(self.run)
+                self.assertTrue(any(expected in error for error in errors), errors)
+
+        standalone_run, standalone_item, _ = self.code_preview_fixture(
+            mode="standalone"
+        )
+        standalone_item["component_sources"] = []
+        self.write("run.json", standalone_run)
+        self.write("mockup-manifest.json", mockup_manifest([standalone_item]))
+        errors = validator.validate_mockups(self.run)
+        self.assertTrue(
+            any(
+                "code preview component_sources must be a non-empty list" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_code_preview_tokens_must_be_defined_and_used(self):
+        run, item, source_root = self.code_preview_fixture(mode="project")
+        self.write("run.json", run)
+
+        undefined = copy.deepcopy(item)
+        undefined["used_tokens"].append("--color-unknown")
+        self.write("mockup-manifest.json", mockup_manifest([undefined]))
+        errors = validator.validate_mockups(self.run)
+        self.assertIn(
+            "mockups[0] code preview used token must be defined by token_sources: --color-unknown",
+            errors,
+        )
+
+        tokens = source_root / item["token_sources"][0]
+        tokens.write_text(
+            tokens.read_text(encoding="utf-8").replace(
+                "}", " --space-8: 2rem; }"
+            ),
+            encoding="utf-8",
+        )
+        unused = copy.deepcopy(item)
+        unused["used_tokens"].append("--space-8")
+        unused["source_digest"] = preview_digest(source_root, unused["preview_files"])
+        self.write("mockup-manifest.json", mockup_manifest([unused]))
+        errors = validator.validate_mockups(self.run)
+        self.assertIn(
+            "mockups[0] code preview used token must be referenced by preview dependency set: --space-8",
+            errors,
+        )
+
+    def test_code_preview_sources_are_digest_bound_and_contained(self):
+        run, item, source_root = self.code_preview_fixture(mode="project")
+        self.write("run.json", run)
+
+        stale = copy.deepcopy(item)
+        stale["source_digest"] = "sha256:" + "0" * 64
+        self.write("mockup-manifest.json", mockup_manifest([stale]))
+        errors = validator.validate_mockups(self.run)
+        self.assertIn(
+            "mockups[0] code preview source_digest must match current preview_files",
+            errors,
+        )
+
+        unsafe = copy.deepcopy(item)
+        unsafe["token_sources"] = ["../tokens.css"]
+        self.write("mockup-manifest.json", mockup_manifest([unsafe]))
+        errors = validator.validate_mockups(self.run)
+        self.assertIn(
+            "mockups[0] code preview token_sources must use safe relative paths",
+            errors,
+        )
+
+        with tempfile.TemporaryDirectory() as outside_temp:
+            outside = Path(outside_temp) / "Outside.tsx"
+            outside.write_text("export const outside = true;\n", encoding="utf-8")
+            (source_root / "escape.tsx").symlink_to(outside)
+            escaped = copy.deepcopy(item)
+            escaped["preview_files"].append("escape.tsx")
+            self.write("mockup-manifest.json", mockup_manifest([escaped]))
+            errors = validator.validate_mockups(self.run)
+            self.assertIn(
+                "mockups[0] code preview preview file must be contained and existing: escape.tsx",
+                errors,
+            )
+
+        provider_mismatch = copy.deepcopy(item)
+        provider_mismatch["supporting_provider_refs"] = [
+            "provider:openai:asset-123"
+        ]
+        self.write("mockup-manifest.json", mockup_manifest([provider_mismatch]))
+        errors = validator.validate_mockups(self.run)
+        self.assertIn(
+            "mockups[0] code preview supporting_provider_refs require a positive attempt_count",
+            errors,
+        )
+
+    def test_legacy_provider_image_manifest_remains_valid(self):
+        code_run, code_item, _ = self.code_preview_fixture(mode="project")
+        self.write("run.json", run_manifest())
+        self.write("mockup-manifest.json", mockup_manifest([mockup()]))
+        self.assertEqual(validator.validate_mockups(self.run), [])
+
+        zero_attempt = mockup(attempt_count=0)
+        self.write("mockup-manifest.json", mockup_manifest([zero_attempt]))
+        errors = validator.validate_mockups(self.run)
+        self.assertIn(
+            "mockups[0] attempt_count must be positive, or zero for initial pending authorization",
+            errors,
+        )
+
+        unknown_kind = mockup(
+            artifact_kind="code-prevew",
+            preview_files=["../unsafe.tsx"],
+            source_digest="sha256:" + "0" * 64,
+            viewport_checks={},
+        )
+        self.write("mockup-manifest.json", mockup_manifest([unknown_kind]))
+        errors = validator.validate_mockups(self.run)
+        self.assertIn(
+            "mockups[0] artifact_kind must be code-preview when present",
+            errors,
+        )
+
+        code_run["approved_direction_ids"] = ["a", "d-0"]
+        self.write("run.json", code_run)
+        mixed = mockup_manifest([mockup("a"), code_item])
+        self.assertEqual(mixed["last_generation_direction_id"], "d-0")
+        self.write("mockup-manifest.json", mixed)
+        errors = validator.validate_mockups(self.run)
+        self.assertIn(
+            "mockup-manifest audit direction must have a positive attempt_count",
+            errors,
+        )
 
     def test_mockups_require_at_least_one_approved_direction(self):
         self.write("run.json", run_manifest(approved_direction_ids=[]))

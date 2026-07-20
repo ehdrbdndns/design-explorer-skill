@@ -344,6 +344,254 @@ def preview_files_digest(root: Path, paths: list[str]) -> str | None:
     return "sha256:" + digest.hexdigest()
 
 
+CSS_CUSTOM_PROPERTY_PATTERN = re.compile(r"(?m)(--[A-Za-z0-9_-]+)\s*:")
+
+
+def css_custom_properties(paths: list[Path]) -> set[str]:
+    values: set[str] = set()
+    for path in paths:
+        try:
+            values.update(
+                CSS_CUSTOM_PROPERTY_PATTERN.findall(path.read_text(encoding="utf-8"))
+            )
+        except (OSError, UnicodeError):
+            continue
+    return values
+
+
+def code_preview_errors(
+    run_dir: Path, run: dict, item: dict, index: int
+) -> list[str]:
+    """Validate one reproducible project or standalone direction preview."""
+    errors = []
+    label = f"mockups[{index}] code preview"
+
+    def string_list(field: str, *, required: bool = True) -> list[str] | None:
+        value = item.get(field, [] if not required else None)
+        if (
+            not isinstance(value, list)
+            or (required and not value)
+            or any(not isinstance(entry, str) or not entry.strip() for entry in value)
+        ):
+            requirement = "a non-empty list" if required else "a list"
+            field_label = (
+                f"mockups[{index}] project code preview"
+                if field == "component_sources" and mode == "project"
+                else label
+            )
+            errors.append(f"{field_label} {field} must be {requirement} of strings")
+            return None
+        normalized = [entry.strip() for entry in value]
+        if normalized != value or len(set(normalized)) != len(normalized):
+            errors.append(f"{label} {field} must be normalized and unique")
+            return None
+        return normalized
+
+    mode = item.get("preview_mode")
+    source_root = None
+    if mode == "project":
+        project_path = run.get("project_path")
+        if not isinstance(project_path, str) or not Path(project_path).is_absolute():
+            errors.append(
+                f"{label} project mode requires project_path to be an existing absolute directory"
+            )
+        else:
+            try:
+                candidate = Path(project_path).resolve(strict=True)
+            except (OSError, RuntimeError):
+                candidate = None
+            if candidate is None or not candidate.is_dir():
+                errors.append(
+                    f"{label} project mode requires project_path to be an existing absolute directory"
+                )
+            else:
+                source_root = candidate
+    elif mode == "standalone":
+        try:
+            source_root = Path(run_dir).resolve(strict=True)
+        except (OSError, RuntimeError):
+            source_root = None
+    else:
+        errors.append(f"{label} preview_mode must be project or standalone")
+
+    preview_files = string_list("preview_files")
+    token_sources = string_list("token_sources")
+    component_sources = string_list("component_sources")
+    used_tokens = string_list("used_tokens")
+
+    path_lists = (
+        ("preview_files", preview_files),
+        ("token_sources", token_sources),
+        ("component_sources", component_sources),
+    )
+    for field, values in path_lists:
+        if values is not None and any(not valid_artifact_ref(value) for value in values):
+            errors.append(f"{label} {field} must use safe relative paths")
+
+    preview_path = item.get("preview_path")
+    if not isinstance(preview_path, str) or not valid_artifact_ref(preview_path):
+        errors.append(f"{label} preview_path must be a safe relative path")
+        preview_path = None
+    elif preview_files is not None and preview_path not in preview_files:
+        errors.append(f"{label} preview_path must be included in preview_files")
+
+    if not valid_preview_route(item.get("preview_route")):
+        errors.append(
+            f"{label} preview_route must be a normalized absolute URL path"
+        )
+
+    resolved_files = {}
+    if source_root is not None and preview_files is not None:
+        for relative in preview_files:
+            resolved = resolved_scoped_path(source_root, relative)
+            if resolved is None or not resolved.is_file():
+                errors.append(
+                    f"{label} preview file must be contained and existing: {relative}"
+                )
+            else:
+                resolved_files[relative] = resolved
+
+    for field, values in (
+        ("token_sources", token_sources),
+        ("component_sources", component_sources),
+    ):
+        if values is not None and preview_files is not None:
+            for relative in values:
+                if relative not in preview_files:
+                    errors.append(
+                        f"{label} {field} must be included in preview_files: {relative}"
+                    )
+
+    token_paths = [
+        resolved_files[path]
+        for path in token_sources or []
+        if path in resolved_files
+    ]
+    definitions = css_custom_properties(token_paths)
+    dependency_sources = []
+    for path in resolved_files.values():
+        try:
+            dependency_sources.append(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError):
+            continue
+    dependency_source = "\n".join(dependency_sources)
+    for token in used_tokens or []:
+        if CSS_CUSTOM_PROPERTY_PATTERN.fullmatch(f"{token}:") is None:
+            errors.append(f"{label} used_tokens contains an invalid CSS variable: {token}")
+            continue
+        if token not in definitions:
+            errors.append(
+                f"{label} used token must be defined by token_sources: {token}"
+            )
+        if re.search(
+            rf"var\(\s*{re.escape(token)}\s*(?:,|\))", dependency_source
+        ) is None:
+            errors.append(
+                f"{label} used token must be referenced by preview dependency set: {token}"
+            )
+
+    supporting_refs = string_list("supporting_provider_refs", required=False)
+    if supporting_refs is not None:
+        for reference in supporting_refs:
+            if not _valid_provider_output_ref(reference):
+                errors.append(
+                    f"{label} supporting_provider_refs must use "
+                    "provider:<lowercase-provider>:<safe-artifact-id>"
+                )
+        attempt_count = item.get("attempt_count")
+        if supporting_refs and (
+            not isinstance(attempt_count, int)
+            or isinstance(attempt_count, bool)
+            or attempt_count <= 0
+        ):
+            errors.append(
+                f"{label} supporting_provider_refs require a positive attempt_count"
+            )
+
+    expected_digest = None
+    if (
+        source_root is not None
+        and preview_files is not None
+        and len(resolved_files) == len(preview_files)
+    ):
+        expected_digest = preview_files_digest(source_root, preview_files)
+    source_digest = item.get("source_digest")
+    if (
+        not isinstance(source_digest, str)
+        or PROMPT_DIGEST_PATTERN.fullmatch(source_digest) is None
+        or expected_digest is None
+        or source_digest != expected_digest
+    ):
+        errors.append(f"{label} source_digest must match current preview_files")
+
+    if source_root is not None and preview_files is not None and preview_path is not None:
+        absolute_root = source_root
+        if mode == "standalone":
+            packages = [
+                path
+                for path in preview_files
+                if PurePosixPath(path).name == "package.json"
+            ]
+            if len(packages) == 1:
+                absolute_root = source_root / PurePosixPath(packages[0]).parent
+        errors.extend(
+            f"{label} {error}"
+            for error in dependency_closure_errors(
+                source_root,
+                preview_files,
+                [preview_path, *(component_sources or [])],
+                absolute_root,
+            )
+        )
+
+    if item.get("status") == "success" and item.get("output_kind") != "local":
+        errors.append(f"{label} success requires local output_kind")
+
+    target_viewports = run.get("target_viewports")
+    valid_targets = (
+        isinstance(target_viewports, list)
+        and bool(target_viewports)
+        and all(normalized_viewport(viewport) == viewport for viewport in target_viewports)
+        and len(set(target_viewports)) == len(target_viewports)
+    )
+    viewport_checks = item.get("viewport_checks")
+    if not isinstance(viewport_checks, dict):
+        errors.append(f"{label} viewport_checks must be an object")
+        viewport_checks = {}
+    if valid_targets and set(viewport_checks) != set(target_viewports):
+        errors.append(
+            f"{label} viewport_checks keys must exactly match run target_viewports"
+        )
+    for viewport in target_viewports if valid_targets else []:
+        check = viewport_checks.get(viewport)
+        check_label = f"{label} viewport_checks[{viewport}]"
+        if not isinstance(check, dict):
+            errors.append(f"{check_label} must be an object")
+            continue
+        for name in ("content", "overflow", "accessibility", "interaction"):
+            if check.get(name) != "pass":
+                errors.append(f"{check_label} status must pass: {name}")
+        screenshot_ref = check.get("screenshot_ref")
+        if not valid_artifact_ref(screenshot_ref):
+            errors.append(f"{check_label} screenshot_ref must be a safe run-relative path")
+            continue
+        screenshot = resolved_scoped_path(Path(run_dir), screenshot_ref)
+        if screenshot is None or not screenshot.is_file():
+            errors.append(f"{check_label} screenshot must be an existing file")
+            continue
+        dimensions = png_dimensions(screenshot)
+        if dimensions is None:
+            errors.append(f"{check_label} screenshot must be a complete PNG")
+            continue
+        expected_dimensions = tuple(int(part) for part in viewport.split("x"))
+        if dimensions != expected_dimensions:
+            errors.append(
+                f"{check_label} screenshot dimensions {dimensions[0]}x{dimensions[1]} "
+                f"must match {viewport}"
+            )
+    return errors
+
+
 LOCAL_SCRIPT_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".css")
 
 
@@ -1394,6 +1642,7 @@ def _mockup_manifest_errors(
     seen_direction_ids = set()
     seen_viewports = set()
     attempt_total = 0
+    attempt_counts_by_direction = {}
     for index, item in enumerate(mockups):
         if not isinstance(item, dict):
             errors.append(f"mockups[{index}] must be an object")
@@ -1420,12 +1669,26 @@ def _mockup_manifest_errors(
             errors.append(
                 f"mockups[{index}] status must be pending, success, or failed"
             )
+        artifact_kind = item.get("artifact_kind")
+        is_code_preview = artifact_kind == "code-preview"
+        invalid_artifact_kind = "artifact_kind" in item and not is_code_preview
+        if invalid_artifact_kind:
+            errors.append(
+                f"mockups[{index}] artifact_kind must be code-preview when present"
+            )
         attempt_count = item.get("attempt_count")
         valid_attempt = isinstance(attempt_count, int) and not isinstance(
             attempt_count, bool
         )
         pending_zero = status == "pending" and attempt_count == 0 and allow_initial_pending
-        if not valid_attempt or (attempt_count <= 0 and not pending_zero):
+        successful_code_preview_zero = (
+            is_code_preview and status == "success" and attempt_count == 0
+        )
+        if not valid_attempt or (
+            attempt_count <= 0
+            and not pending_zero
+            and not successful_code_preview_zero
+        ):
             errors.append(
                 f"mockups[{index}] attempt_count must be positive, or zero for initial pending authorization"
             )
@@ -1435,6 +1698,8 @@ def _mockup_manifest_errors(
             )
         if valid_attempt and attempt_count >= 0:
             attempt_total += attempt_count
+            if isinstance(direction_id, str) and direction_id.strip():
+                attempt_counts_by_direction[direction_id] = attempt_count
         viewport = item.get("viewport")
         normalized = normalized_viewport(viewport)
         if normalized is None:
@@ -1501,6 +1766,12 @@ def _mockup_manifest_errors(
                 f"mockups[{index}] output_kind must be local or provider when output_ref is present"
             )
             output_valid = False
+        entry_code_preview_errors = []
+        if is_code_preview:
+            entry_code_preview_errors = code_preview_errors(
+                run_dir, run, item, index
+            )
+            errors.extend(entry_code_preview_errors)
         if status == "success":
             fields_are_valid = True
             if output_kind not in {"local", "provider"}:
@@ -1516,6 +1787,10 @@ def _mockup_manifest_errors(
             ):
                 fields_are_valid = False
             if prompt_path is None or not prompt_path.is_file() or not output_valid:
+                fields_are_valid = False
+            if entry_code_preview_errors:
+                fields_are_valid = False
+            if invalid_artifact_kind:
                 fields_are_valid = False
             if direction_is_approved and fields_are_valid:
                 successful.add(direction_id)
@@ -1537,6 +1812,15 @@ def _mockup_manifest_errors(
     if attempts_used is not None and attempt_total != attempts_used:
         errors.append(
             "mockup attempt_count total must equal manifest generation_attempts_used"
+        )
+    if (
+        attempts_used is not None
+        and attempts_used > 0
+        and authorized_direction is not None
+        and attempt_counts_by_direction.get(authorized_direction, 0) <= 0
+    ):
+        errors.append(
+            "mockup-manifest audit direction must have a positive attempt_count"
         )
     if require_success:
         missing = approved - successful if approved is not None else set()
