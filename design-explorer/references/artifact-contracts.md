@@ -168,7 +168,7 @@ last_generation_direction_id: null
 mockups: [...]
 ```
 
-The audit fields become a valid RFC3339 timestamp and the just-authorized approved direction ID together. The top-level total equals the sum of entry attempts and cannot exceed the approved-direction ceiling. A successful mockup requires:
+The audit fields become a valid RFC3339 timestamp and the just-authorized approved direction ID together. The top-level total equals the sum of entry attempts and cannot exceed the approved-direction ceiling. Every successful entry requires:
 
 - `direction_id`
 - `status` set to `success`
@@ -177,11 +177,23 @@ The audit fields become a valid RFC3339 timestamp and the just-authorized approv
 - `prompt_digest` as `sha256:` followed by 64 lowercase hexadecimal characters
 - `output_kind` set to `local` or `provider`
 - `output_ref`
-- positive integer `attempt_count`
+- nonnegative integer `attempt_count`; legacy provider-image success requires a positive value
 
 The list contains exactly one current entry per approved direction. All entries use one shared target viewport from the locked run targets. The digest equals the exact `prompt_ref` bytes. Initial pending entries use attempt zero; authorization increments that entry and the manifest total. One technical retry is the default maximum of two attempts.
 
-A local success uses a contained existing complete PNG whose dimensions exactly match the viewport. A provider success uses `provider:<lowercase-provider>:<safe-artifact-id>`; provider artifact existence is the host's responsibility. Pending/failed entries may omit output fields, but present outputs satisfy their typed contract. Every approved direction succeeds, and manifest attempt totals reconcile, before `mockups_generated`.
+A normal token-first entry also requires `artifact_kind: code-preview` and:
+
+- `preview_mode`: `project` or `standalone`
+- safe `preview_path` included in non-empty `preview_files`
+- normalized absolute `preview_route`
+- non-empty `token_sources` included in `preview_files`
+- non-empty `used_tokens`, each defined by `token_sources` and referenced by the preview dependency set
+- `component_sources`, included in `preview_files`; project mode requires reusable components, while standalone mode uses the shared standalone token layer and primitives
+- optional `supporting_provider_refs`, each shaped `provider:<lowercase-provider>:<safe-artifact-id>`
+- `source_digest` over the canonical sorted preview paths and bytes
+- `viewport_checks` keyed exactly by every target viewport, each containing a safe run-relative `screenshot_ref` and `content`, `overflow`, `accessibility`, and `interaction` set to `pass`
+
+A successful code preview uses `output_kind: local`, a contained complete PNG matching its viewport, and may keep `attempt_count: 0` when no provider was called. Existing provider-image entries remain valid. A provider success uses `provider:<lowercase-provider>:<safe-artifact-id>`; provider artifact existence is the host's responsibility. Pending/failed entries may omit output fields, but present outputs satisfy their typed contract. Every approved direction succeeds, and manifest attempt totals reconcile, before `mockups_generated`.
 
 ### Implementation artifact
 

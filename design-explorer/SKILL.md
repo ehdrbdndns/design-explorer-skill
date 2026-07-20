@@ -16,9 +16,9 @@ Build evidence-backed directions, then implement selection in user's language, i
 5. Validate research and directions. Present every direction in the response using the complete user-facing block in `references/research-evidence.md`; artifact links are not substitutes.
 6. Transition to `directions_pending_approval` and stop for explicit approval. Never infer it.
 7. Record approved IDs and transition to `directions_approved`.
-8. Read `references/mockups-implementation.md`; prepare prompts/pending entries, then run direction-specific `can-generate` and `authorize-generation` immediately before each provider call.
-9. Record outputs and validate coverage. Ask the user to select, or `revise` a bounded variation as a first-class direction ID and reapprove it.
-10. Implement a structured-registry project preview or standalone fallback. Validate runtime-bound wiring and render-asset closure. Bind exact-size PNG evidence to current source bytes before integration.
+8. Read `references/mockups-implementation.md`; inspect project tokens, theme, components, routes, and build commands. Build five isolated code previews for the approved directions, or one standalone workspace with a shared token layer when no project exists.
+9. Render the same viewports, record code-preview evidence, and ask the user to select or `revise`. Treat image generation as an optional approved asset step; a generated image alone is not a completed direction preview.
+10. Refine the selected preview, validate runtime wiring and render evidence, then integrate only after explicit approval.
 
 ## Hard gates
 
@@ -39,13 +39,11 @@ Every load and transition cumulatively validates prerequisite phases; use `scrip
 | Saved state | Allowed next action |
 |---|---|
 | `directions_pending_approval` | Present evidence and request approval |
-| `directions_approved` | Generate approved mockups within budget |
+| `directions_approved` | Build approved isolated code previews |
 | `mockups_generated` | Select, or `revise` to a first-class direction ID |
 | `implementation_selected` | Build an isolated preview |
 
 ## Common mistakes
 
-- Treating five palettes on one layout as five directions.
 - Reusing a primary ID for a combined direction instead of revising and reapproving it.
 - Citing a search-result thumbnail instead of the direct source.
-- Editing the production screen before preview approval.

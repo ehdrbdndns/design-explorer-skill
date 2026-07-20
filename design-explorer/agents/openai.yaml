@@ -1,4 +1,4 @@
 interface:
   display_name: "Design Explorer"
   short_description: "근거 기반으로 UI 방향을 탐색하고 선택안을 코드로 구현"
-  default_prompt: "Use $design-explorer to research evidence and propose five distinct directions for this interface before generating mockups."
+  default_prompt: "Use $design-explorer to research evidence and propose five distinct directions for this interface before building five token-backed code previews."

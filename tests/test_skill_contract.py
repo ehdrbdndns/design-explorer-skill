@@ -386,6 +386,28 @@ class SkillContractTests(unittest.TestCase):
         ):
             self.assertIn(phrase, combined)
 
+    def test_token_first_code_preview_contract_is_documented(self):
+        skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        mockups = (SKILL_DIR / "references/mockups-implementation.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_DIR / "references/artifact-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        metadata = (SKILL_DIR / "agents/openai.yaml").read_text(encoding="utf-8")
+        combined = "\n".join((skill, mockups, contracts, metadata)).lower()
+        for phrase in (
+            "token-first",
+            "five isolated code previews",
+            "existing design tokens",
+            "reusable components",
+            "shared standalone token layer",
+            "image generation is optional",
+            "generated image alone does not satisfy",
+            "artifact_kind: code-preview",
+        ):
+            self.assertIn(phrase, combined)
+
 
 if __name__ == "__main__":
     unittest.main()
