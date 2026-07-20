@@ -992,13 +992,6 @@ class ValidateRunTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        project_button = project_root / project_item["component_sources"][0]
-        project_button.write_text(
-            project_button.read_text(encoding="utf-8").replace(
-                "export const previewRoute = '/design-explorer/d-0';\n", ""
-            ),
-            encoding="utf-8",
-        )
         project_item["source_digest"] = preview_digest(
             project_root, project_item["preview_files"]
         )
@@ -1030,6 +1023,48 @@ class ValidateRunTests(unittest.TestCase):
             "standalone App route table must map preview_route to its imported preview_path component: /design-explorer/d-0",
             errors,
         )
+
+    def test_standalone_route_spoofs_do_not_count_as_active_route_table(self):
+        standalone_run, standalone_item, standalone_root = self.code_preview_fixture(
+            mode="standalone"
+        )
+        app = standalone_root / "standalone/src/App.tsx"
+        self.write("run.json", standalone_run)
+
+        route_spoofs = (
+            (
+                "hidden inner route table",
+                "import { Screen } from '../previews/d-0/Screen';\n"
+                "function Wrong(){return <aside>Wrong</aside>}\n"
+                "function hidden(){const routes = {'/design-explorer/d-0': Screen}; return routes;}\n"
+                "const routes = {'/design-explorer/d-0': Wrong};\n"
+                "export default function App(){const Route = routes[window.location.pathname] ?? Wrong; return <Route />;}\n",
+            ),
+            (
+                "shadowed Screen decoy",
+                "import { Screen } from '../previews/d-0/Screen';\n"
+                "function Wrong(){return <aside>Wrong</aside>}\n"
+                "function hidden(){const Screen = Wrong; const decoy = {'/design-explorer/d-0': Screen}; return decoy;}\n"
+                "const routes = {'/design-explorer/d-0': Wrong};\n"
+                "export default function App(){const Route = routes[window.location.pathname] ?? Wrong; return <Route />;}\n",
+            ),
+        )
+        for label, source in route_spoofs:
+            with self.subTest(spoof=label):
+                app.write_text(source, encoding="utf-8")
+                standalone_item["source_digest"] = preview_digest(
+                    standalone_root, standalone_item["preview_files"]
+                )
+                self.write(
+                    "mockup-manifest.json", mockup_manifest([standalone_item])
+                )
+
+                errors = validator.validate_mockups(self.run)
+
+                self.assertIn(
+                    "standalone App route table must map preview_route to its imported preview_path component: /design-explorer/d-0",
+                    errors,
+                )
 
     def test_component_sources_must_bind_to_rendered_or_called_imports(self):
         valid_sources = (
@@ -1063,6 +1098,7 @@ class ValidateRunTests(unittest.TestCase):
                 (source_root / item["preview_path"]).write_text(
                     "import '../../src/tokens.css';\n"
                     + import_source
+                    + "export const route = '/design-explorer/d-0';\n"
                     + "export function Screen(){return <main style={{background: "
                     "'var(--color-surface)', gap: 'var(--space-4)'}}>"
                     + use
@@ -1496,6 +1532,7 @@ class ValidateRunTests(unittest.TestCase):
                 screen.write_text(
                     "import '../../src/tokens.css';\n"
                     "import { Button } from '../../src/Button';\n"
+                    "export const route = '/design-explorer/d-0';\n"
                     f"export function Screen(){{return <main style={style}><Button /></main>}}\n",
                     encoding="utf-8",
                 )
@@ -1539,6 +1576,7 @@ class ValidateRunTests(unittest.TestCase):
         screen.write_text(
             "import '../../src/tokens.css';\n"
             "import { Button } from '../../src/Button';\n"
+            "export const route = '/design-explorer/d-0';\n"
             "export function Screen(){return <main><Button /></main>}\n",
             encoding="utf-8",
         )
@@ -1634,6 +1672,7 @@ class ValidateRunTests(unittest.TestCase):
         screen.write_text(
             "import '../../src/tokens.css';\n"
             "import { Button } from '../../src/Button';\n"
+            "export const route = '/design-explorer/d-0';\n"
             "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
             "export function Screen(){return <main style={styles}><Button /></main>}\n",
             encoding="utf-8",
@@ -1678,6 +1717,7 @@ class ValidateRunTests(unittest.TestCase):
                 screen.write_text(
                     "import '../../src/tokens.css';\n"
                     "import { Button } from '../../src/Button';\n"
+                    "export const route = '/design-explorer/d-0';\n"
                     f"{source}",
                     encoding="utf-8",
                 )

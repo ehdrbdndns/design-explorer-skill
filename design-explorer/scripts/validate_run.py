@@ -1060,12 +1060,7 @@ def code_preview_errors(
             errors.extend(offline_esbuild_errors(compile_entry, source_root))
         preview_route = item.get("preview_route")
         if isinstance(preview_route, str) and not project_preview_route_is_bound(
-            [
-                resolved_files[path]
-                for path in reachable
-                if path in resolved_files
-            ],
-            preview_route,
+            compile_entry, preview_route
         ):
             errors.append(
                 f"project preview entry must bind preview_route: {preview_route}"
@@ -1895,31 +1890,137 @@ def component_source_is_runtime_used(
     return False
 
 
-def project_preview_route_is_bound(paths: list[Path], preview_route: str) -> bool:
-    for path in paths:
-        if path.suffix.casefold() not in {
-            ".ts",
-            ".tsx",
-            ".js",
-            ".jsx",
-            ".mjs",
-            ".cjs",
-        }:
+def project_preview_route_is_bound(
+    path: Path | None, preview_route: str
+) -> bool:
+    if path is None or path.suffix.casefold() not in {
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+    }:
+        return False
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    lexed = lex_js(source)
+    for literal in lexed.literals:
+        if literal.value != preview_route:
             continue
-        try:
-            source = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            continue
-        lexed = lex_js(source)
-        for literal in lexed.literals:
-            if literal.value != preview_route:
-                continue
-            prefix = lexed.executable[: literal.start]
-            if re.search(
-                r"\b(?:export\s+)?const\s+(?:route|previewRoute)\s*=\s*$",
-                prefix,
-            ) or re.search(r"\bpath\s*:\s*$", prefix):
+        prefix = lexed.executable[: literal.start]
+        if re.search(
+            r"\b(?:export\s+)?const\s+(?:route|previewRoute)\s*=\s*$",
+            prefix,
+        ) or re.search(r"\bpath\s*:\s*$", prefix):
+            return True
+    return False
+
+
+DEFAULT_APP_FUNCTION_PATTERN = re.compile(
+    r"\bexport\s+default\s+function\s+App\s*\(([^)]*)\)\s*"
+    r"(?::[^\{;]+)?\{"
+)
+
+
+def scope_declares_name(
+    executable: str, name: str, scope: tuple[int, ...]
+) -> bool:
+    for match in VARIABLE_BINDING_PATTERN.finditer(executable):
+        if (
+            match.group(2) == name
+            and brace_scope_at(executable, match.start()) == scope
+        ):
+            return True
+    for match in DESTRUCTURED_VARIABLE_PATTERN.finditer(executable):
+        if (
+            name in parameter_binding_names(match.group(1))
+            and brace_scope_at(executable, match.start()) == scope
+        ):
+            return True
+    for pattern in (FUNCTION_DECLARATION_PATTERN, CLASS_DECLARATION_PATTERN):
+        for match in pattern.finditer(executable):
+            if (
+                match.group(1) == name
+                and brace_scope_at(executable, match.start()) == scope
+            ):
                 return True
+    return False
+
+
+def route_table_maps_preview_component(
+    source: str,
+    lexed: JsLexResult,
+    object_start: int,
+    object_end: int,
+    preview_route: str,
+    preview_locals: set[str],
+) -> bool:
+    for property_start, property_end in top_level_ranges(
+        lexed.executable, object_start + 1, object_end, ","
+    ):
+        colon = top_level_character(
+            lexed.executable, property_start, property_end, ":"
+        )
+        if colon is None:
+            continue
+        keys = [
+            literal
+            for literal in lexed.literals
+            if property_start <= literal.start < colon
+        ]
+        if (
+            len(keys) != 1
+            or keys[0].value != preview_route
+            or source[property_start:colon].strip()
+            != source[keys[0].start : keys[0].end]
+        ):
+            continue
+        value = lexed.executable[colon + 1 : property_end]
+        for local in preview_locals:
+            match = re.fullmatch(rf"\s*({re.escape(local)})\s*", value)
+            if match is not None and not binding_is_shadowed_at(
+                lexed.executable, local, colon + 1 + match.start(1)
+            ):
+                return True
+    return False
+
+
+def app_consumes_route_table(
+    lexed: JsLexResult, app_match: re.Match, table: str
+) -> bool:
+    body_start = app_match.end() - 1
+    body_end = matching_brace(lexed.executable, body_start)
+    if body_end is None:
+        return False
+    app_scope = brace_scope_at(lexed.executable, body_start + 1)
+    if table in parameter_binding_names(app_match.group(1)) or scope_declares_name(
+        lexed.executable, table, app_scope
+    ):
+        return False
+
+    selector_pattern = re.compile(
+        rf"\b(?:const|let|var)\s+({IDENTIFIER})\s*"
+        rf"(?::[^=;\n]+)?=\s*{re.escape(table)}\s*\["
+    )
+    for selector in selector_pattern.finditer(
+        lexed.executable, body_start + 1, body_end
+    ):
+        if brace_scope_at(lexed.executable, selector.start()) != app_scope:
+            continue
+        selected = re.escape(selector.group(1))
+        uses = (
+            re.compile(rf"<\s*{selected}(?=\s|/|>)"),
+            re.compile(rf"\b{selected}\s*\("),
+        )
+        for pattern in uses:
+            for use in pattern.finditer(
+                lexed.executable, selector.end(), body_end
+            ):
+                if brace_scope_at(lexed.executable, use.start()) == app_scope:
+                    return True
     return False
 
 
@@ -1944,18 +2045,34 @@ def standalone_route_maps_preview_component(
             preview_locals.update(bindings.values())
     if not preview_locals:
         return False
-    locals_pattern = "|".join(
-        re.escape(local) for local in sorted(preview_locals, key=len, reverse=True)
-    )
     lexed = lex_js(app_source)
+    app_matches = [
+        match
+        for match in DEFAULT_APP_FUNCTION_PATTERN.finditer(lexed.executable)
+        if brace_scope_at(lexed.executable, match.start()) == ()
+    ]
+    if len(app_matches) != 1:
+        return False
+
+    route_tables = set()
+    for match in CONST_OBJECT_PATTERN.finditer(lexed.executable):
+        if brace_scope_at(lexed.executable, match.start()) != ():
+            continue
+        object_start = match.end() - 1
+        object_end = matching_brace(lexed.executable, object_start)
+        if object_end is not None and route_table_maps_preview_component(
+            app_source,
+            lexed,
+            object_start,
+            object_end,
+            preview_route,
+            preview_locals,
+        ):
+            route_tables.add(match.group(1))
+
     return any(
-        literal.value == preview_route
-        and re.match(
-            rf"\s*:\s*(?:{locals_pattern})\b",
-            lexed.executable[literal.end :],
-        )
-        is not None
-        for literal in lexed.literals
+        app_consumes_route_table(lexed, app_matches[0], table)
+        for table in route_tables
     )
 
 
