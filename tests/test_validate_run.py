@@ -215,13 +215,19 @@ class ValidateRunTests(unittest.TestCase):
             encoding="utf-8",
         )
         button.write_text(
+            "export const previewRoute = '/design-explorer/d-0';\n"
             "export function Button(){return <button>Continue</button>}\n",
             encoding="utf-8",
         )
         screen.write_text(
             "import '../../src/tokens.css';\n"
             "import { Button } from '../../src/Button';\n"
-            "export function Screen(){return <main style={{background: "
+            + (
+                "export const route = '/design-explorer/d-0';\n"
+                if mode == "project"
+                else ""
+            )
+            + "export function Screen(){return <main style={{background: "
             "'var(--color-surface)', gap: 'var(--space-4)'}}><Button /></main>}\n",
             encoding="utf-8",
         )
@@ -322,6 +328,7 @@ class ValidateRunTests(unittest.TestCase):
         second_screen.write_text(
             "import '../../src/tokens.css';\n"
             "import { Button } from '../../src/Button';\n"
+            "export const route = '/design-explorer/d-1';\n"
             "export function Screen(){return <section style={{background: "
             "'var(--color-surface)', gap: 'var(--space-4)'}}><Button /></section>}\n",
             encoding="utf-8",
@@ -851,13 +858,40 @@ class ValidateRunTests(unittest.TestCase):
         errors = validator.validate_mockups(self.run)
 
         self.assertIn(
-            "mockups[0] code preview direction-owned file must not be equal to or under production_paths: previews/d-0/Screen.tsx",
+            "mockups[0] code preview direction-owned preview_path must not be equal to or under production_paths: previews/d-0/Screen.tsx",
             errors,
         )
 
         run["production_paths"] = ["src"]
         self.write("run.json", run)
         self.assertEqual(validator.validate_mockups(self.run), [])
+
+        protected_app = source_root / "src/App.tsx"
+        protected_app.write_text(
+            "import './tokens.css';\n"
+            "import { App as CTA } from './App';\n"
+            "export const route = '/design-explorer/d-0';\n"
+            "export function App(){return <main style={{background: "
+            "'var(--color-surface)', gap: 'var(--space-4)'}}><CTA /></main>}\n",
+            encoding="utf-8",
+        )
+        relabeled = copy.deepcopy(item)
+        relabeled["preview_path"] = "src/App.tsx"
+        relabeled["preview_files"] = ["src/App.tsx", "src/tokens.css"]
+        relabeled["component_sources"] = ["src/App.tsx"]
+        relabeled["source_digest"] = preview_digest(
+            source_root, relabeled["preview_files"]
+        )
+        run["production_paths"] = ["src/App.tsx"]
+        self.write("run.json", run)
+        self.write("mockup-manifest.json", mockup_manifest([relabeled]))
+
+        errors = validator.validate_mockups(self.run)
+
+        self.assertIn(
+            "mockups[0] code preview direction-owned preview_path must not be equal to or under production_paths: src/App.tsx",
+            errors,
+        )
 
     def test_code_preview_entries_require_unique_direction_topology(self):
         run, first, source_root = self.code_preview_fixture(mode="project")
@@ -926,7 +960,7 @@ class ValidateRunTests(unittest.TestCase):
         self.write("mockup-manifest.json", mockup_manifest([item]))
         errors = validator.validate_mockups(self.run)
         self.assertIn(
-            "standalone App route table must contain preview_route: /design-explorer/d-0",
+            "standalone App route table must map preview_route to its imported preview_path component: /design-explorer/d-0",
             errors,
         )
 
@@ -943,25 +977,79 @@ class ValidateRunTests(unittest.TestCase):
         errors = validator.validate_mockups(self.run)
         self.assertTrue(any("offline esbuild compile failed" in error for error in errors), errors)
 
+    def test_code_preview_routes_bind_to_the_correct_entry_component(self):
+        project_run, project_item, project_root = self.code_preview_fixture(
+            mode="project"
+        )
+        self.write("run.json", project_run)
+        self.write("mockup-manifest.json", mockup_manifest([project_item]))
+        self.assertEqual(validator.validate_mockups(self.run), [])
+
+        project_screen = project_root / project_item["preview_path"]
+        project_screen.write_text(
+            project_screen.read_text(encoding="utf-8").replace(
+                "export const route = '/design-explorer/d-0';\n", ""
+            ),
+            encoding="utf-8",
+        )
+        project_button = project_root / project_item["component_sources"][0]
+        project_button.write_text(
+            project_button.read_text(encoding="utf-8").replace(
+                "export const previewRoute = '/design-explorer/d-0';\n", ""
+            ),
+            encoding="utf-8",
+        )
+        project_item["source_digest"] = preview_digest(
+            project_root, project_item["preview_files"]
+        )
+        self.write("mockup-manifest.json", mockup_manifest([project_item]))
+        errors = validator.validate_mockups(self.run)
+        self.assertIn(
+            "project preview entry must bind preview_route: /design-explorer/d-0",
+            errors,
+        )
+
+        standalone_run, standalone_item, standalone_root = self.code_preview_fixture(
+            mode="standalone"
+        )
+        app = standalone_root / "standalone/src/App.tsx"
+        app.write_text(
+            "import { Screen } from '../previews/d-0/Screen';\n"
+            "function Wrong(){return <aside>Wrong</aside>}\n"
+            "const routes = {'/design-explorer/d-0': Wrong};\n"
+            "export default function App(){const Route = routes[window.location.pathname] ?? Screen; return <Route />;}\n",
+            encoding="utf-8",
+        )
+        standalone_item["source_digest"] = preview_digest(
+            standalone_root, standalone_item["preview_files"]
+        )
+        self.write("run.json", standalone_run)
+        self.write("mockup-manifest.json", mockup_manifest([standalone_item]))
+        errors = validator.validate_mockups(self.run)
+        self.assertIn(
+            "standalone App route table must map preview_route to its imported preview_path component: /design-explorer/d-0",
+            errors,
+        )
+
     def test_component_sources_must_bind_to_rendered_or_called_imports(self):
         valid_sources = (
             (
-                "export function Button(){return <button>Continue</button>}\n",
+                "export const previewRoute = '/design-explorer/d-0';\nexport function Button(){return <button>Continue</button>}\n",
                 "import { Button as CTA } from '../../src/Button';\n",
                 "<CTA />",
             ),
             (
-                "export function Button(){return <button>Continue</button>}\n",
+                "export const previewRoute = '/design-explorer/d-0';\nexport function Button(){return <button>Continue</button>}\n",
                 "import * as UI from '../../src/Button';\n",
                 "<UI.Button />",
             ),
             (
-                "export default function Button(){return <button>Continue</button>}\n",
+                "export const previewRoute = '/design-explorer/d-0';\nexport default function Button(){return <button>Continue</button>}\n",
                 "import CTA from '../../src/Button';\n",
                 "<CTA />",
             ),
             (
-                "export function Button(){return <button>Continue</button>}\n",
+                "export const previewRoute = '/design-explorer/d-0';\nexport function Button(){return <button>Continue</button>}\n",
                 "import { Button as CTA } from '../../src/Button';\n",
                 "{CTA()}",
             ),
@@ -993,6 +1081,12 @@ class ValidateRunTests(unittest.TestCase):
             "export function Screen(){return <main style={{background: 'var(--color-surface)', gap: 'var(--space-4)'}}>Preview</main>}\n",
             "import { Button as CTA } from '../../src/Button';\n"
             "export function Screen(CTA: any){return <main style={{background: 'var(--color-surface)', gap: 'var(--space-4)'}}><CTA /></main>}\n",
+            "import { Button as CTA } from '../../src/Button';\n"
+            "export function Screen(){function CTA(){return <i/>} return <main style={{background: 'var(--color-surface)', gap: 'var(--space-4)'}}><CTA /></main>}\n",
+            "import { Button as CTA } from '../../src/Button';\n"
+            "export function Screen(){class CTA { render(){return <i/>} } return <main style={{background: 'var(--color-surface)', gap: 'var(--space-4)'}}><CTA /></main>}\n",
+            "import { Button as CTA } from '../../src/Button';\n"
+            "export function Screen(){const { Button: CTA } = local; return <main style={{background: 'var(--color-surface)', gap: 'var(--space-4)'}}><CTA /></main>}\n",
         )
         for invalid_source in invalid_sources:
             with self.subTest(invalid=invalid_source):

@@ -362,6 +362,15 @@ CONST_OBJECT_PATTERN = re.compile(
 VARIABLE_BINDING_PATTERN = re.compile(
     r"\b(const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)"
 )
+DESTRUCTURED_VARIABLE_PATTERN = re.compile(
+    r"\b(?:const|let|var)\s+(\{[^;]*?\}|\[[^;]*?\])\s*="
+)
+FUNCTION_DECLARATION_PATTERN = re.compile(
+    r"\bfunction\s+([A-Za-z_$][A-Za-z0-9_$]*)\b"
+)
+CLASS_DECLARATION_PATTERN = re.compile(
+    r"\bclass\s+([A-Za-z_$][A-Za-z0-9_$]*)\b"
+)
 FUNCTION_PARAMETER_PATTERN = re.compile(
     r"\bfunction(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s*"
     r"(?:<[^>{};]*>)?\s*"
@@ -958,8 +967,16 @@ def code_preview_errors(
             isinstance(path, str) and valid_artifact_ref(path)
             for path in production_paths
         ):
+            if preview_path is not None and any(
+                path_is_equal_to_or_below(preview_path, protected)
+                for protected in production_paths
+            ):
+                errors.append(
+                    f"{label} direction-owned preview_path must not be equal to or "
+                    f"under production_paths: {preview_path}"
+                )
             for relative in preview_files:
-                if relative in reusable_sources:
+                if relative == preview_path or relative in reusable_sources:
                     continue
                 if any(
                     path_is_equal_to_or_below(relative, protected)
@@ -1013,18 +1030,25 @@ def code_preview_errors(
                         f"standalone App must route to preview_path: {preview_path}"
                     )
                 try:
-                    app_literals = {
-                        literal.value
-                        for literal in lex_js(
-                            app_path.read_text(encoding="utf-8")
-                        ).literals
-                    }
+                    app_source = app_path.read_text(encoding="utf-8")
                 except (OSError, UnicodeError):
-                    app_literals = set()
+                    app_source = ""
                 preview_route = item.get("preview_route")
-                if preview_route not in app_literals:
+                if (
+                    preview_path is None
+                    or not isinstance(preview_route, str)
+                    or not standalone_route_maps_preview_component(
+                        source_root,
+                        app_path,
+                        app_source,
+                        preview_path,
+                        preview_route,
+                        workspace_root,
+                    )
+                ):
                     errors.append(
-                        "standalone App route table must contain preview_route: "
+                        "standalone App route table must map preview_route to its "
+                        "imported preview_path component: "
                         f"{preview_route}"
                     )
             compile_entry = resolved_files.get(main_relative)
@@ -1034,6 +1058,18 @@ def code_preview_errors(
         compile_entry = resolved_files.get(preview_path)
         if compile_entry is not None:
             errors.extend(offline_esbuild_errors(compile_entry, source_root))
+        preview_route = item.get("preview_route")
+        if isinstance(preview_route, str) and not project_preview_route_is_bound(
+            [
+                resolved_files[path]
+                for path in reachable
+                if path in resolved_files
+            ],
+            preview_route,
+        ):
+            errors.append(
+                f"project preview entry must bind preview_route: {preview_route}"
+            )
 
     reachable_paths = [
         resolved_files[path] for path in reachable if path in resolved_files
@@ -1730,6 +1766,25 @@ def binding_is_shadowed_at(
                 )
             )
 
+    for match in DESTRUCTURED_VARIABLE_PATTERN.finditer(executable):
+        if name in parameter_binding_names(match.group(1)):
+            shadows.append(
+                (
+                    brace_scope_at(executable, match.start()),
+                    None,
+                )
+            )
+
+    for pattern in (FUNCTION_DECLARATION_PATTERN, CLASS_DECLARATION_PATTERN):
+        for match in pattern.finditer(executable):
+            if match.group(1) == name:
+                shadows.append(
+                    (
+                        brace_scope_at(executable, match.start()),
+                        None,
+                    )
+                )
+
     for pattern in (
         FUNCTION_PARAMETER_PATTERN,
         METHOD_PARAMETER_PATTERN,
@@ -1838,6 +1893,72 @@ def component_source_is_runtime_used(
                 ):
                     return True
     return False
+
+
+def project_preview_route_is_bound(paths: list[Path], preview_route: str) -> bool:
+    for path in paths:
+        if path.suffix.casefold() not in {
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".mjs",
+            ".cjs",
+        }:
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        lexed = lex_js(source)
+        for literal in lexed.literals:
+            if literal.value != preview_route:
+                continue
+            prefix = lexed.executable[: literal.start]
+            if re.search(
+                r"\b(?:export\s+)?const\s+(?:route|previewRoute)\s*=\s*$",
+                prefix,
+            ) or re.search(r"\bpath\s*:\s*$", prefix):
+                return True
+    return False
+
+
+def standalone_route_maps_preview_component(
+    root: Path,
+    app_path: Path,
+    app_source: str,
+    preview_path: str,
+    preview_route: str,
+    absolute_root: Path,
+) -> bool:
+    _, references = js_module_references(app_source)
+    preview_locals = set()
+    for reference in references:
+        bindings = import_bindings(reference)
+        if not bindings:
+            continue
+        resolved, error = resolve_local_dependency(
+            root, app_path, reference.specifier, absolute_root
+        )
+        if error is None and resolved == preview_path:
+            preview_locals.update(bindings.values())
+    if not preview_locals:
+        return False
+    locals_pattern = "|".join(
+        re.escape(local) for local in sorted(preview_locals, key=len, reverse=True)
+    )
+    lexed = lex_js(app_source)
+    return any(
+        literal.value == preview_route
+        and re.match(
+            rf"\s*:\s*(?:{locals_pattern})\b",
+            lexed.executable[literal.end :],
+        )
+        is not None
+        for literal in lexed.literals
+    )
+
+
 CSS_IMPORT_PATTERN = re.compile(
     r"@import\s+(?:url\(\s*)?[\"']?([^\"')\s;]+)", re.IGNORECASE
 )
