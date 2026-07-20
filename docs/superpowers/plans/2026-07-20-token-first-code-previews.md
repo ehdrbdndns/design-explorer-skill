@@ -139,6 +139,7 @@ The new entry shape is:
   "token_sources": ["src/tokens.css"],
   "used_tokens": ["--color-surface", "--space-4"],
   "component_sources": ["src/Button.tsx"],
+  "supporting_provider_refs": [],
   "source_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "viewport_checks": {
     "390x844": {
@@ -192,7 +193,7 @@ def code_preview_errors(
     """Validate one reproducible project or standalone direction preview."""
 ```
 
-Inside `code_preview_errors`, resolve the source root from `preview_mode`, normalize and contain every path, require token/component sources to be included in `preview_files`, require every `used_tokens` value to be defined by `token_sources` and referenced with CSS such as `var(--color-surface)` in the preview dependency set, require `source_digest == preview_files_digest(source_root, preview_files)`, require exact target viewport keys and complete exact-size PNGs, and require every check to equal `pass`.
+Inside `code_preview_errors`, resolve the source root from `preview_mode`, normalize and contain every path, require token/component sources to be included in `preview_files`, require every `used_tokens` value to be defined by `token_sources` and referenced with CSS such as `var(--color-surface)` in the preview dependency set, validate each optional `supporting_provider_refs` value with `_valid_provider_output_ref`, require `source_digest == preview_files_digest(source_root, preview_files)`, require exact target viewport keys and complete exact-size PNGs, and require every check to equal `pass`.
 
 In `_mockup_manifest_errors`, set `is_code_preview = item.get("artifact_kind") == "code-preview"`. Permit `attempt_count == 0` for a successful code preview, but keep zero invalid for provider-image success. Add `code_preview_errors(run_dir, run, item, index)` to the entry errors. Existing entries without `artifact_kind` retain legacy behavior.
 
@@ -231,7 +232,7 @@ Add methods named `test_project_builds_five_token_backed_previews_without_provid
 
 The project fixture creates `src/tokens.css`, `src/Button.tsx`, five isolated route entries, five direction components, and exact screenshots. Approve `d-0` through `d-4`, write one code-preview entry per direction, assert `generation_attempts_used == 0`, assert an initially empty `provider_calls` list remains empty, and assert the production file hash is unchanged.
 
-The standalone fixture creates one Vite React workspace with `src/tokens.css`, shared primitives, and five direction components/routes that all reference the same variables. The optional-provider test begins with a pending legacy/provider entry and proves the existing `can-generate`/`authorize-generation` sequence is still required.
+The standalone fixture creates one Vite React workspace with `src/tokens.css`, shared primitives, and five direction components/routes that all reference the same variables. The optional-provider test begins with a complete pending code-preview entry, proves the existing `can-generate`/`authorize-generation` sequence is still required, records a strict provider reference in `supporting_provider_refs`, then records the rerendered local PNG as the final `output_ref`.
 
 - [ ] **Step 2: Run the new tests and verify RED**
 
