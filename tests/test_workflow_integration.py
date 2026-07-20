@@ -79,7 +79,8 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 "import { Button } from '../../src/Button';\n"
                 "export function Screen(){return <main style={{background: "
                 "'var(--color-surface)', padding: 'var(--space-4)'}}>"
-                f"<h1>{direction_id}</h1><Button /></main>}}\n",
+                f"<h1>{direction_id}</h1><Button /></main>"
+                "}\n",
                 encoding="utf-8",
             )
             (preview_dir / "entry.tsx").write_text(
@@ -216,7 +217,10 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 "import { PreviewCard } from '../PreviewCard';\n"
                 f"export default function {component_name}(){{return <main "
                 "style={{background: 'var(--color-surface)', padding: "
-                f"'var(--space-4)'}}><PreviewCard title='{direction_id}' /></main>}}\n",
+                "'var(--space-4)'}}><PreviewCard title='"
+                f"{direction_id}"
+                "' /></main>"
+                "}\n",
                 encoding="utf-8",
             )
         (source / "App.tsx").write_text(

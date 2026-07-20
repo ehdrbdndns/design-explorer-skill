@@ -191,14 +191,23 @@ class ValidateRunTests(unittest.TestCase):
             source_root = self.run
             prefix = "standalone/"
             project_path = None
-        preview_files = [
-            f"{prefix}previews/{direction_id}/Screen.tsx",
-            f"{prefix}src/tokens.css",
-            f"{prefix}src/Button.tsx",
-        ]
-        screen = source_root / preview_files[0]
-        tokens = source_root / preview_files[1]
-        button = source_root / preview_files[2]
+        screen_relative = f"{prefix}previews/{direction_id}/Screen.tsx"
+        tokens_relative = f"{prefix}src/tokens.css"
+        button_relative = f"{prefix}src/Button.tsx"
+        preview_files = [screen_relative, tokens_relative, button_relative]
+        if mode == "standalone":
+            preview_files = [
+                "standalone/package.json",
+                "standalone/index.html",
+                "standalone/vite.config.ts",
+                "standalone/tsconfig.json",
+                "standalone/src/main.tsx",
+                "standalone/src/App.tsx",
+                *preview_files,
+            ]
+        screen = source_root / screen_relative
+        tokens = source_root / tokens_relative
+        button = source_root / button_relative
         screen.parent.mkdir(parents=True, exist_ok=True)
         tokens.parent.mkdir(parents=True, exist_ok=True)
         tokens.write_text(
@@ -216,6 +225,49 @@ class ValidateRunTests(unittest.TestCase):
             "'var(--color-surface)', gap: 'var(--space-4)'}}><Button /></main>}\n",
             encoding="utf-8",
         )
+        if mode == "standalone":
+            workspace = self.run / "standalone"
+            (workspace / "package.json").write_text(
+                json.dumps(
+                    {
+                        "scripts": {"dev": "vite", "build": "vite build"},
+                        "dependencies": {"react": "1", "react-dom": "1"},
+                        "devDependencies": {
+                            "vite": "1",
+                            "typescript": "1",
+                            "@vitejs/plugin-react": "1",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (workspace / "index.html").write_text(
+                '<div id="root"></div><script type="module" src="/src/main.tsx"></script>',
+                encoding="utf-8",
+            )
+            (workspace / "vite.config.ts").write_text(
+                "import { defineConfig } from 'vite';\n"
+                "import react from '@vitejs/plugin-react';\n"
+                "export default defineConfig({plugins:[react()]});\n",
+                encoding="utf-8",
+            )
+            (workspace / "tsconfig.json").write_text(
+                '{"compilerOptions":{"jsx":"react-jsx","module":"ESNext"}}',
+                encoding="utf-8",
+            )
+            (workspace / "src" / "main.tsx").write_text(
+                "import React from 'react';\n"
+                "import { createRoot } from 'react-dom/client';\n"
+                "import App from './App';\n"
+                "createRoot(document.getElementById('root')!).render(<App />);\n",
+                encoding="utf-8",
+            )
+            (workspace / "src" / "App.tsx").write_text(
+                "import { Screen } from '../previews/d-0/Screen';\n"
+                "const routes = {'/design-explorer/d-0': Screen};\n"
+                "export default function App(){const Route = routes[window.location.pathname] ?? Screen; return <Route />;}\n",
+                encoding="utf-8",
+            )
         checks = {}
         for viewport in viewports:
             screenshot_ref = f"evidence/{direction_id}/{viewport}.png"
@@ -242,17 +294,56 @@ class ValidateRunTests(unittest.TestCase):
             output_kind="local",
             output_ref=checks[viewports[0]]["screenshot_ref"],
             preview_mode=mode,
-            preview_path=preview_files[0],
+            preview_path=screen_relative,
             preview_files=preview_files,
             preview_route=f"/design-explorer/{direction_id}",
-            token_sources=[preview_files[1]],
+            token_sources=[tokens_relative],
             used_tokens=["--color-surface", "--space-4"],
-            component_sources=[preview_files[2]],
+            component_sources=[button_relative],
             supporting_provider_refs=[],
             source_digest=preview_digest(source_root, preview_files),
             viewport_checks=checks,
         )
         return run, item, source_root
+
+    def second_project_code_preview(self, run, item, source_root):
+        second = copy.deepcopy(item)
+        second["direction_id"] = "d-1"
+        second["preview_path"] = "previews/d-1/Screen.tsx"
+        second["preview_route"] = "/design-explorer/d-1"
+        second["prompt_ref"] = "prompts/d-1.txt"
+        second["preview_files"] = [
+            second["preview_path"],
+            *item["token_sources"],
+            *item["component_sources"],
+        ]
+        second_screen = source_root / second["preview_path"]
+        second_screen.parent.mkdir(parents=True, exist_ok=True)
+        second_screen.write_text(
+            "import '../../src/tokens.css';\n"
+            "import { Button } from '../../src/Button';\n"
+            "export function Screen(){return <section style={{background: "
+            "'var(--color-surface)', gap: 'var(--space-4)'}}><Button /></section>}\n",
+            encoding="utf-8",
+        )
+        second["viewport_checks"] = {}
+        for viewport in run["target_viewports"]:
+            screenshot_ref = f"evidence/d-1/{viewport}.png"
+            width, height = (int(value) for value in viewport.split("x"))
+            write_png(self.run / screenshot_ref, width, height)
+            second["viewport_checks"][viewport] = {
+                "screenshot_ref": screenshot_ref,
+                "content": "pass",
+                "overflow": "pass",
+                "accessibility": "pass",
+                "interaction": "pass",
+            }
+        second["output_ref"] = second["viewport_checks"][run["target_viewports"][0]][
+            "screenshot_ref"
+        ]
+        second["source_digest"] = preview_digest(source_root, second["preview_files"])
+        run["approved_direction_ids"] = ["d-0", "d-1"]
+        return second
 
     def test_research_requires_traceable_http_sources(self):
         bad = reference()
@@ -751,6 +842,176 @@ class ValidateRunTests(unittest.TestCase):
 
                 self.assertEqual(validator.validate_mockups(self.run), [])
 
+    def test_project_code_preview_rejects_direction_files_in_production_paths(self):
+        run, item, source_root = self.code_preview_fixture(mode="project")
+        run["production_paths"] = ["previews/d-0"]
+        self.write("run.json", run)
+        self.write("mockup-manifest.json", mockup_manifest([item]))
+
+        errors = validator.validate_mockups(self.run)
+
+        self.assertIn(
+            "mockups[0] code preview direction-owned file must not be equal to or under production_paths: previews/d-0/Screen.tsx",
+            errors,
+        )
+
+        run["production_paths"] = ["src"]
+        self.write("run.json", run)
+        self.assertEqual(validator.validate_mockups(self.run), [])
+
+    def test_code_preview_entries_require_unique_direction_topology(self):
+        run, first, source_root = self.code_preview_fixture(mode="project")
+        second = self.second_project_code_preview(run, first, source_root)
+        self.write("run.json", run)
+
+        duplicate = copy.deepcopy(second)
+        duplicate["preview_path"] = first["preview_path"]
+        duplicate["preview_route"] = first["preview_route"]
+        duplicate["viewport_checks"]["390x844"]["screenshot_ref"] = first[
+            "viewport_checks"
+        ]["390x844"]["screenshot_ref"]
+        duplicate["output_ref"] = first["output_ref"]
+        duplicate["preview_files"] = first["preview_files"]
+        duplicate["source_digest"] = first["source_digest"]
+        self.write("mockup-manifest.json", mockup_manifest([first, duplicate]))
+
+        errors = validator.validate_mockups(self.run)
+
+        self.assertIn("code preview preview_path must be unique across directions", errors)
+        self.assertIn("code preview preview_route must be unique across directions", errors)
+        self.assertIn(
+            "code preview screenshot_ref must be unique for viewport 390x844 across directions",
+            errors,
+        )
+        self.assertIn(
+            "code preview direction-owned topology must be unique across directions",
+            errors,
+        )
+
+        first = copy.deepcopy(first)
+        second = copy.deepcopy(second)
+        shared_direction_files = [
+            first["preview_path"],
+            second["preview_path"],
+            *first["token_sources"],
+            *first["component_sources"],
+        ]
+        shared_digest = preview_digest(source_root, shared_direction_files)
+        for entry in (first, second):
+            entry["preview_files"] = shared_direction_files
+            entry["source_digest"] = shared_digest
+        self.write("mockup-manifest.json", mockup_manifest([first, second]))
+
+        errors = validator.validate_mockups(self.run)
+
+        self.assertNotIn("code preview preview_path must be unique across directions", errors)
+        self.assertNotIn("code preview preview_route must be unique across directions", errors)
+        self.assertIn(
+            "code preview direction-owned topology must be unique across directions",
+            errors,
+        )
+
+    def test_standalone_code_previews_require_executable_routes_and_compilation(self):
+        run, item, source_root = self.code_preview_fixture(mode="standalone")
+        self.write("run.json", run)
+
+        app = source_root / "standalone/src/App.tsx"
+        app.write_text(
+            app.read_text(encoding="utf-8").replace(
+                "/design-explorer/d-0", "/design-explorer/missing"
+            ),
+            encoding="utf-8",
+        )
+        item["source_digest"] = preview_digest(source_root, item["preview_files"])
+        self.write("mockup-manifest.json", mockup_manifest([item]))
+        errors = validator.validate_mockups(self.run)
+        self.assertIn(
+            "standalone App route table must contain preview_route: /design-explorer/d-0",
+            errors,
+        )
+
+        app.write_text(
+            app.read_text(encoding="utf-8").replace(
+                "/design-explorer/missing", "/design-explorer/d-0"
+            ),
+            encoding="utf-8",
+        )
+        screen = source_root / item["preview_path"]
+        screen.write_text(screen.read_text(encoding="utf-8") + "}\n", encoding="utf-8")
+        item["source_digest"] = preview_digest(source_root, item["preview_files"])
+        self.write("mockup-manifest.json", mockup_manifest([item]))
+        errors = validator.validate_mockups(self.run)
+        self.assertTrue(any("offline esbuild compile failed" in error for error in errors), errors)
+
+    def test_component_sources_must_bind_to_rendered_or_called_imports(self):
+        valid_sources = (
+            (
+                "export function Button(){return <button>Continue</button>}\n",
+                "import { Button as CTA } from '../../src/Button';\n",
+                "<CTA />",
+            ),
+            (
+                "export function Button(){return <button>Continue</button>}\n",
+                "import * as UI from '../../src/Button';\n",
+                "<UI.Button />",
+            ),
+            (
+                "export default function Button(){return <button>Continue</button>}\n",
+                "import CTA from '../../src/Button';\n",
+                "<CTA />",
+            ),
+            (
+                "export function Button(){return <button>Continue</button>}\n",
+                "import { Button as CTA } from '../../src/Button';\n",
+                "{CTA()}",
+            ),
+        )
+        for component_source, import_source, use in valid_sources:
+            with self.subTest(use=use):
+                run, item, source_root = self.code_preview_fixture(mode="project")
+                (source_root / item["component_sources"][0]).write_text(
+                    component_source, encoding="utf-8"
+                )
+                (source_root / item["preview_path"]).write_text(
+                    "import '../../src/tokens.css';\n"
+                    + import_source
+                    + "export function Screen(){return <main style={{background: "
+                    "'var(--color-surface)', gap: 'var(--space-4)'}}>"
+                    + use
+                    + "</main>}\n",
+                    encoding="utf-8",
+                )
+                item["source_digest"] = preview_digest(
+                    source_root, item["preview_files"]
+                )
+                self.write("run.json", run)
+                self.write("mockup-manifest.json", mockup_manifest([item]))
+                self.assertEqual(validator.validate_mockups(self.run), [])
+
+        invalid_sources = (
+            "import { Button as CTA } from '../../src/Button';\n"
+            "export function Screen(){return <main style={{background: 'var(--color-surface)', gap: 'var(--space-4)'}}>Preview</main>}\n",
+            "import { Button as CTA } from '../../src/Button';\n"
+            "export function Screen(CTA: any){return <main style={{background: 'var(--color-surface)', gap: 'var(--space-4)'}}><CTA /></main>}\n",
+        )
+        for invalid_source in invalid_sources:
+            with self.subTest(invalid=invalid_source):
+                run, item, source_root = self.code_preview_fixture(mode="project")
+                (source_root / item["preview_path"]).write_text(
+                    "import '../../src/tokens.css';\n" + invalid_source,
+                    encoding="utf-8",
+                )
+                item["source_digest"] = preview_digest(
+                    source_root, item["preview_files"]
+                )
+                self.write("run.json", run)
+                self.write("mockup-manifest.json", mockup_manifest([item]))
+                errors = validator.validate_mockups(self.run)
+                self.assertIn(
+                    f"mockups[0] code preview component_source must be rendered or called at runtime: {item['component_sources'][0]}",
+                    errors,
+                )
+
     def test_code_preview_requires_complete_topology_and_all_viewports(self):
         run, item, _ = self.code_preview_fixture(
             mode="project", viewports=["390x844", "1280x720"]
@@ -964,6 +1225,11 @@ class ValidateRunTests(unittest.TestCase):
             "declare function use(button: import('../../src/Button').Button): void;",
             "const button = null as import('../../src/Button').Button;",
             "function use(button: import('../../src/Button').Button): void {}",
+            "function use<T extends import('../../src/Button').Button>(button: T): void {}",
+            "const use = <T extends import('../../src/Button').Button>(button: T) => button;",
+            "class Use<T extends import('../../src/Button').Button> {}",
+            "type Use<T extends import('../../src/Button').Button> = T;",
+            "class Use extends Base implements import('../../src/Button').Button {}",
         )
         for mode in ("project", "standalone"):
             for type_expression in type_expressions:
@@ -1014,7 +1280,16 @@ class ValidateRunTests(unittest.TestCase):
                 self.write("run.json", run)
                 self.write("mockup-manifest.json", mockup_manifest([item]))
 
-                self.assertEqual(validator.validate_mockups(self.run), [])
+                self.assertIn(
+                    "../../src/Button",
+                    validator.js_runtime_dependencies(
+                        screen.read_text(encoding="utf-8")
+                    ),
+                )
+                self.assertIn(
+                    f"mockups[0] code preview component_source must be rendered or called at runtime: {item['component_sources'][0]}",
+                    validator.validate_mockups(self.run),
+                )
 
     def test_code_preview_ts_annotations_are_not_runtime_reachable(self):
         annotations = (
@@ -1357,6 +1632,12 @@ class ValidateRunTests(unittest.TestCase):
             "import { styles } from '../../src/Button';\n"
             "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
             "export function Screen(){return <main style={styles}><Button /></main>}\n",
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "class Preview { render(styles: CSSProperties){return <main style={styles}><Button /></main>} }\n",
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "class Preview { render<T>(styles: T){return <main style={styles}><Button /></main>} }\n",
+            "const styles = { background: 'var(--color-surface)', gap: 'var(--space-4)' };\n"
+            "export function Screen(){try { throw null } catch (styles) { return <main style={styles}><Button /></main> }}\n",
         )
         for source in decoys:
             with self.subTest(decoy=source):

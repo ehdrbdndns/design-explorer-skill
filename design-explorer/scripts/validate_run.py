@@ -5,8 +5,11 @@ import ipaddress
 import json
 import re
 import shlex
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 import unicodedata
 import zlib
 from dataclasses import dataclass
@@ -361,6 +364,7 @@ VARIABLE_BINDING_PATTERN = re.compile(
 )
 FUNCTION_PARAMETER_PATTERN = re.compile(
     r"\bfunction(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s*"
+    r"(?:<[^>{};]*>)?\s*"
     r"\(([^)]*)\)\s*(?::[^\{;]+)?\{"
 )
 PAREN_ARROW_PARAMETER_PATTERN = re.compile(
@@ -369,6 +373,13 @@ PAREN_ARROW_PARAMETER_PATTERN = re.compile(
 SINGLE_ARROW_PARAMETER_PATTERN = re.compile(
     r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*=>"
 )
+METHOD_PARAMETER_PATTERN = re.compile(
+    r"(?m)(?:^|[;{}])\s*"
+    r"(?:(?:public|private|protected|static|abstract|override|async|get|set)\s+)*"
+    r"[A-Za-z_$][A-Za-z0-9_$]*\s*(?:<[^>{};]*>)?\s*"
+    r"\(([^()]*)\)\s*(?::[^\{;]+)?\{"
+)
+CATCH_BINDING_PATTERN = re.compile(r"\bcatch\s*\(([^)]*)\)\s*\{")
 TOKEN_STYLESHEET_SUFFIXES = frozenset({".css", ".less", ".sass", ".scss"})
 
 
@@ -609,6 +620,31 @@ def jsx_style_value_literals(source: str) -> list[str]:
                     (name, match.start(), parameter_scope, None, True, None)
                 )
 
+    for pattern in (METHOD_PARAMETER_PATTERN, CATCH_BINDING_PATTERN):
+        for match in pattern.finditer(lexed.executable):
+            body_start = match.end() - 1
+            body_end = matching_brace(lexed.executable, body_start)
+            parameter_scope = brace_scope_at(lexed.executable, body_start + 1)
+            visibility = (
+                (body_start, body_end)
+                if body_end is not None
+                else (body_start, len(lexed.executable))
+            )
+            for start, end in top_level_ranges(
+                lexed.executable, match.start(1), match.end(1), ","
+            ):
+                for name in parameter_binding_names(lexed.executable[start:end]):
+                    bindings.append(
+                        (
+                            name,
+                            match.start(),
+                            parameter_scope,
+                            None,
+                            True,
+                            visibility,
+                        )
+                    )
+
     for pattern in (PAREN_ARROW_PARAMETER_PATTERN, SINGLE_ARROW_PARAMETER_PATTERN):
         for match in pattern.finditer(lexed.executable):
             body_start, body_end, parameter_scope = arrow_body_range(
@@ -720,6 +756,58 @@ def css_custom_property_uses(paths: list[Path]) -> set[str]:
                     CSS_CUSTOM_PROPERTY_USE_PATTERN.findall(value)
                 )
     return values
+
+
+def path_is_equal_to_or_below(path: str, protected: str) -> bool:
+    candidate = PurePosixPath(path)
+    boundary = PurePosixPath(protected)
+    return candidate == boundary or boundary in candidate.parents
+
+
+def offline_esbuild_errors(entry: Path, working_directory: Path) -> list[str]:
+    executable = shutil.which("esbuild")
+    if executable is None:
+        for candidate in (
+            working_directory / "node_modules/.bin/esbuild",
+            Path(__file__).resolve().parents[2] / "node_modules/.bin/esbuild",
+        ):
+            if candidate.is_file():
+                executable = str(candidate)
+                break
+    if executable is None:
+        return ["offline esbuild executable is required for code-preview validation"]
+    try:
+        with tempfile.TemporaryDirectory(prefix="design-explorer-esbuild-") as temporary:
+            result = subprocess.run(
+                [
+                    executable,
+                    str(entry),
+                    "--bundle",
+                    "--format=esm",
+                    "--platform=browser",
+                    "--packages=external",
+                    "--jsx=automatic",
+                    "--loader:.scss=css",
+                    "--loader:.sass=css",
+                    "--loader:.less=css",
+                    "--log-level=error",
+                    f"--outfile={Path(temporary) / 'preview.js'}",
+                ],
+                cwd=working_directory,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+    except (OSError, subprocess.SubprocessError) as error:
+        return [f"offline esbuild compile failed: {type(error).__name__}"]
+    if result.returncode == 0:
+        return []
+    detail = next(
+        (line.strip() for line in result.stderr.splitlines() if line.strip()),
+        "invalid or unbundleable preview source",
+    )
+    return [f"offline esbuild compile failed: {detail}"]
 
 
 def code_preview_errors(
@@ -862,6 +950,90 @@ def code_preview_errors(
                 errors.append(
                     f"{label} {singular} must be reachable from preview_path: {relative}"
                 )
+
+    reusable_sources = set(token_sources or []) | set(component_sources or [])
+    if mode == "project" and preview_files is not None:
+        production_paths = run.get("production_paths")
+        if isinstance(production_paths, list) and all(
+            isinstance(path, str) and valid_artifact_ref(path)
+            for path in production_paths
+        ):
+            for relative in preview_files:
+                if relative in reusable_sources:
+                    continue
+                if any(
+                    path_is_equal_to_or_below(relative, protected)
+                    for protected in production_paths
+                ):
+                    errors.append(
+                        f"{label} direction-owned file must not be equal to or under "
+                        f"production_paths: {relative}"
+                    )
+
+    for relative in component_sources or []:
+        if relative in reachable and not component_source_is_runtime_used(
+            source_root,
+            resolved_files,
+            reachable,
+            relative,
+            absolute_root if source_root is not None else None,
+        ):
+            errors.append(
+                f"{label} component_source must be rendered or called at runtime: {relative}"
+            )
+
+    if (
+        mode == "standalone"
+        and source_root is not None
+        and preview_files is not None
+        and len(resolved_files) == len(preview_files)
+    ):
+        errors.extend(_standalone_topology_errors(source_root, preview_files, resolved_files))
+        packages = [
+            path for path in preview_files if PurePosixPath(path).name == "package.json"
+        ]
+        if len(packages) == 1:
+            package_parent = PurePosixPath(packages[0]).parent
+            prefix = "" if str(package_parent) == "." else f"{package_parent}/"
+            app_relative = f"{prefix}src/App.tsx"
+            main_relative = f"{prefix}src/main.tsx"
+            app_path = resolved_files.get(app_relative)
+            workspace_root = source_root / package_parent
+            if app_path is not None:
+                app_reachable, app_errors = dependency_closure(
+                    source_root,
+                    preview_files,
+                    [app_relative],
+                    workspace_root,
+                    runtime_only=True,
+                )
+                errors.extend(f"{label} {error}" for error in app_errors)
+                if preview_path is not None and preview_path not in app_reachable:
+                    errors.append(
+                        f"standalone App must route to preview_path: {preview_path}"
+                    )
+                try:
+                    app_literals = {
+                        literal.value
+                        for literal in lex_js(
+                            app_path.read_text(encoding="utf-8")
+                        ).literals
+                    }
+                except (OSError, UnicodeError):
+                    app_literals = set()
+                preview_route = item.get("preview_route")
+                if preview_route not in app_literals:
+                    errors.append(
+                        "standalone App route table must contain preview_route: "
+                        f"{preview_route}"
+                    )
+            compile_entry = resolved_files.get(main_relative)
+            if compile_entry is not None:
+                errors.extend(offline_esbuild_errors(compile_entry, workspace_root))
+    elif mode == "project" and source_root is not None and preview_path is not None:
+        compile_entry = resolved_files.get(preview_path)
+        if compile_entry is not None:
+            errors.extend(offline_esbuild_errors(compile_entry, source_root))
 
     reachable_paths = [
         resolved_files[path] for path in reachable if path in resolved_files
@@ -1252,6 +1424,67 @@ def matching_parenthesis(source: str, start: int) -> int | None:
     return None
 
 
+def matching_angle_bracket(source: str, start: int) -> int | None:
+    depth = 0
+    for index in range(start, len(source)):
+        character = source[index]
+        if character == "<":
+            depth += 1
+        elif character == ">":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def inside_typescript_generic_parameters(source: str, position: int) -> bool:
+    declarations = re.compile(
+        rf"\b(?:function(?:\s+{IDENTIFIER})?|class\s+{IDENTIFIER}|"
+        rf"interface\s+{IDENTIFIER}|type\s+{IDENTIFIER})\s*<"
+    )
+    for match in declarations.finditer(source, 0, position):
+        open_angle = match.end() - 1
+        close_angle = matching_angle_bracket(source, open_angle)
+        if close_angle is not None and open_angle < position < close_angle:
+            return True
+
+    for open_angle in (
+        index for index, character in enumerate(source[:position]) if character == "<"
+    ):
+        close_angle = matching_angle_bracket(source, open_angle)
+        if close_angle is None or not (open_angle < position < close_angle):
+            continue
+        tail = source[close_angle + 1 :]
+        parameters = re.match(r"\s*\(", tail)
+        if parameters is None:
+            continue
+        open_paren = close_angle + 1 + parameters.end() - 1
+        close_paren = matching_parenthesis(source, open_paren)
+        if close_paren is not None and re.match(
+            r"\s*(?::[^=]+)?=>", source[close_paren + 1 :]
+        ):
+            return True
+    return False
+
+
+def inside_typescript_heritage_clause(source: str, position: int) -> bool:
+    class_pattern = re.compile(rf"\bclass\s+{IDENTIFIER}")
+    for match in class_pattern.finditer(source, 0, position):
+        body = source.find("{", match.end())
+        if body != -1 and position < body:
+            implements = source.find("implements", match.end(), body)
+            if implements != -1 and position > implements:
+                return True
+    interface_pattern = re.compile(rf"\binterface\s+{IDENTIFIER}")
+    for match in interface_pattern.finditer(source, 0, position):
+        body = source.find("{", match.end())
+        if body != -1 and position < body:
+            extends = source.find("extends", match.end(), body)
+            if extends != -1 and position > extends:
+                return True
+    return False
+
+
 def inside_direct_class_body(source: str, position: int) -> bool:
     class_pattern = re.compile(
         r"\bclass\s+[A-Za-z_$][A-Za-z0-9_$]*[^\{]*\{"
@@ -1304,6 +1537,10 @@ def annotation_prefix_is_type(
 def typescript_import_is_type_only(source: str, position: int) -> bool:
     prefix = source[:position]
     if re.search(r"\b(?:as|satisfies)\s*$", prefix):
+        return True
+    if inside_typescript_generic_parameters(
+        source, position
+    ) or inside_typescript_heritage_clause(source, position):
         return True
 
     variable_annotation_pattern = re.compile(
@@ -1476,6 +1713,131 @@ def imported_locals(
         elif exported in bindings:
             result.add(bindings[exported])
     return result
+
+
+def binding_is_shadowed_at(
+    executable: str, name: str, position: int
+) -> bool:
+    use_scope = brace_scope_at(executable, position)
+    shadows = []
+
+    for match in VARIABLE_BINDING_PATTERN.finditer(executable):
+        if match.group(2) == name:
+            shadows.append(
+                (
+                    brace_scope_at(executable, match.start()),
+                    None,
+                )
+            )
+
+    for pattern in (
+        FUNCTION_PARAMETER_PATTERN,
+        METHOD_PARAMETER_PATTERN,
+        CATCH_BINDING_PATTERN,
+    ):
+        for match in pattern.finditer(executable):
+            if name not in parameter_binding_names(match.group(1)):
+                continue
+            body_start = match.end() - 1
+            body_end = matching_brace(executable, body_start)
+            shadows.append(
+                (
+                    brace_scope_at(executable, body_start + 1),
+                    (
+                        body_start,
+                        body_end if body_end is not None else len(executable),
+                    ),
+                )
+            )
+
+    for pattern in (PAREN_ARROW_PARAMETER_PATTERN, SINGLE_ARROW_PARAMETER_PATTERN):
+        for match in pattern.finditer(executable):
+            if name not in parameter_binding_names(match.group(1)):
+                continue
+            body_start, body_end, parameter_scope = arrow_body_range(
+                executable, match.end()
+            )
+            shadows.append((parameter_scope, (body_start, body_end)))
+
+    for declared_scope, visibility in shadows:
+        if use_scope[: len(declared_scope)] != declared_scope:
+            continue
+        if visibility is not None and not (
+            visibility[0] <= position < visibility[1]
+        ):
+            continue
+        return True
+    return False
+
+
+def imported_binding_is_rendered_or_called(
+    lexed: JsLexResult, local: str, *, namespace: bool
+) -> bool:
+    escaped = re.escape(local)
+    patterns = (
+        (
+            re.compile(rf"<\s*{escaped}\s*\.[A-Za-z_$][A-Za-z0-9_$]*\b")
+            if namespace
+            else re.compile(rf"<\s*{escaped}(?=\s|/|>)")
+        ),
+        (
+            re.compile(rf"\b{escaped}\s*\.[A-Za-z_$][A-Za-z0-9_$]*\s*\(")
+            if namespace
+            else re.compile(rf"\b{escaped}\s*\(")
+        ),
+    )
+    for pattern in patterns:
+        for match in pattern.finditer(lexed.executable):
+            prefix = lexed.executable[max(0, match.start() - 16) : match.start()]
+            if re.search(r"\b(?:function|class)\s*$", prefix):
+                continue
+            if not binding_is_shadowed_at(
+                lexed.executable, local, match.start()
+            ):
+                return True
+    return False
+
+
+def component_source_is_runtime_used(
+    root: Path | None,
+    resolved_files: dict[str, Path],
+    reachable: set[str],
+    component_source: str,
+    absolute_root: Path | None,
+) -> bool:
+    if root is None or absolute_root is None:
+        return False
+    for importer_relative in reachable:
+        importer = resolved_files.get(importer_relative)
+        if importer is None or importer.suffix.casefold() not in {
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".mjs",
+            ".cjs",
+        }:
+            continue
+        try:
+            source = importer.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        lexed, references = js_module_references(source)
+        for reference in references:
+            bindings = import_bindings(reference)
+            if not bindings:
+                continue
+            resolved, error = resolve_local_dependency(
+                root, importer, reference.specifier, absolute_root
+            )
+            if error is not None or resolved != component_source:
+                continue
+            for exported, local in bindings.items():
+                if imported_binding_is_rendered_or_called(
+                    lexed, local, namespace=exported == "*"
+                ):
+                    return True
+    return False
 CSS_IMPORT_PATTERN = re.compile(
     r"@import\s+(?:url\(\s*)?[\"']?([^\"')\s;]+)", re.IGNORECASE
 )
@@ -2275,6 +2637,10 @@ def _mockup_manifest_errors(
     seen_viewports = set()
     attempt_total = 0
     attempt_counts_by_direction = {}
+    code_preview_paths = {}
+    code_preview_routes = {}
+    code_preview_screenshots = {}
+    code_preview_topologies = {}
     for index, item in enumerate(mockups):
         if not isinstance(item, dict):
             errors.append(f"mockups[{index}] must be an object")
@@ -2404,6 +2770,69 @@ def _mockup_manifest_errors(
                 run_dir, run, item, index
             )
             errors.extend(entry_code_preview_errors)
+            if direction_is_approved:
+                preview_path = item.get("preview_path")
+                if isinstance(preview_path, str):
+                    if preview_path in code_preview_paths:
+                        errors.append(
+                            "code preview preview_path must be unique across directions"
+                        )
+                    else:
+                        code_preview_paths[preview_path] = direction_id
+                preview_route = item.get("preview_route")
+                if isinstance(preview_route, str):
+                    if preview_route in code_preview_routes:
+                        errors.append(
+                            "code preview preview_route must be unique across directions"
+                        )
+                    else:
+                        code_preview_routes[preview_route] = direction_id
+                checks = item.get("viewport_checks")
+                if isinstance(checks, dict):
+                    for check_viewport, check in checks.items():
+                        screenshot_ref = (
+                            check.get("screenshot_ref")
+                            if isinstance(check, dict)
+                            else None
+                        )
+                        key = (check_viewport, screenshot_ref)
+                        if isinstance(screenshot_ref, str):
+                            if key in code_preview_screenshots:
+                                errors.append(
+                                    "code preview screenshot_ref must be unique for "
+                                    f"viewport {check_viewport} across directions"
+                                )
+                            else:
+                                code_preview_screenshots[key] = direction_id
+                preview_files = item.get("preview_files")
+                token_sources = item.get("token_sources")
+                component_sources = item.get("component_sources")
+                if (
+                    isinstance(preview_path, str)
+                    and isinstance(preview_files, list)
+                    and isinstance(token_sources, list)
+                    and isinstance(component_sources, list)
+                ):
+                    reusable = set(token_sources) | set(component_sources)
+                    direction_owned = [
+                        path for path in preview_files if path not in reusable
+                    ]
+                    if item.get("preview_mode") == "standalone":
+                        isolated = [
+                            path
+                            for path in direction_owned
+                            if direction_id in PurePosixPath(path).parts
+                            or PurePosixPath(path).stem == direction_id
+                        ]
+                        if isolated:
+                            direction_owned = isolated
+                    topology = tuple(sorted(direction_owned))
+                    if topology in code_preview_topologies:
+                        errors.append(
+                            "code preview direction-owned topology must be unique across directions"
+                        )
+                    else:
+                        code_preview_topologies[topology] = direction_id
         if status == "success":
             fields_are_valid = True
             if output_kind not in {"local", "provider"}:
